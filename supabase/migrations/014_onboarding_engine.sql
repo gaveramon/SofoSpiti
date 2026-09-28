@@ -1340,7 +1340,7 @@ drop trigger if exists trg_onboarding_lifecycle_transitions_consistency on publi
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('014_onboarding_engine', 'REV1.ONBOARDING.ENGINE', false)
+values ('014_onboarding_engine', 'REV1', false)
 on conflict (version) do nothing;
 
 

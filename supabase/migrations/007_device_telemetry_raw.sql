@@ -400,16 +400,8 @@ is
 -- 9. SCHEMA MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (
-    migration_name,
-    version,
-    rollback_available
-)
-values (
-    '007_device_telemetry_raw',
-    'REV1.DEVICE.TELEMETRY.RAW',
-    false
-)
+insert into platform.schema_migrations (migration_name, version, rollback_available)
+values ('007_device_telemetry_raw','REV1', false)
 on conflict (version) do nothing;
 
 

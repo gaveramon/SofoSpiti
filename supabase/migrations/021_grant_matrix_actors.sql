@@ -2436,16 +2436,8 @@ set
 -- 5. MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (
-    migration_name,
-    version,
-    rollback_available
-)
-values (
-    '021_grant_matrix_actors',
-    'REV1.GRANT.MATRIX.ACTORS',
-    false
-)
+insert into platform.schema_migrations ( migration_name, version, rollback_available)
+values ( '021_grant_matrix_actors', 'REV1', false)
 on conflict (version) do nothing;
 
 
@@ -2454,4 +2446,3 @@ on conflict (version) do nothing;
 -- =====================================================
 
 COMMIT;
---commit;

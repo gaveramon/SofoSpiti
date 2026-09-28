@@ -562,7 +562,6 @@ begin
 end;
 $$;
 
-
 -- =====================================================
 -- 10. SECURITY DEFINER RELATION DEPENDENCY VALIDATION
 -- =====================================================
@@ -951,22 +950,12 @@ $$;
 comment on table platform.security_table_registry is
 'Central security classification for governed tables. security_class identifies business versus backend ownership. portal_access defines whether controlled portal access exists through approved API/RPC contracts. Direct authenticated table access is prohibited. 020 enforces RLS/FORCE RLS and removes legacy direct-table policies. 022 owns all privileges and grants/revokes.';
 
-
 -- =====================================================
 -- 16. MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (
-    migration_name,
-    version,
-    rollback_available
-)
-values (
-    '020_security_hardening',
-    'REV1.SECURITY.HARDENING',
-    false
-)
+insert into platform.schema_migrations ( migration_name, version, rollback_available)
+values ( '020_security_hardening', 'REV1', false)
 on conflict (version) do nothing;
-
 
 commit;

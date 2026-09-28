@@ -341,7 +341,8 @@ create table if not exists platform.internal_events (
     tenant_id uuid,
 
     source text not null, -- system module identifier
-    event_type text not null,
+    
+    event_type public.platform_event_type not null,
 
     correlation_id uuid,
 
@@ -352,7 +353,6 @@ create table if not exists platform.internal_events (
 
     created_at timestamptz default now()
 );
-
 
 
 -- =====================================================
@@ -377,7 +377,6 @@ create table if not exists platform.scheduled_jobs (
 
     created_at timestamptz default now()
 );
-
 
 
 -- =====================================================
@@ -405,7 +404,6 @@ create table if not exists platform.job_executions (
 );
 
 
-
 -- =====================================================
 -- 5. MIGRATION EXECUTION LOG
 -- =====================================================
@@ -426,7 +424,6 @@ create table if not exists platform.migration_execution_log (
 );
 
 
-
 -- =====================================================
 -- 1. SYSTEM NODES REGISTRY (NORMALIZED CONTROL PLANE)
 -- =====================================================
@@ -444,7 +441,6 @@ create table if not exists platform.system_nodes (
 
     last_seen timestamptz default now()
 );
-
 
 
 -- =====================================================
@@ -850,7 +846,7 @@ create table if not exists platform.security_table_registry (
 
     constraint chk_security_table_registry_backend_access
         check (
-            security_class <> 'backend_only'
+            security_class <> 'backend'
             or portal_access = 'none'
         ),
 
@@ -867,11 +863,11 @@ comment on table platform.security_table_registry is
 
 
 comment on column platform.security_table_registry.security_class is
-'Security classification: business or backend_only.';
+'Security classification: business or backend.';
 
 
 comment on column platform.security_table_registry.portal_access is
-'Portal access contract: none for backend-only tables, rpc for business tables.';
+'Portal access contract: none for backend tables, rpc for business tables.';
 
 
 comment on column platform.security_table_registry.direct_authenticated_access is
@@ -4253,7 +4249,7 @@ $$;
 
 create or replace function platform.publish_internal_event(
     p_source text,
-    p_event_type text,
+    p_event_type public.platform_event_type,
     p_payload jsonb,
     p_correlation_id uuid default null
 )
@@ -5245,5 +5241,5 @@ on conflict (id) do nothing;
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('000_supabase_platform', 'REV1.SUPABASE.PLATFORM', false)
+values ('000_supabase_platform', 'REV1', false)
 on conflict (version) do nothing;

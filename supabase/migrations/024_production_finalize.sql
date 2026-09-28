@@ -586,7 +586,7 @@ values
 
 
 insert into platform.schema_migrations( migration_name, version, rollback_available)
-values( '024_production_finalize', 'REV1.PRODUCTION.FINALIZE', false)
+values( '024_production_finalize', 'REV1', false)
 on conflict(version) do nothing;
 
 commit;

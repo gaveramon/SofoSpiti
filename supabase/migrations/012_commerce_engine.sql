@@ -1272,5 +1272,5 @@ for each row execute function public.enforce_subscription_plan_required();
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('012_commerce_engine', 'REV1.COMMERCE', false)
+values ('012_commerce_engine', 'REV1', false)
 on conflict (version) do nothing;

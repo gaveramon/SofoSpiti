@@ -512,7 +512,7 @@ $$;
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('015_optimization_engine', 'REV1.OPTIMIZATION', false)
+values ('015_optimization_engine', 'REV1', false)
 on conflict (version) do nothing;
 
 

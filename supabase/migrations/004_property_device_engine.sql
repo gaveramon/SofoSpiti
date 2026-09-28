@@ -401,6 +401,10 @@ begin
     end if;
 
 
+    -- -------------------------------------------------
+    -- 1. Device must belong to active tenant
+    -- -------------------------------------------------
+
     if not exists (
         select 1
         from public.devices d
@@ -410,6 +414,10 @@ begin
         raise exception 'Device not found';
     end if;
 
+
+    -- -------------------------------------------------
+    -- 2. Room must belong to active tenant
+    -- -------------------------------------------------
 
     if not exists (
         select 1
@@ -423,6 +431,11 @@ begin
     end if;
 
 
+    -- -------------------------------------------------
+    -- 3. Existing assignment?
+    --    A device may have only one room.
+    -- -------------------------------------------------
+
     select da.id
     into v_existing
     from public.device_assignments da
@@ -433,7 +446,7 @@ begin
 
         update public.device_assignments
         set room_id = p_room_id
-        where device_id = p_device_id
+        where id = v_existing
         returning device_id, room_id, assigned_at
         into v_row;
 
@@ -454,6 +467,20 @@ begin
 
     end if;
 
+
+    -- -------------------------------------------------
+    -- 4. Successful assignment makes the device active
+    -- -------------------------------------------------
+
+    update public.devices
+    set is_active = true
+    where id = p_device_id
+      and tenant_id = v_tid;
+
+
+    -- -------------------------------------------------
+    -- 5. Return assignment
+    -- -------------------------------------------------
 
     return jsonb_build_object(
         'device_id', v_row.device_id,
@@ -1901,9 +1928,40 @@ begin
 end;
 $$;
 
+-- =====================================================
+-- 25. DEVICE DEACTIVATION
+-- Whenever a room gets deleted, the unassigned devices
+-- must become inactive.
+-- =====================================================
+
+
+create or replace function public.deactivate_unassigned_device()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+
+    if not exists (
+        select 1
+        from public.device_assignments da
+        where da.device_id = old.device_id
+    ) then
+
+        update public.devices
+        set is_active = false
+        where id = old.device_id;
+
+    end if;
+
+    return old;
+end;
+$$;
+
 
 -- =====================================================
--- 25. TRIGGERS
+-- 26. TRIGGERS
 -- =====================================================
 
 drop trigger if exists trg_properties_updated_at
@@ -1950,12 +2008,20 @@ on public.device_configurations
 for each row
 execute function platform.set_updated_at();
 
+drop trigger if exists trg_deactivate_unassigned_device
+on public.device_assignments;
+
+create trigger trg_deactivate_unassigned_device
+after delete on public.device_assignments
+for each row
+execute function public.deactivate_unassigned_device();
+
 -- =====================================================
--- 27. MIGRATION REGISTRATION
+-- 28. MIGRATION REGISTRATION
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('004_property_device_engine', 'REV1.PROPERTY.DEVICE', false)
+values ('004_property_device_engine', 'REV1', false)
 on conflict (version) do nothing;
 
 -- =====================================================

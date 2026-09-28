@@ -680,5 +680,5 @@ join public.operation_workflows ow on ow.id = ar.workflow_id;
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('017_automation_engine', 'REV1.AUTOMATION.ENGINE', false)
+values ('017_automation_engine', 'REV1', false)
 on conflict (version) do nothing;

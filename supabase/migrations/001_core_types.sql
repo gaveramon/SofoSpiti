@@ -19,7 +19,7 @@
 -- These types form the stable database/API vocabulary used
 -- by subsequent domain migrations and RPC contracts.
 --
--- ENUM EXPANSION RULES (REV19 SSOT)
+-- ENUM EXPANSION RULES 
 --   1. Never remove or rename labels after baseline deploy.
 --   2. Append only:
 --        alter type ... add value if not exists 'label';
@@ -28,7 +28,10 @@
 --   4. Platform execution states remain text in 000 unless
 --      explicitly bound here.
 --   5. Use domain-specific status enums; no global lifecycle enum.
---
+--  
+-- 001 is the single SSOT for all PostgreSQL enum/type definitions.
+-- Domain migrations may reference these types but must not create
+-- duplicate domain enums.
 -- =====================================================
 
 
@@ -93,7 +96,7 @@ create type public.priority_level as enum (
 -- 2. USER & ACCESS ROLES
 -- =====================================================
 
-create type public.user_role as enum (
+create type public.membership_role as enum (
     'owner',
     'admin',
     'manager',
@@ -105,6 +108,7 @@ create type public.user_role as enum (
 create type public.access_credential_status as enum (
     'pending',
     'active',
+    'revoking',
     'revoked',
     'expired',
     'failed'
@@ -637,8 +641,6 @@ create type public.proposal_status as enum (
 -- 15. UPSELL / MONETIZATION TRIGGERS
 -- =====================================================
 --
--- Domain-local duplicate of upsell_package_trigger labels
--- (013).
 -- Do not compare or cast across these enum types.
 -- =====================================================
 
@@ -678,7 +680,7 @@ select platform.bind_operation_context_type_column();
 -- =====================================================
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
-values ('001_core_types', 'REV1.CORE.TYPES', false)
+values ('001_core_types', 'REV1', false)
 on conflict (version) do nothing;
 
 

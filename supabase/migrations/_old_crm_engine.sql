@@ -1,18 +1,19 @@
--- REV23 greenfield baseline: 003_crm_engine.sql
-
 -- =====================================================
--- 003 CRM ENGINE (CLEAN CUSTOMER RELATIONSHIP DOMAIN)
+-- REV1 GREENFIELD BASELINE
+-- 003_CRM_ENGINE.SQL
+-- =====================================================
+--
 -- NO EXECUTION / NO RUNTIME STATE / NO PLATFORM LOGIC
 -- =====================================================
 --
 -- SSOT: contacts, companies, leads, pipelines, opportunities,
 -- tasks, interactions, notes, tags, lists, campaigns, custom fields.
 --
--- References only: tenants, customer_accounts, profiles (002/000). Customer accounts are owned by 002; CRM never creates them.
+-- References only: tenants, profiles (002/000), customer tenants via FK.
 -- Does NOT own: orders, subscriptions, payments, bookings, devices,
--- portal, onboarding, support cases (008).
+-- portal, onboarding, support cases (009).
 -- Campaign SSOT: crm_campaigns (marketing acquisition) only.
--- In-product upsells → 013.upsell_campaigns. Plan upsells → 011.upsell_rules.
+-- In-product upsells → 015.upsell_campaigns. Plan upsells → 012.upsell_rules.
 -- CRM domain enums SSOT: 001_core_types_rev19.sql (section 14).
 -- =====================================================
 
@@ -20,7 +21,7 @@
 -- 1. PIPELINES
 -- =====================================================
 
-create table if not exists crm_pipelines (
+create table if not exists public.crm_pipelines (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -41,11 +42,12 @@ create table if not exists crm_pipelines (
 );
 
 
+
 -- =====================================================
 -- 2. PIPELINE STAGES
 -- =====================================================
 
-create table if not exists crm_pipeline_stages (
+create table if not exists public.crm_pipeline_stages (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -87,7 +89,7 @@ create table if not exists crm_pipeline_stages (
 -- 3. CAMPAIGNS
 -- =====================================================
 
-create table if not exists crm_campaigns (
+create table if not exists public.crm_campaigns (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -124,11 +126,12 @@ create table if not exists crm_campaigns (
 );
 
 
+
 -- =====================================================
 -- 4. TAGS
 -- =====================================================
 
-create table if not exists crm_tags (
+create table if not exists public.crm_tags (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -143,15 +146,15 @@ create table if not exists crm_tags (
 );
 
 
+
 -- =====================================================
 -- 5. COMPANIES
 -- =====================================================
 
-create table if not exists crm_companies (
+create table if not exists public.crm_companies (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
-    customer_account_id uuid,
 
     name text not null,
 
@@ -175,11 +178,10 @@ create table if not exists crm_companies (
 -- 6. CONTACTS
 -- =====================================================
 
-create table if not exists crm_contacts (
+create table if not exists public.crm_contacts (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
-    customer_account_id uuid,
 
     first_name text,
 
@@ -235,14 +237,37 @@ create table if not exists crm_contacts (
 
 
 -- =====================================================
--- 7. LEADS
+-- 9. COMPANY ↔ TENANT (M:N — REQUIRED FOR NORMALIZATION)
 -- =====================================================
 
-create table if not exists crm_leads (
+create table if not exists public.crm_company_tenants (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
-    customer_account_id uuid,
+
+    company_id uuid not null references crm_companies(id) on delete cascade,
+
+    linked_tenant_id uuid,
+
+    relationship_type text,
+
+    created_at timestamptz not null default now(),
+
+    deleted_at timestamptz,
+
+    unique (company_id, linked_tenant_id)
+);
+
+
+
+-- =====================================================
+-- 7. LEADS
+-- =====================================================
+
+create table if not exists public.crm_leads (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null,
 
     first_name text,
 
@@ -270,7 +295,7 @@ create table if not exists crm_leads (
 
     converted_company_id uuid references crm_companies(id) on delete set null,
 
-    converted_customer_account_id uuid,
+    converted_tenant_id uuid,
 
     converted_at timestamptz,
 
@@ -294,11 +319,13 @@ create table if not exists crm_leads (
     )
 );
 
+
+
 -- =====================================================
 -- 8. CONTACT ↔ COMPANY (M:N WITH ROLES)
 -- =====================================================
 
-create table if not exists crm_contact_company (
+create table if not exists public.crm_contact_company (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -319,15 +346,39 @@ create table if not exists crm_contact_company (
 );
 
 
+
+-- =====================================================
+-- 10. CONTACT ↔ TENANT (M:N — REQUIRED FOR NORMALIZATION)
+-- =====================================================
+
+create table if not exists public.crm_contact_tenants (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null,
+
+    contact_id uuid not null references crm_contacts(id) on delete cascade,
+
+    linked_tenant_id uuid,
+
+    relationship_type text,
+
+    created_at timestamptz not null default now(),
+
+    deleted_at timestamptz,
+
+    unique (contact_id, linked_tenant_id)
+);
+
+
+
 -- =====================================================
 -- 11. OPPORTUNITIES
 -- =====================================================
 
-create table if not exists crm_opportunities (
+create table if not exists public.crm_opportunities (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
-    customer_account_id uuid,
 
     pipeline_id uuid not null references crm_pipelines(id) on delete restrict,
 
@@ -337,7 +388,7 @@ create table if not exists crm_opportunities (
 
     company_id uuid references crm_companies(id) on delete set null,
 
-    customer_account_id uuid,
+    linked_tenant_id uuid,
 
     name text not null,
 
@@ -368,16 +419,17 @@ create table if not exists crm_opportunities (
     constraint chk_crm_opportunities_has_party check (
         contact_id is not null
         or company_id is not null
-        or customer_account_id is not null
+        or linked_tenant_id is not null
     )
 );
+
 
 
 -- =====================================================
 -- 12. TASKS
 -- =====================================================
 
-create table if not exists crm_tasks (
+create table if not exists public.crm_tasks (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -406,11 +458,12 @@ create table if not exists crm_tasks (
 );
 
 
+
 -- =====================================================
 -- 13. INTERACTIONS (APPEND-ONLY)
 -- =====================================================
 
-create table if not exists crm_interactions (
+create table if not exists public.crm_interactions (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -446,11 +499,12 @@ create table if not exists crm_interactions (
 );
 
 
+
 -- =====================================================
 -- 14. NOTES
 -- =====================================================
 
-create table if not exists crm_notes (
+create table if not exists public.crm_notes (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -475,11 +529,13 @@ create table if not exists crm_notes (
 );
 
 
+
+
 -- =====================================================
 -- 15. TAG ASSIGNMENTS
 -- =====================================================
 
-create table if not exists crm_tag_assignments (
+create table if not exists public.crm_tag_assignments (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -498,11 +554,12 @@ create table if not exists crm_tag_assignments (
 );
 
 
+
 -- =====================================================
 -- 16. LISTS
 -- =====================================================
 
-create table if not exists crm_lists (
+create table if not exists public.crm_lists (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -527,11 +584,12 @@ create table if not exists crm_lists (
 );
 
 
+
 -- =====================================================
 -- 17. LIST MEMBERS
 -- =====================================================
 
-create table if not exists crm_list_members (
+create table if not exists public.crm_list_members (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -552,7 +610,7 @@ create table if not exists crm_list_members (
 -- 18. CUSTOM FIELDS
 -- =====================================================
 
-create table if not exists crm_custom_fields (
+create table if not exists public.crm_custom_fields (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -585,11 +643,12 @@ create table if not exists crm_custom_fields (
 );
 
 
+
 -- =====================================================
 -- 19. CUSTOM FIELD VALUES
 -- =====================================================
 
-create table if not exists crm_custom_field_values (
+create table if not exists public.crm_custom_field_values (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -628,8 +687,9 @@ create table if not exists crm_custom_field_values (
     )
 );
 
+
 -- ==========================
---  Indexes
+--  Triggers
 -- ==========================
 
 create index if not exists idx_crm_pipelines_tenant_created
@@ -668,23 +728,15 @@ where deleted_at is null;
 create index if not exists idx_crm_companies_tenant_created
 on crm_companies (tenant_id, created_at desc);
 
-create index if not exists idx_crm_companies_customer_account
-on crm_companies (customer_account_id)
-where customer_account_id is not null and deleted_at is null;
-
 create index if not exists idx_crm_companies_owner
 on crm_companies (tenant_id, owner_user_id)
 where owner_user_id is not null and deleted_at is null;
 
 comment on table public.crm_companies is
-    'CRM company records. Customer identity is linked to 002 customer_accounts; tenants are grouped under the account.';
+    'CRM company records. Customer tenant links via crm_company_tenants (M:N).';
 
 create index if not exists idx_crm_contacts_tenant_created
 on crm_contacts (tenant_id, created_at desc);
-
-create index if not exists idx_crm_contacts_customer_account
-on crm_contacts (customer_account_id)
-where customer_account_id is not null and deleted_at is null;
 
 create index if not exists idx_crm_contacts_tenant_email
 on crm_contacts (tenant_id, lower(email))
@@ -700,10 +752,6 @@ comment on table public.crm_contacts is
 create index if not exists idx_crm_leads_tenant_created
 on crm_leads (tenant_id, created_at desc);
 
-create index if not exists idx_crm_leads_customer_account
-on crm_leads (customer_account_id)
-where customer_account_id is not null and deleted_at is null;
-
 create index if not exists idx_crm_leads_tenant_status
 on crm_leads (tenant_id, status)
 where deleted_at is null;
@@ -713,13 +761,13 @@ on crm_leads (campaign_id)
 where campaign_id is not null;
 
 create index if not exists idx_crm_leads_converted_tenant
-on crm_leads (converted_customer_account_id)
-where converted_customer_account_id is not null;
+on crm_leads (converted_tenant_id)
+where converted_tenant_id is not null;
 
 comment on table public.crm_leads is
     'Prospect leads. May convert to contact, company, and/or customer tenant. CRM does not create tenants.';
 
-comment on column public.crm_leads.converted_customer_account_id is
+comment on column public.crm_leads.converted_tenant_id is
     'Reference to 002 tenants after conversion. Set by application layer; CRM stores FK only.';
 
 create index if not exists idx_crm_contact_company_contact
@@ -737,12 +785,36 @@ create unique index if not exists uq_crm_contact_company_primary
 on crm_contact_company (contact_id, company_id)
 where is_primary = true and deleted_at is null;
 
+create index if not exists idx_crm_company_tenants_company
+on crm_company_tenants (company_id)
+where deleted_at is null and linked_tenant_id is not null;
+
+create index if not exists idx_crm_company_tenants_linked_tenant
+on crm_company_tenants (linked_tenant_id)
+where deleted_at is null;
+
+create index if not exists idx_crm_company_tenants_tenant_created
+on crm_company_tenants (tenant_id, created_at desc);
+
+comment on table public.crm_company_tenants is
+    'Links CRM companies to customer tenants (002). Required M:N; not duplicated on crm_companies.';
+
+create index if not exists idx_crm_contact_tenants_contact
+on crm_contact_tenants (contact_id)
+where deleted_at is null and linked_tenant_id is not null;
+
+create index if not exists idx_crm_contact_tenants_linked_tenant
+on crm_contact_tenants (linked_tenant_id)
+where deleted_at is null;
+
+create index if not exists idx_crm_contact_tenants_tenant_created
+on crm_contact_tenants (tenant_id, created_at desc);
+
+comment on table public.crm_contact_tenants is
+    'Links CRM contacts to customer tenants (002) they manage. Required M:N.';
+
 create index if not exists idx_crm_opportunities_tenant_created
 on crm_opportunities (tenant_id, created_at desc);
-
-create index if not exists idx_crm_opportunities_customer_account
-on crm_opportunities (customer_account_id)
-where customer_account_id is not null and deleted_at is null;
 
 create index if not exists idx_crm_opportunities_pipeline_stage
 on crm_opportunities (pipeline_id, stage_id)
@@ -753,11 +825,11 @@ on crm_opportunities (tenant_id, owner_user_id)
 where owner_user_id is not null and deleted_at is null;
 
 create index if not exists idx_crm_opportunities_linked_tenant
-on crm_opportunities (customer_account_id)
-where customer_account_id is not null;
+on crm_opportunities (linked_tenant_id)
+where linked_tenant_id is not null;
 
-comment on column public.crm_opportunities.customer_account_id is
-    'Optional reference to the 002 customer account associated with this deal.';
+comment on column public.crm_opportunities.linked_tenant_id is
+    'Optional reference to 002 customer tenant associated with this deal.';
 
 create index if not exists idx_crm_tasks_tenant_created
 on crm_tasks (tenant_id, created_at desc);
@@ -839,6 +911,7 @@ on crm_custom_field_values (tenant_id, entity_type, entity_id);
 create index if not exists idx_crm_custom_field_values_tenant_created
 on crm_custom_field_values (tenant_id, created_at desc);
 
+
 -- =====================================================
 -- 20. TENANT FKs (DEFERRED PATTERN)
 -- =====================================================
@@ -902,32 +975,8 @@ end $$;
 do $$
 begin
     alter table public.crm_leads
-        add constraint fk_crm_leads_converted_customer_account
-        foreign key (converted_customer_account_id) references public.customer_accounts(id) on delete set null;
-exception when duplicate_object then null;
-end $$;
-
-do $$
-begin
-    alter table public.crm_companies
-        add constraint fk_crm_companies_customer_account
-        foreign key (customer_account_id) references public.customer_accounts(id) on delete set null;
-exception when duplicate_object then null;
-end $$;
-
-do $$
-begin
-    alter table public.crm_contacts
-        add constraint fk_crm_contacts_customer_account
-        foreign key (customer_account_id) references public.customer_accounts(id) on delete set null;
-exception when duplicate_object then null;
-end $$;
-
-do $$
-begin
-    alter table public.crm_leads
-        add constraint fk_crm_leads_customer_account
-        foreign key (customer_account_id) references public.customer_accounts(id) on delete set null;
+        add constraint fk_crm_leads_converted_tenant
+        foreign key (converted_tenant_id) references public.tenants(id) on delete set null;
 exception when duplicate_object then null;
 end $$;
 
@@ -936,6 +985,38 @@ begin
     alter table public.crm_contact_company
         add constraint fk_crm_contact_company_tenant
         foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_company_tenants
+        add constraint fk_crm_company_tenants_tenant
+        foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_company_tenants
+        add constraint fk_crm_company_tenants_linked_tenant
+        foreign key (linked_tenant_id) references public.tenants(id) on delete set null;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_contact_tenants
+        add constraint fk_crm_contact_tenants_tenant
+        foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_contact_tenants
+        add constraint fk_crm_contact_tenants_linked_tenant
+        foreign key (linked_tenant_id) references public.tenants(id) on delete set null;
 exception when duplicate_object then null;
 end $$;
 
@@ -950,8 +1031,8 @@ end $$;
 do $$
 begin
     alter table public.crm_opportunities
-        add constraint fk_crm_opportunities_customer_account
-        foreign key (customer_account_id) references public.customer_accounts(id) on delete set null;
+        add constraint fk_crm_opportunities_linked_tenant
+        foreign key (linked_tenant_id) references public.tenants(id) on delete set null;
 exception when duplicate_object then null;
 end $$;
 
@@ -1025,6 +1106,10 @@ drop trigger if exists trg_crm_leads_conversion_timestamp on public.crm_leads;
 
 drop trigger if exists trg_crm_notes_version_increment on public.crm_notes;
 
+-- ==========================
+--  VIEW PIPELINE
+-- ==========================
+
 create or replace view public.v_crm_pipeline
 with (security_invoker = true)
 as
@@ -1054,6 +1139,10 @@ join public.crm_pipelines pip on pip.id = ps.pipeline_id
 left join public.crm_companies co on co.id = o.company_id
 left join public.crm_contacts ct on ct.id = o.contact_id
 where o.deleted_at is null;
+
+-- ==========================
+--  CRM DOMAIN
+-- ==========================
 
 create or replace function public.crm_domain(
     p_op text,
@@ -1124,7 +1213,6 @@ begin
         insert into public.crm_pipelines (tenant_id, name, description, is_default, is_active)
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             p_payload->>'name',
             case when p_payload ? 'description' then p_payload->>'description' else null end,
             coalesce((p_payload->>'is_default')::boolean, false),
@@ -1364,7 +1452,7 @@ begin
         into v_result
         from (
             select
-                co.id, co.tenant_id, co.customer_account_id, co.name, co.legal_name, co.website, co.industry,
+                co.id, co.tenant_id, co.name, co.legal_name, co.website, co.industry,
                 co.owner_user_id, co.created_at, co.updated_at, co.deleted_at
             from public.crm_companies co
             where co.tenant_id = v_tid and co.deleted_at is null
@@ -1375,7 +1463,7 @@ begin
         select to_jsonb(t) into v_result
         from (
             select
-                co.id, co.tenant_id, co.customer_account_id, co.name, co.legal_name, co.website, co.industry,
+                co.id, co.tenant_id, co.name, co.legal_name, co.website, co.industry,
                 co.owner_user_id, co.created_at, co.updated_at, co.deleted_at
             from public.crm_companies co
             where co.id = (p_payload->>'id')::uuid
@@ -1386,10 +1474,9 @@ begin
 
     when 'create_company' then
         v_tid := platform.current_tenant_id();
-        insert into public.crm_companies (tenant_id, customer_account_id, name, legal_name, website, industry, owner_user_id)
+        insert into public.crm_companies (tenant_id, name, legal_name, website, industry, owner_user_id)
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             p_payload->>'name',
             case when p_payload ? 'legal_name' then p_payload->>'legal_name' else null end,
             case when p_payload ? 'website' then p_payload->>'website' else null end,
@@ -1406,7 +1493,6 @@ begin
     when 'update_company' then
         v_tid := platform.current_tenant_id();
         update public.crm_companies co set
-            customer_account_id = case when p_payload ? 'customer_account_id' then case when p_payload->>'customer_account_id' is null then null else (p_payload->>'customer_account_id')::uuid end else co.customer_account_id end,
             name = case when p_payload ? 'name' then p_payload->>'name' else co.name end,
             legal_name = case when p_payload ? 'legal_name' then p_payload->>'legal_name' else co.legal_name end,
             website = case when p_payload ? 'website' then p_payload->>'website' else co.website end,
@@ -1420,7 +1506,7 @@ begin
           and co.tenant_id = v_tid
           and co.deleted_at is null
         returning
-            co.id, co.tenant_id, co.customer_account_id, co.name, co.legal_name, co.website, co.industry,
+            co.id, co.tenant_id, co.name, co.legal_name, co.website, co.industry,
             co.owner_user_id, co.created_at, co.updated_at, co.deleted_at
         into v_row;
         if not found then raise exception 'Company not found'; end if;
@@ -1441,7 +1527,7 @@ begin
         into v_result
         from (
             select
-                c.id, c.tenant_id, c.customer_account_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
+                c.id, c.tenant_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
                 c.language, c.timezone, c.marketing_consent, c.marketing_consent_at,
                 c.gdpr_consent, c.gdpr_consent_at, c.status, c.lead_source, c.owner_user_id,
                 c.created_at, c.updated_at, c.deleted_at
@@ -1456,7 +1542,7 @@ begin
         select to_jsonb(t) into v_result
         from (
             select
-                c.id, c.tenant_id, c.customer_account_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
+                c.id, c.tenant_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
                 c.language, c.timezone, c.marketing_consent, c.marketing_consent_at,
                 c.gdpr_consent, c.gdpr_consent_at, c.status, c.lead_source, c.owner_user_id,
                 c.created_at, c.updated_at, c.deleted_at
@@ -1470,12 +1556,11 @@ begin
     when 'create_contact' then
         v_tid := platform.current_tenant_id();
         insert into public.crm_contacts (
-            tenant_id, customer_account_id, first_name, last_name, display_name, email, phone, language, timezone,
+            tenant_id, first_name, last_name, display_name, email, phone, language, timezone,
             marketing_consent, gdpr_consent, status, lead_source, owner_user_id
         )
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             case when p_payload ? 'first_name' then p_payload->>'first_name' else null end,
             case when p_payload ? 'last_name' then p_payload->>'last_name' else null end,
             case when p_payload ? 'display_name' then p_payload->>'display_name' else null end,
@@ -1501,7 +1586,6 @@ begin
     when 'update_contact' then
         v_tid := platform.current_tenant_id();
         update public.crm_contacts c set
-            customer_account_id = case when p_payload ? 'customer_account_id' then case when p_payload->>'customer_account_id' is null then null else (p_payload->>'customer_account_id')::uuid end else c.customer_account_id end,
             first_name = case when p_payload ? 'first_name' then p_payload->>'first_name' else c.first_name end,
             last_name = case when p_payload ? 'last_name' then p_payload->>'last_name' else c.last_name end,
             display_name = case when p_payload ? 'display_name' then p_payload->>'display_name' else c.display_name end,
@@ -1522,7 +1606,7 @@ begin
           and c.tenant_id = v_tid
           and c.deleted_at is null
         returning
-            c.id, c.tenant_id, c.customer_account_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
+            c.id, c.tenant_id, c.first_name, c.last_name, c.display_name, c.email, c.phone,
             c.language, c.timezone, c.marketing_consent, c.marketing_consent_at,
             c.gdpr_consent, c.gdpr_consent_at, c.status, c.lead_source, c.owner_user_id,
             c.created_at, c.updated_at, c.deleted_at
@@ -1545,9 +1629,9 @@ begin
         into v_result
         from (
             select
-                l.id, l.tenant_id, l.customer_account_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
+                l.id, l.tenant_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
                 l.score, l.temperature, l.owner_user_id, l.estimated_value, l.campaign_id,
-                l.converted_contact_id, l.converted_company_id, l.converted_customer_account_id, l.converted_at,
+                l.converted_contact_id, l.converted_company_id, l.converted_tenant_id, l.converted_at,
                 l.created_at, l.updated_at, l.deleted_at
             from public.crm_leads l
             where l.tenant_id = v_tid
@@ -1561,9 +1645,9 @@ begin
         select to_jsonb(t) into v_result
         from (
             select
-                l.id, l.tenant_id, l.customer_account_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
+                l.id, l.tenant_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
                 l.score, l.temperature, l.owner_user_id, l.estimated_value, l.campaign_id,
-                l.converted_contact_id, l.converted_company_id, l.converted_customer_account_id, l.converted_at,
+                l.converted_contact_id, l.converted_company_id, l.converted_tenant_id, l.converted_at,
                 l.created_at, l.updated_at, l.deleted_at
             from public.crm_leads l
             where l.id = (p_payload->>'id')::uuid
@@ -1575,12 +1659,11 @@ begin
     when 'create_lead' then
         v_tid := platform.current_tenant_id();
         insert into public.crm_leads (
-            tenant_id, customer_account_id, first_name, last_name, email, phone, status, source, score, temperature,
+            tenant_id, first_name, last_name, email, phone, status, source, score, temperature,
             owner_user_id, estimated_value, campaign_id
         )
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             case when p_payload ? 'first_name' then p_payload->>'first_name' else null end,
             case when p_payload ? 'last_name' then p_payload->>'last_name' else null end,
             case when p_payload ? 'email' then p_payload->>'email' else null end,
@@ -1596,7 +1679,7 @@ begin
         returning
             id, tenant_id, first_name, last_name, email, phone, status, source,
             score, temperature, owner_user_id, estimated_value, campaign_id,
-            converted_contact_id, converted_company_id, converted_customer_account_id, converted_at,
+            converted_contact_id, converted_company_id, converted_tenant_id, converted_at,
             created_at, updated_at, deleted_at
         into v_row;
         perform platform.log_audit('crm_lead.created', 'crm_lead', v_row.id);
@@ -1605,7 +1688,6 @@ begin
     when 'update_lead' then
         v_tid := platform.current_tenant_id();
         update public.crm_leads l set
-            customer_account_id = case when p_payload ? 'customer_account_id' then case when p_payload->>'customer_account_id' is null then null else (p_payload->>'customer_account_id')::uuid end else l.customer_account_id end,
             first_name = case when p_payload ? 'first_name' then p_payload->>'first_name' else l.first_name end,
             last_name = case when p_payload ? 'last_name' then p_payload->>'last_name' else l.last_name end,
             email = case when p_payload ? 'email' then p_payload->>'email' else l.email end,
@@ -1618,15 +1700,15 @@ begin
             campaign_id = case when p_payload ? 'campaign_id' then case when p_payload->>'campaign_id' is null then null else (p_payload->>'campaign_id')::uuid end else l.campaign_id end,
             converted_contact_id = case when p_payload ? 'converted_contact_id' then case when p_payload->>'converted_contact_id' is null then null else (p_payload->>'converted_contact_id')::uuid end else l.converted_contact_id end,
             converted_company_id = case when p_payload ? 'converted_company_id' then case when p_payload->>'converted_company_id' is null then null else (p_payload->>'converted_company_id')::uuid end else l.converted_company_id end,
-            converted_customer_account_id = case when p_payload ? 'converted_customer_account_id' then case when p_payload->>'converted_customer_account_id' is null then null else (p_payload->>'converted_customer_account_id')::uuid end else l.converted_customer_account_id end,
+            converted_tenant_id = case when p_payload ? 'converted_tenant_id' then case when p_payload->>'converted_tenant_id' is null then null else (p_payload->>'converted_tenant_id')::uuid end else l.converted_tenant_id end,
             status = case when p_payload ? 'status' then (p_payload->>'status')::public.crm_lead_status else l.status end
         where l.id = (p_payload->>'id')::uuid
           and l.tenant_id = v_tid
           and l.deleted_at is null
         returning
-            l.id, l.tenant_id, l.customer_account_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
+            l.id, l.tenant_id, l.first_name, l.last_name, l.email, l.phone, l.status, l.source,
             l.score, l.temperature, l.owner_user_id, l.estimated_value, l.campaign_id,
-            l.converted_contact_id, l.converted_company_id, l.converted_customer_account_id, l.converted_at,
+            l.converted_contact_id, l.converted_company_id, l.converted_tenant_id, l.converted_at,
             l.created_at, l.updated_at, l.deleted_at
         into v_row;
         if not found then raise exception 'Lead not found'; end if;
@@ -1688,6 +1770,102 @@ begin
         perform platform.log_audit('crm_contact_company.deleted', 'crm_contact_company', (p_payload->>'id')::uuid);
 
     -- =================================================
+    -- COMPANY ↔ TENANT
+    -- =================================================
+
+    when 'list_company_tenants' then
+        v_tid := platform.current_tenant_id();
+        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at), '[]'::jsonb)
+        into v_result
+        from (
+            select ct.id, ct.tenant_id, ct.company_id, ct.linked_tenant_id, ct.relationship_type, ct.created_at, ct.deleted_at
+            from public.crm_company_tenants ct
+            where ct.tenant_id = v_tid
+              and ct.deleted_at is null
+              and (not p_payload ? 'company_id' or ct.company_id = (p_payload->>'company_id')::uuid)
+        ) t;
+
+    when 'create_company_tenant' then
+        v_tid := platform.current_tenant_id();
+        insert into public.crm_company_tenants (tenant_id, company_id, linked_tenant_id, relationship_type)
+        values (
+            v_tid,
+            (p_payload->>'company_id')::uuid,
+            case when p_payload ? 'linked_tenant_id' and p_payload->>'linked_tenant_id' is not null then (p_payload->>'linked_tenant_id')::uuid else null end,
+            case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else null end
+        )
+        returning id, tenant_id, company_id, linked_tenant_id, relationship_type, created_at, deleted_at
+        into v_row;
+        perform platform.log_audit('crm_company_tenant.created', 'crm_company_tenant', v_row.id);
+        v_result := to_jsonb(v_row);
+
+    when 'update_company_tenant' then
+        v_tid := platform.current_tenant_id();
+        update public.crm_company_tenants ct set
+            linked_tenant_id = case when p_payload ? 'linked_tenant_id' then case when p_payload->>'linked_tenant_id' is null then null else (p_payload->>'linked_tenant_id')::uuid end else ct.linked_tenant_id end,
+            relationship_type = case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else ct.relationship_type end
+        where ct.id = (p_payload->>'id')::uuid
+          and ct.tenant_id = v_tid
+          and ct.deleted_at is null
+        returning id, tenant_id, company_id, linked_tenant_id, relationship_type, created_at, deleted_at
+        into v_row;
+        if not found then raise exception 'Company tenant link not found'; end if;
+        perform platform.log_audit('crm_company_tenant.updated', 'crm_company_tenant', v_row.id, p_payload - 'id');
+        v_result := to_jsonb(v_row);
+
+    when 'delete_company_tenant' then
+        v_result := public.crm_soft_delete_row('public.crm_company_tenants'::regclass, (p_payload->>'id')::uuid);
+        perform platform.log_audit('crm_company_tenant.deleted', 'crm_company_tenant', (p_payload->>'id')::uuid);
+
+    -- =================================================
+    -- CONTACT ↔ TENANT
+    -- =================================================
+
+    when 'list_contact_tenants' then
+        v_tid := platform.current_tenant_id();
+        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at), '[]'::jsonb)
+        into v_result
+        from (
+            select ct.id, ct.tenant_id, ct.contact_id, ct.linked_tenant_id, ct.relationship_type, ct.created_at, ct.deleted_at
+            from public.crm_contact_tenants ct
+            where ct.tenant_id = v_tid
+              and ct.deleted_at is null
+              and (not p_payload ? 'contact_id' or ct.contact_id = (p_payload->>'contact_id')::uuid)
+        ) t;
+
+    when 'create_contact_tenant' then
+        v_tid := platform.current_tenant_id();
+        insert into public.crm_contact_tenants (tenant_id, contact_id, linked_tenant_id, relationship_type)
+        values (
+            v_tid,
+            (p_payload->>'contact_id')::uuid,
+            case when p_payload ? 'linked_tenant_id' and p_payload->>'linked_tenant_id' is not null then (p_payload->>'linked_tenant_id')::uuid else null end,
+            case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else null end
+        )
+        returning id, tenant_id, contact_id, linked_tenant_id, relationship_type, created_at, deleted_at
+        into v_row;
+        perform platform.log_audit('crm_contact_tenant.created', 'crm_contact_tenant', v_row.id);
+        v_result := to_jsonb(v_row);
+
+    when 'update_contact_tenant' then
+        v_tid := platform.current_tenant_id();
+        update public.crm_contact_tenants ct set
+            linked_tenant_id = case when p_payload ? 'linked_tenant_id' then case when p_payload->>'linked_tenant_id' is null then null else (p_payload->>'linked_tenant_id')::uuid end else ct.linked_tenant_id end,
+            relationship_type = case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else ct.relationship_type end
+        where ct.id = (p_payload->>'id')::uuid
+          and ct.tenant_id = v_tid
+          and ct.deleted_at is null
+        returning id, tenant_id, contact_id, linked_tenant_id, relationship_type, created_at, deleted_at
+        into v_row;
+        if not found then raise exception 'Contact tenant link not found'; end if;
+        perform platform.log_audit('crm_contact_tenant.updated', 'crm_contact_tenant', v_row.id, p_payload - 'id');
+        v_result := to_jsonb(v_row);
+
+    when 'delete_contact_tenant' then
+        v_result := public.crm_soft_delete_row('public.crm_contact_tenants'::regclass, (p_payload->>'id')::uuid);
+        perform platform.log_audit('crm_contact_tenant.deleted', 'crm_contact_tenant', (p_payload->>'id')::uuid);
+
+    -- =================================================
     -- OPPORTUNITIES
     -- =================================================
 
@@ -1697,7 +1875,7 @@ begin
         into v_result
         from (
             select
-                o.id, o.tenant_id, o.customer_account_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id,
+                o.id, o.tenant_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id, o.linked_tenant_id,
                 o.name, o.expected_revenue, o.probability, o.expected_close_date, o.owner_user_id, o.status,
                 o.created_at, o.updated_at, o.deleted_at
             from public.crm_opportunities o
@@ -1713,7 +1891,7 @@ begin
         select to_jsonb(t) into v_result
         from (
             select
-                o.id, o.tenant_id, o.customer_account_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id,
+                o.id, o.tenant_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id, o.linked_tenant_id,
                 o.name, o.expected_revenue, o.probability, o.expected_close_date, o.owner_user_id, o.status,
                 o.created_at, o.updated_at, o.deleted_at
             from public.crm_opportunities o
@@ -1726,17 +1904,17 @@ begin
     when 'create_opportunity' then
         v_tid := platform.current_tenant_id();
         insert into public.crm_opportunities (
-            tenant_id, customer_account_id, pipeline_id, stage_id, name, contact_id, company_id,
+            tenant_id, pipeline_id, stage_id, name, contact_id, company_id, linked_tenant_id,
             expected_revenue, probability, expected_close_date, owner_user_id, status
         )
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             (p_payload->>'pipeline_id')::uuid,
             (p_payload->>'stage_id')::uuid,
             p_payload->>'name',
             case when p_payload ? 'contact_id' and p_payload->>'contact_id' is not null then (p_payload->>'contact_id')::uuid else null end,
             case when p_payload ? 'company_id' and p_payload->>'company_id' is not null then (p_payload->>'company_id')::uuid else null end,
+            case when p_payload ? 'linked_tenant_id' and p_payload->>'linked_tenant_id' is not null then (p_payload->>'linked_tenant_id')::uuid else null end,
             case when p_payload ? 'expected_revenue' and p_payload->>'expected_revenue' is not null then (p_payload->>'expected_revenue')::numeric else null end,
             case when p_payload ? 'probability' and p_payload->>'probability' is not null then (p_payload->>'probability')::numeric else null end,
             case when p_payload ? 'expected_close_date' and p_payload->>'expected_close_date' is not null then (p_payload->>'expected_close_date')::date else null end,
@@ -1744,7 +1922,7 @@ begin
             coalesce((p_payload->>'status')::public.crm_opportunity_status, 'open'::public.crm_opportunity_status)
         )
         returning
-            id, tenant_id, pipeline_id, stage_id, contact_id, company_id, customer_account_id,
+            id, tenant_id, pipeline_id, stage_id, contact_id, company_id, linked_tenant_id,
             name, expected_revenue, probability, expected_close_date, owner_user_id, status,
             created_at, updated_at, deleted_at
         into v_row;
@@ -1754,12 +1932,12 @@ begin
     when 'update_opportunity' then
         v_tid := platform.current_tenant_id();
         update public.crm_opportunities o set
-            customer_account_id = case when p_payload ? 'customer_account_id' then case when p_payload->>'customer_account_id' is null then null else (p_payload->>'customer_account_id')::uuid end else o.customer_account_id end,
             pipeline_id = case when p_payload ? 'pipeline_id' then (p_payload->>'pipeline_id')::uuid else o.pipeline_id end,
             stage_id = case when p_payload ? 'stage_id' then (p_payload->>'stage_id')::uuid else o.stage_id end,
             name = case when p_payload ? 'name' then p_payload->>'name' else o.name end,
             contact_id = case when p_payload ? 'contact_id' then case when p_payload->>'contact_id' is null then null else (p_payload->>'contact_id')::uuid end else o.contact_id end,
             company_id = case when p_payload ? 'company_id' then case when p_payload->>'company_id' is null then null else (p_payload->>'company_id')::uuid end else o.company_id end,
+            linked_tenant_id = case when p_payload ? 'linked_tenant_id' then case when p_payload->>'linked_tenant_id' is null then null else (p_payload->>'linked_tenant_id')::uuid end else o.linked_tenant_id end,
             expected_revenue = case when p_payload ? 'expected_revenue' then case when p_payload->>'expected_revenue' is null then null else (p_payload->>'expected_revenue')::numeric end else o.expected_revenue end,
             probability = case when p_payload ? 'probability' then case when p_payload->>'probability' is null then null else (p_payload->>'probability')::numeric end else o.probability end,
             expected_close_date = case when p_payload ? 'expected_close_date' then case when p_payload->>'expected_close_date' is null then null else (p_payload->>'expected_close_date')::date end else o.expected_close_date end,
@@ -1769,7 +1947,7 @@ begin
           and o.tenant_id = v_tid
           and o.deleted_at is null
         returning
-            o.id, o.tenant_id, o.customer_account_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id,
+            o.id, o.tenant_id, o.pipeline_id, o.stage_id, o.contact_id, o.company_id, o.linked_tenant_id,
             o.name, o.expected_revenue, o.probability, o.expected_close_date, o.owner_user_id, o.status,
             o.created_at, o.updated_at, o.deleted_at
         into v_row;
@@ -2273,6 +2451,8 @@ end;
 $$;
 
 
+
+
 -- -----------------------------------------------------
 -- 003 CRM: whitelist soft-delete targets
 -- -----------------------------------------------------
@@ -2304,6 +2484,8 @@ begin
         'public.crm_contacts',
         'public.crm_leads',
         'public.crm_contact_company',
+        'public.crm_company_tenants',
+        'public.crm_contact_tenants',
         'public.crm_opportunities',
         'public.crm_tasks',
         'public.crm_interactions',
@@ -2331,6 +2513,8 @@ end;
 $$;
 
 
+
+
 create or replace function public.edge_soft_delete_row(
     p_table regclass,
     p_id uuid
@@ -2346,27 +2530,6 @@ begin
 end;
 $$;
 
-create or replace function public.enforce_crm_customer_account_reference()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-begin
-    if new.customer_account_id is null then
-        return new;
-    end if;
-
-    if not exists (
-        select 1
-        from public.customer_accounts ca
-        where ca.id = new.customer_account_id
-    ) then
-        raise exception 'customer_account_id does not reference an existing customer account';
-    end if;
-
-    return new;
-end;
-$$;
 
 
 create or replace function public.enforce_crm_child_tenant_consistency()
@@ -2391,6 +2554,14 @@ begin
         ) then
             raise exception 'contact and company must belong to the same tenant';
         end if;
+    elsif tg_table_name = 'crm_company_tenants' then
+        select c.tenant_id into v_parent_tenant
+        from public.crm_companies c
+        where c.id = new.company_id;
+    elsif tg_table_name = 'crm_contact_tenants' then
+        select c.tenant_id into v_parent_tenant
+        from public.crm_contacts c
+        where c.id = new.contact_id;
     elsif tg_table_name = 'crm_list_members' then
         select l.tenant_id into v_parent_tenant
         from public.crm_lists l
@@ -2430,6 +2601,7 @@ begin
     return new;
 end;
 $$;
+
 
 
 create or replace function public.enforce_crm_custom_field_value_shape()
@@ -2520,6 +2692,7 @@ end;
 $$;
 
 
+
 create or replace function public.enforce_crm_interaction_immutability()
 returns trigger
 language plpgsql
@@ -2547,6 +2720,7 @@ begin
     return new;
 end;
 $$;
+
 
 
 create or replace function public.enforce_crm_interaction_scope()
@@ -2590,6 +2764,7 @@ end;
 $$;
 
 
+
 create or replace function public.enforce_crm_lead_campaign_scope()
 returns trigger
 language plpgsql
@@ -2618,6 +2793,7 @@ begin
     return new;
 end;
 $$;
+
 
 
 create or replace function public.enforce_crm_lead_conversion_scope()
@@ -2652,6 +2828,7 @@ begin
     return new;
 end;
 $$;
+
 
 
 create or replace function public.enforce_crm_note_entity()
@@ -2698,6 +2875,7 @@ end;
 $$;
 
 
+
 create or replace function public.enforce_crm_opportunity_party_scope()
 returns trigger
 language plpgsql
@@ -2730,6 +2908,7 @@ begin
     return new;
 end;
 $$;
+
 
 
 -- =====================================================
@@ -2840,7 +3019,6 @@ end;
 $$;
 
 
-
 create or replace function public.enforce_crm_task_target()
 returns trigger
 language plpgsql
@@ -2885,7 +3063,6 @@ end;
 $$;
 
 
-
 -- -----------------------------------------------------
 -- 003 CRM: domain triggers (lifecycle timestamps / versioning)
 -- -----------------------------------------------------
@@ -2921,8 +3098,6 @@ begin
 end;
 $$;
 
-
-
 create or replace function public.trg_crm_leads_conversion_timestamp()
 returns trigger
 language plpgsql
@@ -2940,7 +3115,6 @@ begin
     return new;
 end;
 $$;
-
 
 create or replace function public.trg_crm_notes_version_increment()
 returns trigger
@@ -3019,22 +3193,6 @@ create trigger trg_crm_opportunities_owner_membership
 before insert or update on public.crm_opportunities
 for each row execute function public.enforce_crm_owner_membership();
 
-create trigger trg_crm_companies_customer_account
-before insert or update on public.crm_companies
-for each row execute function public.enforce_crm_customer_account_reference();
-
-create trigger trg_crm_contacts_customer_account
-before insert or update on public.crm_contacts
-for each row execute function public.enforce_crm_customer_account_reference();
-
-create trigger trg_crm_leads_customer_account
-before insert or update on public.crm_leads
-for each row execute function public.enforce_crm_customer_account_reference();
-
-create trigger trg_crm_opportunities_customer_account
-before insert or update on public.crm_opportunities
-for each row execute function public.enforce_crm_customer_account_reference();
-
 create trigger trg_crm_tasks_owner_membership
 before insert or update on public.crm_tasks
 for each row execute function public.enforce_crm_owner_membership();
@@ -3049,6 +3207,14 @@ for each row execute function public.enforce_crm_child_tenant_consistency();
 
 create trigger trg_crm_contact_company_tenant_consistency
 before insert or update on public.crm_contact_company
+for each row execute function public.enforce_crm_child_tenant_consistency();
+
+create trigger trg_crm_company_tenants_tenant_consistency
+before insert or update on public.crm_company_tenants
+for each row execute function public.enforce_crm_child_tenant_consistency();
+
+create trigger trg_crm_contact_tenants_tenant_consistency
+before insert or update on public.crm_contact_tenants
 for each row execute function public.enforce_crm_child_tenant_consistency();
 
 create trigger trg_crm_list_members_tenant_consistency

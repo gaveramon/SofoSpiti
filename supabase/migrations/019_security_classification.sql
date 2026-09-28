@@ -2340,16 +2340,8 @@ on conflict (
 -- 7. MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (
-    migration_name,
-    version,
-    rollback_available
-)
-values (
-    '019_security_classification',
-    'REV1.SECURITY.CLASSIFICATION',
-    false
-)
+insert into platform.schema_migrations ( migration_name, version, rollback_available)
+values ( '019_security_classification', 'REV1', false)
 on conflict (version) do nothing;
 
 

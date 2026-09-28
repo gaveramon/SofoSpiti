@@ -1858,5 +1858,5 @@ for each row execute function public.enforce_fulfilment_order_consistency();
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('011_logistics_engine', 'REV1.LOGISTICS', false)
+values ('011_logistics_engine', 'REV1', false)
 on conflict (version) do nothing;
