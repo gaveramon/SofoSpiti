@@ -999,6 +999,24 @@ with seed (
 
     (
         'public',
+        'customer_accounts',
+        'portal_user',
+        'Portal actor for authorized customer-account access through the approved API/RPC layer.'
+    ),
+    (
+        'public',
+        'customer_accounts',
+        'platform_admin',
+        'Platform administration and authorized support access to customer accounts.'
+    ),(
+        'public',
+        'customer_accounts',
+        'system',
+        'Trusted system-level operations that require customer-account access.'
+    ),
+
+    (
+        'public',
         'tenants',
         'portal_user',
         'Portal users require tenant-scoped access through approved API/RPC contracts.'
@@ -2438,7 +2456,7 @@ set
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '021_grant_matrix_actors', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 -- =====================================================

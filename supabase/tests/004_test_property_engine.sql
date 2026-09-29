@@ -1551,23 +1551,23 @@ $$;
 -- 20. FINAL TEST RESULT
 -- ============================================================
 
-raise notice
-    '============================================================';
+do $$
+begin
 
-raise notice
-    '004 PROPERTY / DEVICE ENGINE TESTS COMPLETED';
+    raise notice '============================================================';
 
-raise notice
-    'All non-authenticated structural/domain tests passed.';
+    raise notice '004 PROPERTY / DEVICE ENGINE TESTS COMPLETED';
 
-raise notice
-    'Authenticated RLS / grant / portal tests must still be run';
+    raise notice 'All non-authenticated structural/domain tests passed.';
 
-raise notice
-    'with a real authenticated tenant context.';
+    raise notice 'Authenticated RLS / grant / portal tests must still be run';
 
-raise notice
-    '============================================================';
+    raise notice 'with a real authenticated tenant context.';
+
+    raise notice '============================================================';
+
+end;
+$$;
 
 
 -- ============================================================

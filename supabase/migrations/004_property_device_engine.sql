@@ -2022,7 +2022,7 @@ execute function public.deactivate_unassigned_device();
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('004_property_device_engine', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 -- =====================================================
 -- END 004 PROPERTY & DEVICE ENGINE

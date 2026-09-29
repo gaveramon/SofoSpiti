@@ -342,7 +342,7 @@ create table if not exists platform.internal_events (
 
     source text not null, -- system module identifier
     
-    event_type public.platform_event_type not null,
+    event_type text not null,
 
     correlation_id uuid,
 
@@ -1693,7 +1693,7 @@ create index if not exists idx_slow_query_severity
 on platform.slow_query_flags (severity, last_seen);
 
 create unique index if not exists uq_schema_migration_version
-on platform.schema_migrations (version);
+on platform.schema_migrations (migration_name);
 
 create index if not exists idx_migration_exec_time
 on platform.migration_execution_log (executed_at);
@@ -4249,7 +4249,7 @@ $$;
 
 create or replace function platform.publish_internal_event(
     p_source text,
-    p_event_type public.platform_event_type,
+    p_event_type text,
     p_payload jsonb,
     p_correlation_id uuid default null
 )
@@ -5242,4 +5242,4 @@ on conflict (id) do nothing;
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('000_supabase_platform', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;

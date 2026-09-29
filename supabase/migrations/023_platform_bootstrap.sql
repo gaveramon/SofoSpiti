@@ -505,7 +505,7 @@ end $$;
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('023_platform_bootstrap', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 -- =====================================================

@@ -402,7 +402,7 @@ is
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('007_device_telemetry_raw','REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 commit;

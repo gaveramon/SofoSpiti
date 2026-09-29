@@ -956,6 +956,6 @@ comment on table platform.security_table_registry is
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '020_security_hardening', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 commit;

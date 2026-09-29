@@ -4522,4 +4522,4 @@ set search_path = '';
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('006_integration_engine', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;

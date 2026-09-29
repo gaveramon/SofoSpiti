@@ -235,7 +235,30 @@ create table if not exists crm_contacts (
 
 
 -- =====================================================
--- 7. LEADS
+-- 7. COMPANY ↔ TENANT (M:N — REQUIRED FOR NORMALIZATION)
+-- =====================================================
+
+create table if not exists public.crm_company_tenants (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null,
+
+    company_id uuid not null references crm_companies(id) on delete cascade,
+
+    linked_tenant_id uuid,
+
+    relationship_type text,
+
+    created_at timestamptz not null default now(),
+
+    deleted_at timestamptz,
+
+    unique (company_id, linked_tenant_id)
+);
+
+
+-- =====================================================
+-- 8. LEADS
 -- =====================================================
 
 create table if not exists crm_leads (
@@ -295,7 +318,7 @@ create table if not exists crm_leads (
 );
 
 -- =====================================================
--- 8. CONTACT ↔ COMPANY (M:N WITH ROLES)
+-- 9. CONTACT ↔ COMPANY (M:N WITH ROLES)
 -- =====================================================
 
 create table if not exists crm_contact_company (
@@ -318,6 +341,27 @@ create table if not exists crm_contact_company (
     unique (contact_id, company_id, role)
 );
 
+-- =====================================================
+-- 10. CONTACT ↔ TENANT (M:N — REQUIRED FOR NORMALIZATION)
+-- =====================================================
+
+create table if not exists public.crm_contact_tenants (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null,
+
+    contact_id uuid not null references crm_contacts(id) on delete cascade,
+
+    linked_tenant_id uuid,
+
+    relationship_type text,
+
+    created_at timestamptz not null default now(),
+
+    deleted_at timestamptz,
+
+    unique (contact_id, linked_tenant_id)
+);
 
 -- =====================================================
 -- 11. OPPORTUNITIES
@@ -327,8 +371,7 @@ create table if not exists crm_opportunities (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
-    customer_account_id uuid,
-
+    
     pipeline_id uuid not null references crm_pipelines(id) on delete restrict,
 
     stage_id uuid not null references crm_pipeline_stages(id) on delete restrict,
@@ -3117,5 +3160,5 @@ for each row execute function public.trg_crm_notes_version_increment();
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('003_crm_engine', 'REV1.CRM', false)
-on conflict (version) do nothing;
+values ('003_crm_engine', 'REV1', false)
+on conflict (migration_name) do nothing;

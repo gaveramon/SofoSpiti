@@ -606,7 +606,7 @@ for each row execute function platform.set_updated_at();
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('010_preconfig_engine', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 -- =====================================================
 -- END 010 PRECONFIG ENGINE

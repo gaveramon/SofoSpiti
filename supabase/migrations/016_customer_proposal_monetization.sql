@@ -765,7 +765,7 @@ for each row execute function public.trg_customer_proposals_status_timestamps();
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('016_customer_proposal_monetization', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 -- =====================================================

@@ -203,7 +203,7 @@ create table if not exists public.tenant_memberships (
         references platform.profiles(id)
         on delete cascade,
 
-    role public.user_role not null,
+    role membership_role not null,
 
     is_active boolean not null default true,
 
@@ -706,7 +706,9 @@ $$;
 -- 10. USER-TO-TENANT CONTEXT VIEW
 -- =====================================================
 
-create or replace view public.tenant_user_context as
+create or replace view public.tenant_user_context
+with (security_invoker = true)
+as
 select
     tm.user_id,
     tm.tenant_id,
@@ -716,7 +718,6 @@ select
 from public.tenant_memberships tm
 join public.tenants t
     on t.id = tm.tenant_id;
-
 
 -- =====================================================
 -- 11. TENANT SWITCHING AND AUTH DOMAIN
@@ -872,7 +873,7 @@ begin
 
             update public.tenant_memberships tm
             set
-                role = (p_payload->>'role')::public.user_role,
+                role = (p_payload->>'role')::membership_role,
                 is_active = true,
                 revoked_at = null
             where tm.tenant_id = v_tid
@@ -898,7 +899,7 @@ begin
             values (
                 v_tid,
                 (p_payload->>'user_id')::uuid,
-                (p_payload->>'role')::public.user_role,
+                (p_payload->>'role')::public.membership_role,
                 true
             )
             returning
@@ -1395,7 +1396,7 @@ begin
         set
             role = case
                 when p_payload ? 'role'
-                then (p_payload->>'role')::public.user_role
+                then (p_payload->>'role')::public.membership_role
                 else tm.role
             end,
 
@@ -2548,7 +2549,7 @@ is
 --   auth.uid()
 --
 --   public.tenant_status
---   public.user_role
+--   public.membership_role
 --   public.subscription_tier
 --   public.subscription_status
 --
@@ -2579,7 +2580,7 @@ is
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '002_core_saas', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 -- =====================================================

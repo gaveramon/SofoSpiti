@@ -2316,4 +2316,4 @@ for each row execute function public.enforce_property_tenant_consistency();
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '005_booking_lock_engine', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;

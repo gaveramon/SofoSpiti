@@ -671,6 +671,19 @@ values
     -- =================================================
 
     (
+    'public',
+    'customer_accounts',
+    'business',
+    'rpc',
+    true,
+    false,
+    true,
+    true,
+    true,
+    'Business SSOT for customer accounts. Customer accounts may own or manage multiple tenants. Portal access is exclusively through the approved RPC/API layer; direct authenticated table access is denied. RLS and FORCE RLS are required.'
+    ),
+    
+    (
         'public',
         'tenants',
         'business',
@@ -2342,7 +2355,7 @@ on conflict (
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '019_security_classification', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 
 commit;

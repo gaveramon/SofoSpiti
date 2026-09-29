@@ -2,7 +2,7 @@
 supabase/.temp/
 supabase/node_modules/
 node_modules/
-backup migrations 12-9/
+backup migrations/
 supabase/.branches/
 .branches/
 .continue/

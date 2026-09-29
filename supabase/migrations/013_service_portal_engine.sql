@@ -420,7 +420,7 @@ for each row execute function public.enforce_portal_user_preference_membership()
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
 values ('013_service_portal_engine', 'REV1', false)
-on conflict (version) do nothing;
+on conflict (migration_name) do nothing;
 
 -- =====================================================
 -- END 013 SERVICE & PORTAL ENGINE
