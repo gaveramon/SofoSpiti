@@ -195,7 +195,7 @@ create table if not exists public.package_definitions (
 create table if not exists public.fulfilment_orders (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     property_id uuid not null references properties(id) on delete restrict,
 

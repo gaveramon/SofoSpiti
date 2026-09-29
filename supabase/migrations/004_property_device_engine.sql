@@ -1653,6 +1653,159 @@ begin
 
 
 
+    -- =================================================
+    -- TELEMETRY (derived data from 008)
+    -- =================================================
+
+    when 'list_device_metrics' then
+
+        v_tid := platform.current_tenant_id();
+
+        if v_tid is null then
+            raise exception 'no active tenant';
+        end if;
+
+
+        v_device_id :=
+            (p_payload->>'device_id')::uuid;
+
+
+        if not exists (
+            select 1
+            from public.devices d
+            where d.id = v_device_id
+              and d.tenant_id = v_tid
+        ) then
+            raise exception 'Device not found';
+        end if;
+
+
+        select coalesce(
+            jsonb_agg(
+                to_jsonb(t)
+                order by t.observed_at desc
+            ),
+            '[]'::jsonb
+        )
+        into v_result
+        from
+        (
+            select
+                dm.metric_key,
+                dm.metric_value,
+                dm.metric_value_text,
+                dm.unit,
+                dm.observed_at
+            from public.device_metrics dm
+            where dm.device_id = v_device_id
+              and dm.tenant_id = v_tid
+              and (
+                  p_payload->>'metric_key' is null
+                  or dm.metric_key = p_payload->>'metric_key'
+              )
+              and (
+                  p_payload->>'since' is null
+                  or dm.observed_at >= (p_payload->>'since')::timestamptz
+              )
+              and (
+                  p_payload->>'until' is null
+                  or dm.observed_at <= (p_payload->>'until')::timestamptz
+              )
+            order by dm.observed_at desc
+            limit least(
+                coalesce((p_payload->>'limit')::int, 500),
+                2000
+            )
+        ) t;
+
+
+
+    when 'get_device_current_state' then
+
+        v_tid := platform.current_tenant_id();
+
+        if v_tid is null then
+            raise exception 'no active tenant';
+        end if;
+
+
+        v_device_id :=
+            (p_payload->>'device_id')::uuid;
+
+
+        if not exists (
+            select 1
+            from public.devices d
+            where d.id = v_device_id
+              and d.tenant_id = v_tid
+        ) then
+            raise exception 'Device not found';
+        end if;
+
+
+        select coalesce(
+            jsonb_object_agg(
+                dcs.metric_key,
+                jsonb_build_object(
+                    'metric_value',
+                    dcs.metric_value,
+                    'metric_value_text',
+                    dcs.metric_value_text,
+                    'unit',
+                    dcs.unit,
+                    'observed_at',
+                    dcs.observed_at
+                )
+            ),
+            '{}'::jsonb
+        )
+        into v_result
+        from public.device_current_state dcs
+        where dcs.device_id = v_device_id
+          and dcs.tenant_id = v_tid;
+
+
+
+    when 'list_tenant_device_current_state' then
+
+        v_tid := platform.current_tenant_id();
+
+        if v_tid is null then
+            raise exception 'no active tenant';
+        end if;
+
+
+        select coalesce(
+            jsonb_agg(
+                to_jsonb(t)
+                order by t.device_name
+            ),
+            '[]'::jsonb
+        )
+        into v_result
+        from
+        (
+            select
+                d.id as device_id,
+                d.device_name,
+                d.category_code,
+                dcs.metric_key,
+                dcs.metric_value,
+                dcs.metric_value_text,
+                dcs.unit,
+                dcs.observed_at
+            from public.device_current_state dcs
+            join public.devices d
+              on d.id = dcs.device_id
+            where dcs.tenant_id = v_tid
+              and (
+                  p_payload->>'category_code' is null
+                  or d.category_code = p_payload->>'category_code'
+              )
+        ) t;
+
+
+
     else
 
         raise exception
@@ -1928,8 +2081,9 @@ begin
 end;
 $$;
 
+
 -- =====================================================
--- 25. DEVICE DEACTIVATION
+-- 19. DEVICE DEACTIVATION
 -- Whenever a room gets deleted, the unassigned devices
 -- must become inactive.
 -- =====================================================
@@ -1961,7 +2115,7 @@ $$;
 
 
 -- =====================================================
--- 26. TRIGGERS
+-- 20. TRIGGERS
 -- =====================================================
 
 drop trigger if exists trg_properties_updated_at
@@ -2017,7 +2171,7 @@ for each row
 execute function public.deactivate_unassigned_device();
 
 -- =====================================================
--- 28. MIGRATION REGISTRATION
+-- 21. MIGRATION REGISTRATION
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)

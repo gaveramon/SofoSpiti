@@ -275,132 +275,71 @@ where job_name in ('platform-cron-tick', 'platform-daily-maintenance');
 
 
 -- =====================================================
--- 8. SAFETY-NET TENANT RLS
+-- 8. SAFETY-NET TENANT RLS  [REMOVED - see audit fix]
 -- =====================================================
--- Uncovered public.tenant_id tables only.
+-- REMOVED: this block used to auto-create a permissive
+-- "tenant_isolation_<table>" policy for every public
+-- table with a tenant_id column that had no policy left
+-- after 020 dropped the legacy ones.
 --
--- Existing custom domain policies are preserved.
+-- Combined with section 9 below (also removed), this
+-- gave every `authenticated` client direct CRUD access
+-- to ~77 business tables via PostgREST, bypassing the
+-- *_api() RPC layer entirely.
 --
--- resolve_active_tenant() is the sole tenant authority.
+-- That directly contradicts platform.security_table_registry,
+-- which has a HARD CHECK CONSTRAINT
+-- (chk_security_table_registry_no_direct_authenticated)
+-- forcing direct_authenticated_access = false for every
+-- registered table, with no exceptions.
 --
+-- Access to every registered table must go exclusively
+-- through the *_api() SECURITY DEFINER functions granted
+-- in 022_grant_matrix.sql. RLS (enabled + forced by 020,
+-- driven by the registry) is the deny-by-default backstop:
+-- a registered table with zero policies is correctly
+-- inaccessible to `authenticated` and `anon`, and only
+-- reachable by the SECURITY DEFINER function owner.
+--
+-- If a specific table genuinely needs direct client
+-- access (e.g. a narrow "read your own row" case like
+-- platform.profiles), that must be an explicit, reviewed
+-- policy added in its own migration - never a generic
+-- loop over every tenant_id column.
 -- =====================================================
-
-do $$
-declare
-    v_row record;
-    v_policy_name text;
-begin
-
-    for v_row in
-        select distinct
-            c.table_name
-        from information_schema.columns c
-        join information_schema.tables t
-          on t.table_schema = c.table_schema
-         and t.table_name = c.table_name
-        where c.table_schema = 'public'
-          and c.column_name = 'tenant_id'
-          and t.table_type = 'BASE TABLE'
-          and not exists (
-              select 1
-              from pg_policies p
-              where p.schemaname = 'public'
-                and p.tablename = c.table_name
-          )
-        order by c.table_name
-
-    loop
-
-        -- -------------------------------------------------
-        -- Enable RLS
-        -- -------------------------------------------------
-
-        execute format(
-            'alter table public.%I enable row level security',
-            v_row.table_name
-        );
-
-
-        -- -------------------------------------------------
-        -- Force RLS
-        -- -------------------------------------------------
-
-        execute format(
-            'alter table public.%I force row level security',
-            v_row.table_name
-        );
-
-
-        -- -------------------------------------------------
-        -- Generic tenant-isolation policy
-        -- -------------------------------------------------
-
-        v_policy_name :=
-            'tenant_isolation_' || v_row.table_name;
-
-        execute format(
-            'create policy %I
-             on public.%I
-             for all
-             to authenticated
-             using (
-                 tenant_id = public.resolve_active_tenant(auth.uid())
-             )
-             with check (
-                 tenant_id = public.resolve_active_tenant(auth.uid())
-             )',
-            v_policy_name,
-            v_row.table_name
-        );
-
-
-        raise notice
-            '023 bootstrap: applied generic tenant RLS to public.%',
-            v_row.table_name;
-
-    end loop;
-
-end
-$$;
 
 
 -- =====================================================
--- 9. AUTHENTICATED ROLE GRANTS
--- RLS remains the tenant-isolation gate
--- Canonical authenticated grants live here
--- 000 grants service_role only
+-- 9. AUTHENTICATED ROLE GRANTS  [NARROWED - see audit fix]
+-- =====================================================
+-- REMOVED: blanket `grant select, insert, update, delete
+-- on all tables in schema public/platform to authenticated`
+-- and the matching sequence grants. These gave `authenticated`
+-- direct table access regardless of RLS policies, which
+-- violates the RPC-only model above.
+--
+-- `authenticated` still needs USAGE on both schemas to be
+-- able to CALL the *_api() functions (EXECUTE is granted
+-- separately in 022_grant_matrix.sql); it needs nothing
+-- at the table or sequence level.
 -- =====================================================
 
 grant usage on schema public to authenticated;
 
 
-grant select, insert, update, delete on all tables in schema public to authenticated;
-
-
-grant usage, select on all sequences in schema public to authenticated;
-
-
 grant usage on schema platform to authenticated;
 
 
-grant select on all tables in schema platform to authenticated;
-
-
-grant update on table platform.profiles to authenticated;
-
-
 -- =====================================================
--- 10. DEFAULT PRIVILEGES
--- Applies to tables created by migrations after 024, e.g. 015+
+-- 10. DEFAULT PRIVILEGES  [NARROWED - see audit fix]
 -- =====================================================
-
-alter default privileges for role postgres in schema public
-    grant select, insert, update, delete on tables to authenticated;
-
-
-alter default privileges for role postgres in schema public
-    grant usage, select on sequences to authenticated;
-
+-- REMOVED: default privileges that would have granted
+-- `authenticated` direct table/sequence access on every
+-- table created after this migration too (e.g. 015+).
+-- service_role keeps full access below - service_role is
+-- the trusted backend/admin role, not the portal's client
+-- role, so it is not subject to the RPC-only requirement.
+-- =====================================================
 
 alter default privileges for role postgres in schema public
     grant all on tables to service_role;
@@ -408,10 +347,6 @@ alter default privileges for role postgres in schema public
 
 alter default privileges for role postgres in schema public
     grant usage, select on sequences to service_role;
-
-
-alter default privileges for role postgres in schema platform
-    grant select on tables to authenticated;
 
 
 alter default privileges for role postgres in schema platform

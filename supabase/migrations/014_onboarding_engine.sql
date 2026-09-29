@@ -49,7 +49,7 @@ end $$;
 create table if not exists public.onboarding_sessions (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     property_id uuid not null,
 
@@ -75,7 +75,7 @@ create table if not exists public.onboarding_sessions (
 create table if not exists public.onboarding_step_state (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     session_id uuid not null references onboarding_sessions(id) on delete cascade,
 
@@ -97,7 +97,7 @@ create table if not exists public.onboarding_step_state (
 create table if not exists public.onboarding_room_mapping (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     session_id uuid not null references onboarding_sessions(id) on delete cascade,
 
@@ -121,7 +121,7 @@ create table if not exists public.onboarding_room_mapping (
 create table if not exists public.onboarding_device_mapping (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     session_id uuid not null references onboarding_sessions(id) on delete cascade,
 
@@ -151,7 +151,7 @@ create table if not exists public.onboarding_device_mapping (
 create table if not exists public.onboarding_checklist (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     session_id uuid not null references onboarding_sessions(id) on delete cascade,
 
@@ -174,7 +174,7 @@ create table if not exists public.onboarding_checklist (
 create table if not exists public.onboarding_notes (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     session_id uuid not null references onboarding_sessions(id) on delete cascade,
 
@@ -194,7 +194,7 @@ create table if not exists public.onboarding_notes (
 create table if not exists public.onboarding_lifecycle (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     property_id uuid not null references properties(id) on delete cascade,
 
@@ -218,7 +218,7 @@ create table if not exists public.onboarding_lifecycle (
 create table if not exists public.onboarding_lifecycle_transitions (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     lifecycle_id uuid not null references onboarding_lifecycle(id) on delete cascade,
 

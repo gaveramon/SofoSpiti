@@ -163,14 +163,12 @@ $$;
 -- KGS-001 SINGLE SOURCE OF TRUTH
 -- =====================================================
 
-
 do $$
 
 declare
 v_missing int;
 
 begin
-
 
 select count(*)
 into v_missing
@@ -182,7 +180,6 @@ on n.oid=p.pronamespace
 where n.nspname='public'
 and p.proname='resolve_active_tenant';
 
-
 if v_missing = 0 then
 
 raise exception
@@ -190,9 +187,7 @@ raise exception
 
 end if;
 
-
 end $$;
-
 
 
 -- =====================================================
@@ -213,7 +208,6 @@ declare
 v_count int;
 
 begin
-
 
 select count(*)
 into v_count
@@ -236,14 +230,12 @@ where cfg like 'search_path=%'
 )
 );
 
-
 if v_count > 0 then
 
 raise exception
 'Security finalize failed: SECURITY DEFINER functions without hardened search_path detected';
 
 end if;
-
 
 end $$;
 
@@ -456,11 +448,11 @@ begin
 end
 $$;
 
+
 -- =====================================================
 -- 6. VERIFY DOMAIN API SURFACE
 -- KGS-002 MODULE INTERFACE VALIDATION
 -- =====================================================
-
 
 do $$
 
@@ -468,7 +460,6 @@ declare
 v_count int;
 
 begin
-
 
 select count(*)
 into v_count
@@ -488,16 +479,12 @@ raise exception
 
 end if;
 
-
 end $$;
-
-
 
 -- =====================================================
 -- 7. VERIFY REQUIRED PORTAL VIEWS
 -- PORTAL REPORTING SSOT
 -- =====================================================
-
 
 do $$
 
@@ -505,7 +492,6 @@ declare
 v_count int;
 
 begin
-
 
 select count(*)
 into v_count
@@ -522,7 +508,6 @@ and viewname in
 'v_onboarding_progress'
 );
 
-
 if v_count < 5 then
 
 raise exception
@@ -530,9 +515,84 @@ raise exception
 
 end if;
 
-
 end $$;
 
+
+-- =====================================================
+-- 7B. VERIFY NO DIRECT AUTHENTICATED TABLE ACCESS
+-- RPC-ONLY BOUNDARY (audit fix — closes the 023 gap)
+-- =====================================================
+--
+-- platform.security_table_registry enforces
+-- direct_authenticated_access = false for every registered
+-- table via a hard CHECK CONSTRAINT. This section verifies
+-- that the *runtime* grants and policies actually respect
+-- that promise, since section 4 above only checked that
+-- RLS was enabled, not that it was effectively deny-all.
+--
+-- =====================================================
+
+do $$
+declare
+    v_priv_count int;
+    v_priv_list text;
+    v_policy_count int;
+    v_policy_list text;
+begin
+
+    -- ---------------------------------------------------
+    -- (a) No table-level GRANT to `authenticated` on any
+    --     registered table.
+    -- ---------------------------------------------------
+
+    select
+        count(*)::int,
+        string_agg(format('%I.%I', r.table_schema, r.table_name), ', ' order by 1)
+    into v_priv_count, v_priv_list
+    from platform.security_table_registry r
+    where r.is_active
+      and r.direct_authenticated_access = false
+      and (
+          has_table_privilege('authenticated', format('%I.%I', r.table_schema, r.table_name), 'SELECT')
+          or has_table_privilege('authenticated', format('%I.%I', r.table_schema, r.table_name), 'INSERT')
+          or has_table_privilege('authenticated', format('%I.%I', r.table_schema, r.table_name), 'UPDATE')
+          or has_table_privilege('authenticated', format('%I.%I', r.table_schema, r.table_name), 'DELETE')
+      );
+
+    if v_priv_count > 0 then
+        raise exception
+            'RPC-only validation failed: % registered table(s) grant direct table privileges to authenticated: %',
+            v_priv_count, v_priv_list;
+    end if;
+
+    -- ---------------------------------------------------
+    -- (b) No RLS policy exists on any registered table
+    --     (deny-by-default via RLS + no policy is required;
+    --     policies are only added deliberately, per table,
+    --     outside this generic gate).
+    -- ---------------------------------------------------
+
+    select
+        count(*)::int,
+        string_agg(format('%I.%I (%s)', r.table_schema, r.table_name, p.policyname), ', ' order by 1)
+    into v_policy_count, v_policy_list
+    from platform.security_table_registry r
+    join pg_policies p
+      on p.schemaname = r.table_schema
+     and p.tablename = r.table_name
+    where r.is_active
+      and r.direct_authenticated_access = false;
+
+    if v_policy_count > 0 then
+        raise exception
+            'RPC-only validation failed: % policy(ies) exist on registered no-direct-access tables: %',
+            v_policy_count, v_policy_list;
+    end if;
+
+    raise notice 'RPC-only validation passed: no direct authenticated access on registered tables';
+
+end
+$$;
 
 
 -- =====================================================
@@ -543,16 +603,13 @@ end $$;
 -- 023_platform_bootstrap.sql
 -- =====================================================
 
-
 select platform.ensure_pg_cron_jobs();
-
 
 
 -- =====================================================
 -- 9. REGISTER FINAL PRODUCTION AUDIT EVENT
 -- HUMAN APPROVAL CHECKPOINT
 -- =====================================================
-
 
 insert into platform.audit_log
 (
@@ -583,7 +640,6 @@ values
 -- 10. REGISTER MIGRATION
 -- FINAL MIGRATION STATE
 -- =====================================================
-
 
 insert into platform.schema_migrations( migration_name, version, rollback_available)
 values( '024_production_finalize', 'REV1', false)

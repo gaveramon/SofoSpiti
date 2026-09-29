@@ -211,7 +211,7 @@ comment on column public.integration_oauth_configs.token_url is
     'Provider OAuth token endpoint. Non-secret configuration.';
 
 comment on column public.integration_oauth_configs.default_scopes is
-    'Default OAuth scopes requested by SmartHellas for this provider.';
+    'Default OAuth scopes requested by SofoSpiti for this provider.';
 
 comment on column public.integration_oauth_configs.client_auth_method is
     'OAuth client authentication method used at the token endpoint.';
@@ -254,7 +254,7 @@ create table if not exists public.tenant_integrations (
 
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     provider_code text not null,
 
@@ -282,7 +282,7 @@ create table if not exists public.webhook_definitions (
 
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     provider_code text not null,
 
@@ -308,7 +308,7 @@ create table if not exists public.device_integration_map (
 
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     device_id uuid not null references public.devices(id) on delete cascade,
 
@@ -524,7 +524,7 @@ where is_active = true;
 -- HARDWARE IDENTITY UNIQUENESS
 --
 -- One physical provider device may not map to multiple
--- SmartHellas devices within the same tenant/provider.
+-- SofoSpiti devices within the same tenant/provider.
 -- =====================================================
 
 create unique index if not exists uq_device_integration_tenant_provider_hardware
@@ -939,7 +939,7 @@ begin
     -- PROTECT AGAINST CROSS-DEVICE COLLISION
     --
     -- The new external ID may not already belong to a
-    -- different SmartHellas device.
+    -- different SofoSpiti device.
     -- =================================================
 
     if exists (
@@ -3999,7 +3999,7 @@ $$;
 -- 20. RESOLVE OR RECONCILE PROVIDER DEVICE
 --
 -- Purpose:
--- Resolve a provider device to a SmartHellas device.
+-- Resolve a provider device to a SofoSpiti device.
 --
 -- Resolution order:
 --
@@ -4084,7 +4084,7 @@ begin
     if v_device_id is null then
 
         raise exception
-            'No SmartHellas device mapping found for provider % and hardware identity %',
+            'No SofoSpiti device mapping found for provider % and hardware identity %',
             p_provider_code,
             p_hardware_id;
     end if;
@@ -4146,7 +4146,7 @@ $$;
 -- - Resolve provider event ID
 -- - Resolve provider device identity
 -- - Resolve tenant
--- - Resolve SmartHellas device
+-- - Resolve SofoSpiti device
 -- - Resolve event timestamp
 -- - Route resolved telemetry to 007
 --
@@ -4368,7 +4368,7 @@ begin
 
         if v_device_id is null then
             raise exception
-                'No SmartHellas device mapping found for provider %, tenant %, external device %',
+                'No SofoSpiti device mapping found for provider %, tenant %, external device %',
                 v_provider_code,
                 v_tenant_id,
                 v_device_external_id;

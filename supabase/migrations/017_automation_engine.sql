@@ -17,7 +17,7 @@
 create table if not exists public.automation_runs (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     workflow_id uuid not null references operation_workflows(id) on delete restrict,
 
@@ -48,7 +48,7 @@ create table if not exists public.automation_runs (
 create table if not exists public.automation_run_steps (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     run_id uuid not null references automation_runs(id) on delete cascade,
 
@@ -81,7 +81,7 @@ create table if not exists public.automation_run_steps (
 create table if not exists public.automation_event_subscriptions (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null,
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
 
     workflow_trigger_id uuid not null references workflow_triggers(id) on delete cascade,
 

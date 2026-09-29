@@ -1291,12 +1291,32 @@ values
     -- =================================================
     -- 008 DEVICE TELEMETRY PROCESSING
     -- =================================================
-    --
-    -- No additional 008 telemetry-processing tables were
-    -- present in the supplied registry input. Do not invent
-    -- table names here; they must be added from migration
-    -- 008 once its authoritative table list is available.
-    -- =================================================
+    
+    (
+        'public',
+        'device_metrics',
+        'business',
+        'rpc',
+        false,
+        false,
+        true,
+        true,
+        true,
+        'Normalized device telemetry time series. Portal access exclusively through devices_domain()/devices_api(); no direct authenticated table access.'
+    ),
+    (
+        'public',
+        'device_current_state',
+        'business',
+        'rpc',
+        false,
+        false,
+        true,
+        true,
+        true,
+        'Latest known device metric state used by portal dashboards and device lists. Portal access exclusively through devices_domain()/devices_api(); no direct authenticated table access.'
+    ),
+
 
     -- =================================================
     -- 009 OPERATIONS ENGINE
@@ -1663,6 +1683,45 @@ values
         true,
         true,
         'Tenant-scoped and platform-wide subscription upsell rule definitions. Portal access exclusively through commerce API/RPC contracts; tenant managers and platform admins are authorized by RPC.'
+    ),
+
+    (
+        'public',
+        'invoices',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped invoices. Portal access exclusively through commerce/payment API/RPC contracts.'
+    ),
+
+    (
+        'public',
+        'discount_codes',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped or platform-wide discount/coupon definitions. Portal access exclusively through commerce API/RPC contracts.'
+    ),
+
+    (
+        'public',
+        'discount_redemptions',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped discount redemption ledger. Portal access exclusively through commerce API/RPC contracts.'
     ),
 
     -- =================================================

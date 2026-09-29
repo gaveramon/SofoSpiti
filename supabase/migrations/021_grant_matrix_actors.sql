@@ -46,7 +46,7 @@
 -- IMPORTANT
 -- ---------
 --
--- 018b owns:
+-- 020 owns:
 --   - RLS
 --   - FORCE RLS
 --   - SECURITY DEFINER hardening
@@ -1645,6 +1645,36 @@ with seed (
     ),
 
     -- =================================================
+    -- 008 DEVICE TELEMETRY PROCESSING
+    -- =================================================
+
+    (
+    'public',
+    'device_metrics',
+    'telemetry_worker',
+    'Server-side telemetry processing context for raw telemetry ingestion and downstream telemetry processing.'
+    ),
+    (
+    'public',
+    'device_metrics',
+    'platform_admin',
+    'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+
+    (
+    'public',
+    'device_current_state',
+    'telemetry_worker',
+    'Server-side telemetry processing context for raw telemetry ingestion and downstream telemetry processing.'
+    ),
+    (
+    'public',
+    'device_current_state',
+    'platform_admin',
+    'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+
+    -- =================================================
     -- 009 OPERATIONS
     -- =================================================
 
@@ -1991,6 +2021,33 @@ with seed (
         'upsell_rules',
         'platform_admin',
         'Platform administrators require controlled upsell rule administration.'
+    ),
+
+    (
+        'public',
+        'invoices',
+        'platform_admin',
+        'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+    (
+        'public',
+        'invoices',
+        'system',
+        'Internal server-side system context for explicitly authorized technical and maintenance operations.'
+    ),
+
+    (
+        'public',
+        'discount_codes',
+        'platform_admin',
+        'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+
+    (
+        'public',
+        'discount_redemptions',
+        'platform_admin',
+        'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
     ),
 
     -- =================================================

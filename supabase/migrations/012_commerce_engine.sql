@@ -108,6 +108,117 @@ create table if not exists public.upsell_rules (
 
 
 -- =====================================================
+-- 4B. INVOICES
+-- =====================================================
+-- Audit fix: public.payment_intents (000) has always
+-- supported target_type = 'invoice' and defensively
+-- checks `to_regclass('public.invoices')`, but the table
+-- itself was never created. This adds the minimal table
+-- that check assumes exists.
+-- =====================================================
+
+create table if not exists public.invoices (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
+
+    subscription_id uuid references public.subscriptions(id) on delete set null,
+
+    invoice_number text not null,
+
+    status text not null default 'draft'
+        check (status in ('draft', 'open', 'paid', 'void', 'uncollectible')),
+
+    currency text not null default 'EUR'
+        check (char_length(currency) = 3),
+
+    subtotal numeric(10,2) not null default 0,
+    discount_amount numeric(10,2) not null default 0,
+    tax_amount numeric(10,2) not null default 0,
+    total_amount numeric(10,2) not null default 0,
+
+    issued_at timestamptz,
+    due_at timestamptz,
+    paid_at timestamptz,
+
+    created_at timestamptz default now(),
+    updated_at timestamptz default now(),
+
+    constraint chk_invoices_total_non_negative
+        check (total_amount >= 0),
+
+    unique (tenant_id, invoice_number)
+);
+
+
+-- =====================================================
+-- 4C. DISCOUNTS / COUPONS
+-- =====================================================
+-- Audit fix: no discount/coupon/voucher concept existed
+-- anywhere in the schema. This adds the minimal catalogue
+-- + redemption-tracking tables. RPC wiring (validating and
+-- applying a code at checkout/subscription-change time)
+-- still needs to be added to commerce_api() before this is
+-- usable end-to-end - schema only for now.
+-- =====================================================
+
+create table if not exists public.discount_codes (
+    id uuid primary key default gen_random_uuid(),
+
+    -- null tenant_id = platform-wide code, usable by any tenant
+    tenant_id uuid references public.tenants(id) on delete cascade,
+
+    code text not null,
+
+    discount_type text not null
+        check (discount_type in ('percentage', 'fixed_amount')),
+
+    value numeric(10,2) not null
+        check (value > 0),
+
+    currency text default 'EUR'
+        check (currency is null or char_length(currency) = 3),
+
+    applies_to_plan_id uuid references public.product_plans(id),
+
+    max_redemptions int,
+    redeemed_count int not null default 0,
+
+    valid_from timestamptz not null default now(),
+    valid_until timestamptz,
+
+    is_active boolean not null default true,
+
+    created_at timestamptz default now(),
+    updated_at timestamptz default now(),
+
+    constraint chk_discount_codes_percentage_range
+        check (discount_type <> 'percentage' or (value > 0 and value <= 100)),
+
+    constraint chk_discount_codes_redemption_cap
+        check (max_redemptions is null or redeemed_count <= max_redemptions),
+
+    unique (code)
+);
+
+create table if not exists public.discount_redemptions (
+    id uuid primary key default gen_random_uuid(),
+
+    discount_code_id uuid not null references public.discount_codes(id) on delete cascade,
+
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
+
+    invoice_id uuid references public.invoices(id) on delete set null,
+    subscription_id uuid references public.subscriptions(id) on delete set null,
+
+    amount_applied numeric(10,2) not null
+        check (amount_applied >= 0),
+
+    redeemed_at timestamptz not null default now()
+);
+
+
+-- =====================================================
 -- 5. SUBSCRIPTION ↔ PLAN BINDING
 -- =====================================================
 -- Extends the subscriptions SSOT from 002 with the

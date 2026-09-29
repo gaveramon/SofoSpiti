@@ -1421,7 +1421,10 @@ begin
             'list_device_categories',
             'list_devices',
             'get_device',
-            'get_device_config'
+            'get_device_config',
+            'list_device_metrics',
+            'get_device_current_state',
+            'list_tenant_device_current_state'
         then
             perform public.edge_require_tenant();
 
@@ -2305,8 +2308,8 @@ $$;
 -- Grants/revokes belong to 022.
 -- =====================================================
 
-insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('018_edge_rpc_foundation','REV1', false)
+insert into platform.schema_migrations (migration_name,version,rollback_available)
+values ('018_edge_rpc_foundation','REV1',false)
 on conflict (migration_name) do nothing;
 
 
