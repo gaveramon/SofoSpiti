@@ -1049,12 +1049,17 @@ begin
 
         when
             'update_tenant',
-            'update_subscription',
             'create_service_account',
             'update_service_account',
             'delete_service_account'
         then
             perform public.edge_require_admin();
+
+        -- Billing state (status, period) is platform-controlled.
+        -- A tenant admin must not be able to reactivate an expired or
+        -- suspended subscription or extend its period without payment.
+        when 'update_subscription' then
+            perform public.edge_require_platform_admin();
 
         else
             raise exception
@@ -1257,6 +1262,23 @@ begin
             'update_upsell_rule',
             'delete_upsell_rule',
             'change_plan'
+        then
+            perform public.edge_require_manager();
+
+        when
+            'list_discount_codes',
+            'create_discount_code',
+            'update_discount_code',
+            'deactivate_discount_code'
+        then
+            perform public.edge_require_platform_admin();
+
+        when
+            'validate_discount_code',
+            'apply_discount_to_invoice',
+            'list_discount_redemptions',
+            'list_invoices',
+            'get_invoice'
         then
             perform public.edge_require_manager();
 

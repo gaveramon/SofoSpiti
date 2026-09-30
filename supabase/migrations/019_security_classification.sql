@@ -1724,6 +1724,19 @@ values
         'Tenant-scoped discount redemption ledger. Portal access exclusively through commerce API/RPC contracts.'
     ),
 
+    (
+        'public',
+        'invoice_lines',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped invoice line items. Written by the backend; portal read access exclusively through commerce API/RPC contracts.'
+    ),
+
     -- =================================================
     -- 013 SERVICE & PORTAL ENGINE
     -- =================================================

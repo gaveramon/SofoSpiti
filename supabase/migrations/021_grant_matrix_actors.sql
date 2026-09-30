@@ -2026,6 +2026,12 @@ with seed (
     (
         'public',
         'invoices',
+        'portal_user',
+        'Portal users read their tenant invoices through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'invoices',
         'platform_admin',
         'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
     ),
@@ -2036,6 +2042,12 @@ with seed (
         'Internal server-side system context for explicitly authorized technical and maintenance operations.'
     ),
 
+     (
+        'public',
+        'discount_codes',
+        'portal_user',
+        'Portal users validate discount codes through approved commerce API/RPC contracts.'
+    ),
     (
         'public',
         'discount_codes',
@@ -2046,8 +2058,33 @@ with seed (
     (
         'public',
         'discount_redemptions',
+        'portal_user',
+        'Portal users redeem discount codes and read their redemptions through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'discount_redemptions',
         'platform_admin',
         'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+     
+    (
+        'public',
+        'invoice_lines',
+        'portal_user',
+        'Portal users read invoice lines through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'invoice_lines',
+        'platform_admin',
+        'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+    (
+        'public',
+        'invoice_lines',
+        'system',
+        'Internal server-side system context (invoice generator) for explicitly authorized technical and maintenance operations.'
     ),
 
     -- =================================================

@@ -590,6 +590,7 @@ do update set
     is_active = excluded.is_active,
     updated_at = now();
 
+
 -- =====================================================
 -- INTEGRATION OAUTH CONFIGURATION SEED
 -- =====================================================
@@ -670,3 +671,129 @@ set
     redirect_uri_mode = excluded.redirect_uri_mode,
     is_active = excluded.is_active,
     updated_at = now();
+
+-- =====================================================
+-- 012 COMMERCE CATALOGUE (required reference data)
+-- =====================================================
+--
+-- aDIT MOET WORDEN AANGEPAST IS TESTDATA!!!!!!!!!!
+--
+-- Run AFTER all migrations and BEFORE the first tenant is
+-- created. The tenant trigger (012, provision_default_subscription)
+-- fails with NO_DEFAULT_PRODUCT_PLAN when no default plan exists.
+--
+-- Contains: plans, feature entitlements. No prices, see
+-- seed_commerce_pricing_example.sql.
+--
+-- Idempotent and non-destructive: existing rows are left
+-- untouched, so changes made by a platform admin survive a re-run.
+--
+-- PRODUCTION: a plain `supabase db push` does NOT run seed files.
+-- Run this file explicitly against production once.
+--
+-- Feature keys map to public.service_type through
+-- platform.sync_service_activation_state():
+--   auto_door_code       -> auto_door_code
+--   energy_optimization  -> energy_optimization
+--   energy_reports       -> energy_optimization (portal report gating)
+--   security_monitoring  -> security_monitoring
+--   managed_service      -> managed_service
+-- The plan/feature split below is a PROPOSAL, adjust as needed.
+-- =====================================================
+
+insert into public.product_plans (name, description, tier, is_active, is_default)
+values
+    (
+        'Basic',
+        'Starter plan: automatic door codes.',
+        'basic',
+        true,
+        true
+    ),
+    (
+        'Pro',
+        'Door codes, energy optimization and security monitoring.',
+        'pro',
+        true,
+        false
+    ),
+    (
+        'Enterprise',
+        'Everything in Pro plus managed service.',
+        'enterprise',
+        true,
+        false
+    )
+on conflict ((lower(name))) do nothing;
+
+
+insert into public.feature_entitlements (plan_id, feature_key, enabled)
+select
+    pp.id,
+    v.feature_key,
+    true
+from (
+    values
+        ('basic',      'auto_door_code'),
+
+        ('pro',        'auto_door_code'),
+        ('pro',        'energy_optimization'),
+        ('pro',        'energy_reports'),
+        ('pro',        'security_monitoring'),
+
+        ('enterprise', 'auto_door_code'),
+        ('enterprise', 'energy_optimization'),
+        ('enterprise', 'energy_reports'),
+        ('enterprise', 'security_monitoring'),
+        ('enterprise', 'managed_service')
+) as v(plan_name, feature_key)
+join public.product_plans pp
+  on lower(pp.name) = v.plan_name
+on conflict (plan_id, feature_key) do nothing;
+
+
+-- Sanity check: exactly one active default plan.
+do $$
+begin
+    if (
+        select count(*)
+        from public.product_plans
+        where is_default and is_active is true
+    ) <> 1 then
+        raise exception
+            'seed_commerce: expected exactly one active default plan';
+    end if;
+end
+$$;
+
+
+-- =====================================================
+-- EXAMPLE PRICING  --  DEVELOPMENT / TEST ONLY
+-- =====================================================
+--
+-- !! THESE ARE EXAMPLE PRICES, NOT REAL ONES. !!
+-- Do not run against production until the real prices are
+-- filled in.
+--
+-- Safe default without this file: plans without a plan_pricing
+-- row cannot be self-assigned through change_plan (PAYMENT_REQUIRED).
+-- With this file every plan has a positive price, so all plan
+-- changes must go through checkout.
+-- =====================================================
+
+
+insert into public.plan_pricing (plan_id, currency, monthly_price, yearly_price)
+select
+    pp.id,
+    'EUR',
+    v.monthly_price,
+    v.yearly_price
+from (
+    values
+        ('basic',      19.00,  190.00),
+        ('pro',        49.00,  490.00),
+        ('enterprise', 149.00, 1490.00)
+) as v(plan_name, monthly_price, yearly_price)
+join public.product_plans pp
+  on lower(pp.name) = v.plan_name
+on conflict (plan_id, currency) do nothing;

@@ -416,22 +416,81 @@ begin
         where c.table_schema = 'public'
           and c.column_name = 'tenant_id'
           and t.table_type = 'BASE TABLE'
-          and (
-              not pc.relrowsecurity
-              or not exists (
-                  select 1
-                  from pg_policies p
-                  where p.schemaname = 'public'
-                    and p.tablename = c.table_name
-              )
-          )
+          and not pc.relrowsecurity
         order by c.table_name
     loop
         raise warning
-            '023 bootstrap: public.% has tenant_id but RLS is disabled or has no policies',
+            '023 bootstrap: public.% has tenant_id but RLS is disabled',
             v_row.table_name;
     end loop;
 end $$;
+
+
+-- =====================================================
+-- 12B. PLATFORM ADMIN BOOTSTRAP (BACKEND ONLY)
+-- =====================================================
+-- platform.platform_admins is empty on a fresh database, and the
+-- portal cannot add rows (no direct table access). Without a first
+-- platform admin nobody can manage plans, prices, discount codes
+-- or providers.
+--
+-- Usage (SQL editor / psql / service_role) after the user signed up:
+--
+--     select platform.bootstrap_platform_admin('admin@example.com');
+--
+-- Idempotent. EXECUTE is limited to service_role.
+-- =====================================================
+
+create or replace function platform.bootstrap_platform_admin(p_email text)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_user_id uuid;
+begin
+    if coalesce((select auth.role()), '') in ('anon', 'authenticated') then
+        raise exception 'BACKEND_EXECUTION_REQUIRED';
+    end if;
+
+    if p_email is null or btrim(p_email) = '' then
+        raise exception 'p_email is required';
+    end if;
+
+    select p.id
+    into v_user_id
+    from platform.profiles p
+    where lower(p.email::text) = lower(btrim(p_email))
+      and coalesce(p.is_active, true);
+
+    if v_user_id is null then
+        raise exception
+            'No active profile for %. The user must sign up first.', p_email;
+    end if;
+
+    insert into platform.platform_admins (user_id)
+    values (v_user_id)
+    on conflict (user_id) do nothing;
+
+    perform platform.log_audit(
+        'platform_admin.bootstrapped',
+        'platform_admin',
+        v_user_id,
+        jsonb_build_object('email', lower(btrim(p_email)))
+    );
+
+    return v_user_id;
+end;
+$$;
+
+revoke all
+on function platform.bootstrap_platform_admin(text)
+from public, anon, authenticated;
+
+grant execute
+on function platform.bootstrap_platform_admin(text)
+to service_role;
 
 
 -- =====================================================

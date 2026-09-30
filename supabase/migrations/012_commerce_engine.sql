@@ -26,9 +26,17 @@ create table if not exists public.product_plans (
 
     is_active boolean default true,
 
+    -- Plan every new tenant is provisioned with
+    -- (see provision_default_subscription in section 15).
+    -- At most one plan can be the default (unique index).
+    is_default boolean not null default false,
+
     created_at timestamptz default now(),
 
-    updated_at timestamptz default now()
+    updated_at timestamptz default now(),
+
+    constraint chk_product_plans_default_active
+        check (not is_default or is_active is true)
 );
 
 
@@ -150,16 +158,91 @@ create table if not exists public.invoices (
     unique (tenant_id, invoice_number)
 );
 
+create index if not exists idx_invoices_tenant_created
+on public.invoices (tenant_id, created_at desc);
+
+create index if not exists idx_invoices_tenant_status
+on public.invoices (tenant_id, status);
+
+
+-- =====================================================
+-- 4B.1 INVOICE LINES
+-- =====================================================
+-- Line items returned by get_invoice. Written by the backend
+-- (invoice generator, service_role); read-only for the portal
+-- through commerce_api.
+-- =====================================================
+
+create table if not exists public.invoice_lines (
+    id uuid primary key default gen_random_uuid(),
+
+    invoice_id uuid not null
+        references public.invoices(id) on delete cascade,
+
+    tenant_id uuid not null
+        references public.tenants(id) on delete cascade,
+
+    description text not null,
+
+    quantity numeric(10,2) not null default 1
+        check (quantity > 0),
+
+    unit_amount numeric(10,2) not null default 0,
+
+    line_amount numeric(10,2) not null default 0,
+
+    sort_order int not null default 0,
+
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_invoice_lines_invoice
+on public.invoice_lines (invoice_id, sort_order);
+
+create index if not exists idx_invoice_lines_tenant
+on public.invoice_lines (tenant_id);
+
+create or replace function public.enforce_invoice_line_tenant_consistency()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_invoice_tenant uuid;
+begin
+    select i.tenant_id
+    into v_invoice_tenant
+    from public.invoices i
+    where i.id = new.invoice_id;
+
+    if v_invoice_tenant is distinct from new.tenant_id then
+        raise exception 'invoice_lines.tenant_id must match invoices.tenant_id';
+    end if;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists trg_invoice_lines_tenant_consistency on public.invoice_lines;
+
+create trigger trg_invoice_lines_tenant_consistency
+before insert or update of invoice_id, tenant_id on public.invoice_lines
+for each row execute function public.enforce_invoice_line_tenant_consistency();
+
 
 -- =====================================================
 -- 4C. DISCOUNTS / COUPONS
 -- =====================================================
 -- Audit fix: no discount/coupon/voucher concept existed
--- anywhere in the schema. This adds the minimal catalogue
--- + redemption-tracking tables. RPC wiring (validating and
--- applying a code at checkout/subscription-change time)
--- still needs to be added to commerce_api() before this is
--- usable end-to-end - schema only for now.
+-- anywhere in the schema. This adds the catalogue and the
+-- redemption ledger. RPC wiring lives in commerce_domain() /
+-- commerce_api():
+--   platform admin : list / create / update / deactivate_discount_code
+--   tenant manager : validate_discount_code,
+--                    apply_discount_to_invoice,
+--                    list_discount_redemptions
+-- Rules: one code per invoice, one redemption per tenant per
+-- code (relax by dropping uq_discount_redemptions_code_tenant).
 -- =====================================================
 
 create table if not exists public.discount_codes (
@@ -197,6 +280,15 @@ create table if not exists public.discount_codes (
 
     constraint chk_discount_codes_redemption_cap
         check (max_redemptions is null or redeemed_count <= max_redemptions),
+
+    constraint chk_discount_codes_max_redemptions_positive
+        check (max_redemptions is null or max_redemptions > 0),
+
+    constraint chk_discount_codes_code_normalized
+        check (code <> '' and code = upper(btrim(code))),
+
+    constraint chk_discount_codes_validity_window
+        check (valid_until is null or valid_until > valid_from),
 
     unique (code)
 );
@@ -270,6 +362,23 @@ on public.subscriptions (plan_id);
 
 create index if not exists idx_subscriptions_tenant_created
 on public.subscriptions (tenant_id, created_at desc);
+
+create unique index if not exists uq_product_plans_single_default
+on public.product_plans (is_default)
+where is_default;
+
+create unique index if not exists uq_product_plans_name
+on public.product_plans ((lower(name)));
+
+create unique index if not exists uq_discount_redemptions_invoice
+on public.discount_redemptions (invoice_id)
+where invoice_id is not null;
+
+create unique index if not exists uq_discount_redemptions_code_tenant
+on public.discount_redemptions (discount_code_id, tenant_id);
+
+create index if not exists idx_discount_redemptions_tenant
+on public.discount_redemptions (tenant_id, redeemed_at desc);
 
 drop index if exists public.uq_subscriptions_active_tenant;
 
@@ -453,6 +562,101 @@ $$;
 
 
 -- =====================================================
+-- 11B. DISCOUNT HELPERS (internal, not portal-callable)
+-- =====================================================
+-- Execute privilege is revoked for anon/authenticated by 022.
+-- =====================================================
+
+create or replace function public.commerce_compute_discount_amount(
+    p_discount_type text,
+    p_value numeric,
+    p_base numeric
+)
+returns numeric
+language sql
+immutable
+set search_path = ''
+as $$
+    select greatest(
+        0,
+        case p_discount_type
+            when 'percentage'   then round(p_base * p_value / 100, 2)
+            when 'fixed_amount' then least(p_value, p_base)
+            else 0
+        end
+    );
+$$;
+
+
+-- Returns the discount code row when the tenant may use it right
+-- now, otherwise a row with id = null. The reason is deliberately
+-- not distinguished (prevents probing for existing codes).
+-- p_lock = true takes a row lock so max_redemptions cannot be
+-- exceeded by concurrent redemptions.
+create or replace function public.commerce_find_usable_discount_code(
+    p_tenant_id uuid,
+    p_code text,
+    p_plan_id uuid default null,
+    p_currency text default null,
+    p_lock boolean default false
+)
+returns public.discount_codes
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_row public.discount_codes;
+    v_none public.discount_codes;
+begin
+    if p_code is null or btrim(p_code) = '' then
+        return v_none;
+    end if;
+
+    if p_lock then
+        select dc.*
+        into v_row
+        from public.discount_codes dc
+        where dc.code = upper(btrim(p_code))
+        for update;
+    else
+        select dc.*
+        into v_row
+        from public.discount_codes dc
+        where dc.code = upper(btrim(p_code));
+    end if;
+
+    if v_row.id is null
+       or not v_row.is_active
+       or v_row.valid_from > now()
+       or (v_row.valid_until is not null and v_row.valid_until <= now())
+       or (v_row.max_redemptions is not null
+           and v_row.redeemed_count >= v_row.max_redemptions)
+       or (v_row.tenant_id is not null
+           and v_row.tenant_id is distinct from p_tenant_id)
+       or (v_row.applies_to_plan_id is not null
+           and p_plan_id is not null
+           and v_row.applies_to_plan_id <> p_plan_id)
+       or (v_row.discount_type = 'fixed_amount'
+           and p_currency is not null
+           and v_row.currency is not null
+           and upper(v_row.currency) <> upper(p_currency))
+       or exists (
+            select 1
+            from public.discount_redemptions r
+            where r.discount_code_id = v_row.id
+              and r.tenant_id = p_tenant_id
+       )
+    then
+        return v_none;
+    end if;
+
+    return v_row;
+end;
+$$;
+
+
+-- =====================================================
 -- 12. COMMERCE DOMAIN API
 -- =====================================================
 
@@ -471,6 +675,13 @@ declare
     v_result jsonb;
     v_plan record;
     v_sub record;
+    v_code public.discount_codes;
+    v_inv record;
+    v_base numeric;
+    v_discount numeric;
+    v_new_tax numeric;
+    v_limit int;
+    v_offset int;
 begin
     p_payload := coalesce(p_payload, '{}'::jsonb);
 
@@ -1111,6 +1322,28 @@ begin
             return v_result;
 
         when 'change_plan' then
+            -- A tenant may only switch itself to a FREE plan (pricing row
+            -- present, no positive price). Paid plans are activated by the
+            -- backend after a successful payment (service_role). Without
+            -- this guard any tenant manager could upgrade to any plan for
+            -- free. Platform admins are exempt.
+            if not public.is_platform_admin() then
+                if not exists (
+                    select 1
+                    from public.plan_pricing pr
+                    where pr.plan_id = (p_payload->>'plan_id')::uuid
+                ) or exists (
+                    select 1
+                    from public.plan_pricing pr
+                    where pr.plan_id = (p_payload->>'plan_id')::uuid
+                      and (coalesce(pr.monthly_price, 0) > 0
+                           or coalesce(pr.yearly_price, 0) > 0)
+                ) then
+                    raise exception
+                        'PAYMENT_REQUIRED: this plan is activated after payment (use payment_api create_checkout_session)';
+                end if;
+            end if;
+
             v_result := public.commerce_change_subscription_plan(
                 (p_payload->>'plan_id')::uuid
             );
@@ -1124,6 +1357,427 @@ begin
                     'tier', v_result->>'tier'
                 )
             );
+
+            return v_result;
+
+        -- =================================================
+        -- DISCOUNT CODES - PLATFORM ADMIN
+        -- =================================================
+
+        when 'list_discount_codes' then
+
+            select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    dc.id,
+                    dc.tenant_id,
+                    dc.code,
+                    dc.discount_type,
+                    dc.value,
+                    dc.currency,
+                    dc.applies_to_plan_id,
+                    dc.max_redemptions,
+                    dc.redeemed_count,
+                    dc.valid_from,
+                    dc.valid_until,
+                    dc.is_active,
+                    dc.created_at,
+                    dc.updated_at
+                from public.discount_codes dc
+                where (p_payload->>'is_active' is null
+                       or dc.is_active = (p_payload->>'is_active')::boolean)
+                  and (p_payload->>'tenant_id' is null
+                       or dc.tenant_id = (p_payload->>'tenant_id')::uuid)
+            ) t;
+
+            return v_result;
+
+        when 'create_discount_code' then
+
+            insert into public.discount_codes (
+                tenant_id,
+                code,
+                discount_type,
+                value,
+                currency,
+                applies_to_plan_id,
+                max_redemptions,
+                valid_from,
+                valid_until
+            )
+            values (
+                nullif(p_payload->>'tenant_id', '')::uuid,
+                upper(btrim(p_payload->>'code')),
+                p_payload->>'discount_type',
+                (p_payload->>'value')::numeric,
+                case
+                    when p_payload->>'discount_type' = 'fixed_amount'
+                    then upper(coalesce(nullif(p_payload->>'currency', ''), 'EUR'))
+                    else null
+                end,
+                nullif(p_payload->>'applies_to_plan_id', '')::uuid,
+                nullif(p_payload->>'max_redemptions', '')::int,
+                coalesce(nullif(p_payload->>'valid_from', '')::timestamptz, now()),
+                nullif(p_payload->>'valid_until', '')::timestamptz
+            )
+            returning
+                id, tenant_id, code, discount_type, value, currency,
+                applies_to_plan_id, max_redemptions, redeemed_count,
+                valid_from, valid_until, is_active, created_at
+            into v_row;
+
+            perform platform.log_audit(
+                'discount_code.created',
+                'discount_code',
+                v_row.id,
+                jsonb_build_object('code', v_row.code)
+            );
+
+            return to_jsonb(v_row);
+
+        -- Financial terms (code, type, value) are immutable once
+        -- created: deactivate and create a new code instead.
+        when 'update_discount_code' then
+
+            update public.discount_codes dc
+            set
+                is_active = case
+                    when p_payload ? 'is_active'
+                    then (p_payload->>'is_active')::boolean
+                    else dc.is_active
+                end,
+                valid_until = case
+                    when p_payload ? 'valid_until'
+                    then nullif(p_payload->>'valid_until', '')::timestamptz
+                    else dc.valid_until
+                end,
+                max_redemptions = case
+                    when p_payload ? 'max_redemptions'
+                    then nullif(p_payload->>'max_redemptions', '')::int
+                    else dc.max_redemptions
+                end,
+                applies_to_plan_id = case
+                    when p_payload ? 'applies_to_plan_id'
+                    then nullif(p_payload->>'applies_to_plan_id', '')::uuid
+                    else dc.applies_to_plan_id
+                end
+            where dc.id = (p_payload->>'id')::uuid
+            returning
+                dc.id, dc.code, dc.is_active, dc.valid_until,
+                dc.max_redemptions, dc.redeemed_count,
+                dc.applies_to_plan_id, dc.updated_at
+            into v_row;
+
+            if not found then
+                raise exception 'Discount code not found';
+            end if;
+
+            perform platform.log_audit(
+                'discount_code.updated',
+                'discount_code',
+                v_row.id
+            );
+
+            return to_jsonb(v_row);
+
+        when 'deactivate_discount_code' then
+
+            update public.discount_codes dc
+            set is_active = false
+            where dc.id = (p_payload->>'id')::uuid
+            returning dc.id, dc.code, dc.is_active, dc.updated_at
+            into v_row;
+
+            if not found then
+                raise exception 'Discount code not found';
+            end if;
+
+            perform platform.log_audit(
+                'discount_code.deactivated',
+                'discount_code',
+                v_row.id
+            );
+
+            return to_jsonb(v_row);
+
+        -- =================================================
+        -- DISCOUNT CODES - TENANT
+        -- =================================================
+
+        when 'validate_discount_code' then
+
+            v_tid := platform.current_tenant_id();
+
+            v_code := public.commerce_find_usable_discount_code(
+                v_tid,
+                p_payload->>'code',
+                nullif(p_payload->>'plan_id', '')::uuid,
+                nullif(p_payload->>'currency', ''),
+                false
+            );
+
+            if v_code.id is null then
+                return jsonb_build_object(
+                    'valid', false,
+                    'reason', 'invalid_or_unavailable'
+                );
+            end if;
+
+            v_base := nullif(p_payload->>'amount', '')::numeric;
+
+            return jsonb_build_object(
+                'valid', true,
+                'code', v_code.code,
+                'discount_type', v_code.discount_type,
+                'value', v_code.value,
+                'currency', v_code.currency,
+                'discount_amount', case
+                    when v_base is null then null
+                    else public.commerce_compute_discount_amount(
+                        v_code.discount_type, v_code.value, v_base
+                    )
+                end
+            );
+
+        when 'apply_discount_to_invoice' then
+
+            v_tid := platform.current_tenant_id();
+
+            select i.*
+            into v_inv
+            from public.invoices i
+            where i.id = (p_payload->>'invoice_id')::uuid
+              and i.tenant_id = v_tid
+            for update;
+
+            if not found then
+                raise exception 'Invoice not found';
+            end if;
+
+            if v_inv.status <> 'open' then
+                raise exception 'A discount can only be applied to an open invoice';
+            end if;
+
+            if v_inv.discount_amount > 0
+               or exists (
+                    select 1
+                    from public.discount_redemptions r
+                    where r.invoice_id = v_inv.id
+               ) then
+                raise exception 'A discount was already applied to this invoice';
+            end if;
+
+            -- Totals must not change while a payment is in flight.
+            if exists (
+                select 1
+                from platform.payment_intents pi
+                where pi.target_type = 'invoice'
+                  and pi.target_id = v_inv.id
+                  and pi.status::text in ('pending', 'authorized')
+            ) then
+                raise exception 'Cancel the pending payment before applying a discount';
+            end if;
+
+            v_code := public.commerce_find_usable_discount_code(
+                v_tid,
+                p_payload->>'code',
+                (select s.plan_id
+                 from public.subscriptions s
+                 where s.id = v_inv.subscription_id),
+                v_inv.currency,
+                true
+            );
+
+            if v_code.id is null then
+                raise exception 'Discount code is not valid for this invoice';
+            end if;
+
+            v_discount := public.commerce_compute_discount_amount(
+                v_code.discount_type, v_code.value, v_inv.subtotal
+            );
+
+            if v_discount <= 0 then
+                raise exception 'Discount code does not reduce this invoice';
+            end if;
+
+            -- Tax is scaled proportionally to the discounted subtotal
+            -- (assumes a uniform tax rate on the invoice).
+            v_new_tax := case
+                when v_inv.subtotal > 0
+                then round(v_inv.tax_amount * (v_inv.subtotal - v_discount) / v_inv.subtotal, 2)
+                else v_inv.tax_amount
+            end;
+
+            update public.invoices i
+            set
+                discount_amount = v_discount,
+                tax_amount = v_new_tax,
+                total_amount = v_inv.subtotal - v_discount + v_new_tax
+            where i.id = v_inv.id
+            returning
+                i.id, i.invoice_number, i.status, i.currency, i.subtotal,
+                i.discount_amount, i.tax_amount, i.total_amount
+            into v_row;
+
+            insert into public.discount_redemptions (
+                discount_code_id,
+                tenant_id,
+                invoice_id,
+                subscription_id,
+                amount_applied
+            )
+            values (
+                v_code.id,
+                v_tid,
+                v_inv.id,
+                v_inv.subscription_id,
+                v_discount
+            );
+
+            update public.discount_codes dc
+            set redeemed_count = dc.redeemed_count + 1
+            where dc.id = v_code.id;
+
+            perform platform.log_audit(
+                'discount_code.redeemed',
+                'invoice',
+                v_inv.id,
+                jsonb_build_object(
+                    'code', v_code.code,
+                    'amount_applied', v_discount
+                )
+            );
+
+            return to_jsonb(v_row);
+
+        when 'list_discount_redemptions' then
+
+            v_tid := platform.current_tenant_id();
+
+            select coalesce(jsonb_agg(to_jsonb(t) order by t.redeemed_at desc), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    r.id,
+                    dc.code,
+                    r.invoice_id,
+                    r.subscription_id,
+                    r.amount_applied,
+                    r.redeemed_at
+                from public.discount_redemptions r
+                join public.discount_codes dc
+                  on dc.id = r.discount_code_id
+                where r.tenant_id = v_tid
+            ) t;
+
+            return v_result;
+
+        -- =================================================
+        -- INVOICES - TENANT (READ ONLY, drafts are hidden)
+        -- =================================================
+
+        when 'list_invoices' then
+
+            v_tid := platform.current_tenant_id();
+
+            v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
+            v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
+
+            select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    i.id,
+                    i.tenant_id,
+                    i.subscription_id,
+                    i.invoice_number,
+                    i.status,
+                    i.currency,
+                    i.subtotal,
+                    i.discount_amount,
+                    i.tax_amount,
+                    i.total_amount,
+                    i.issued_at,
+                    i.due_at,
+                    i.paid_at,
+                    i.created_at
+                from public.invoices i
+                where i.tenant_id = v_tid
+                  and i.status <> 'draft'
+                  and (p_payload->>'status' is null
+                       or i.status = p_payload->>'status')
+                order by i.created_at desc
+                limit v_limit
+                offset v_offset
+            ) t;
+
+            return v_result;
+
+        when 'get_invoice' then
+
+            v_tid := platform.current_tenant_id();
+
+            select jsonb_build_object(
+                'invoice', to_jsonb(inv),
+                'lines', coalesce((
+                    select jsonb_agg(to_jsonb(l) order by l.sort_order, l.created_at)
+                    from (
+                        select
+                            il.id,
+                            il.description,
+                            il.quantity,
+                            il.unit_amount,
+                            il.line_amount,
+                            il.sort_order,
+                            il.created_at
+                        from public.invoice_lines il
+                        where il.invoice_id = inv.id
+                    ) l
+                ), '[]'::jsonb),
+                'discounts', coalesce((
+                    select jsonb_agg(to_jsonb(d) order by d.redeemed_at)
+                    from (
+                        select
+                            dc.code,
+                            r.amount_applied,
+                            r.redeemed_at
+                        from public.discount_redemptions r
+                        join public.discount_codes dc
+                          on dc.id = r.discount_code_id
+                        where r.invoice_id = inv.id
+                    ) d
+                ), '[]'::jsonb)
+            )
+            into v_result
+            from (
+                select
+                    i.id,
+                    i.tenant_id,
+                    i.subscription_id,
+                    i.invoice_number,
+                    i.status,
+                    i.currency,
+                    i.subtotal,
+                    i.discount_amount,
+                    i.tax_amount,
+                    i.total_amount,
+                    i.issued_at,
+                    i.due_at,
+                    i.paid_at,
+                    i.created_at
+                from public.invoices i
+                where i.id = coalesce(
+                        nullif(p_payload->>'id', '')::uuid,
+                        nullif(p_payload->>'invoice_id', '')::uuid
+                    )
+                  and i.tenant_id = v_tid
+                  and i.status <> 'draft'
+            ) inv;
+
+            if v_result is null then
+                raise exception 'Invoice not found';
+            end if;
 
             return v_result;
 
@@ -1203,6 +1857,9 @@ declare
     v_result jsonb;
     v_intent_id uuid;
     v_status public.payment_status;
+    v_amount numeric;
+    v_currency text;
+    v_inv record;
 begin
     p_payload := coalesce(p_payload, '{}'::jsonb);
     v_tid := platform.current_tenant_id();
@@ -1218,7 +1875,31 @@ begin
             raise exception 'Unknown or inactive payment provider: %', p_payload->>'provider';
         end if;
 
-        if (p_payload->>'amount')::numeric <= 0 then
+        v_amount := (p_payload->>'amount')::numeric;
+        v_currency := upper(coalesce(p_payload->>'currency', 'EUR'));
+
+        -- For invoices the amount and currency come from the invoice,
+        -- never from the client payload.
+        if p_payload->>'target_type' = 'invoice' then
+            select i.id, i.status, i.total_amount, i.currency
+            into v_inv
+            from public.invoices i
+            where i.id = nullif(p_payload->>'target_id', '')::uuid
+              and i.tenant_id = v_tid;
+
+            if not found then
+                raise exception 'Invoice not found';
+            end if;
+
+            if v_inv.status <> 'open' then
+                raise exception 'Invoice is not payable in status %', v_inv.status;
+            end if;
+
+            v_amount := v_inv.total_amount;
+            v_currency := upper(v_inv.currency);
+        end if;
+
+        if v_amount is null or v_amount <= 0 then
             raise exception 'amount must be positive';
         end if;
 
@@ -1235,8 +1916,8 @@ begin
         values (
             v_tid,
             p_payload->>'provider',
-            (p_payload->>'amount')::numeric,
-            upper(coalesce(p_payload->>'currency', 'EUR')),
+            v_amount,
+            v_currency,
             'pending'::public.payment_status,
             p_payload->>'target_type',
             (p_payload->>'target_id')::uuid,
@@ -1376,6 +2057,83 @@ for each row execute function public.prevent_subscription_tier_drift();
 create trigger trg_subscriptions_plan_required
 before insert or update on public.subscriptions
 for each row execute function public.enforce_subscription_plan_required();
+
+
+-- =====================================================
+-- 15B. DEFAULT SUBSCRIPTION FOR NEW TENANTS
+-- =====================================================
+-- Every tenant gets a trial subscription on the default plan
+-- (product_plans.is_default). Without it get_tenant_entitlements
+-- fails with 'Subscription not found for tenant'.
+--
+-- Requires the commerce catalogue seed (seed_commerce.sql):
+-- tenant creation fails loudly when no default plan exists.
+--
+-- Trial length is 14 days. NOTE: nothing in the schema moves an
+-- expired trial to 'trial_expired' yet; that needs a scheduled job.
+-- =====================================================
+
+create or replace function public.provision_default_subscription()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan_id uuid;
+    v_tier public.subscription_tier;
+begin
+    select pp.id, pp.tier
+    into v_plan_id, v_tier
+    from public.product_plans pp
+    where pp.is_default
+      and pp.is_active is true
+    limit 1;
+
+    if v_plan_id is null then
+        raise exception
+            'NO_DEFAULT_PRODUCT_PLAN: seed public.product_plans (is_default = true) before creating tenants';
+    end if;
+
+    insert into public.subscriptions (
+        tenant_id,
+        plan_id,
+        tier,
+        status,
+        current_period_start,
+        current_period_end
+    )
+    values (
+        new.id,
+        v_plan_id,
+        v_tier,
+        'trial'::public.subscription_status,
+        now(),
+        now() + interval '14 days'
+    )
+    on conflict (tenant_id) do nothing;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists trg_tenants_provision_default_subscription on public.tenants;
+
+create trigger trg_tenants_provision_default_subscription
+after insert on public.tenants
+for each row execute function public.provision_default_subscription();
+
+drop trigger if exists trg_invoices_updated_at on public.invoices;
+
+create trigger trg_invoices_updated_at
+before update on public.invoices
+for each row execute function platform.set_updated_at();
+
+drop trigger if exists trg_discount_codes_updated_at on public.discount_codes;
+
+create trigger trg_discount_codes_updated_at
+before update on public.discount_codes
+for each row execute function platform.set_updated_at();
 
 
 -- =====================================================
