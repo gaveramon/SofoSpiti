@@ -1062,6 +1062,57 @@ begin
 exception when duplicate_object then null;
 end $$;
 
+-- Link tables (company/contact <-> tenant) were missing their FKs.
+-- tenant_id        : owning tenant of the link row
+-- linked_tenant_id : the related tenant; the link is meaningless
+--                    without it, so it cascades.
+
+do $$
+begin
+    alter table public.crm_company_tenants
+        add constraint fk_crm_company_tenants_tenant
+        foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_company_tenants
+        add constraint fk_crm_company_tenants_linked_tenant
+        foreign key (linked_tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_contact_tenants
+        add constraint fk_crm_contact_tenants_tenant
+        foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+do $$
+begin
+    alter table public.crm_contact_tenants
+        add constraint fk_crm_contact_tenants_linked_tenant
+        foreign key (linked_tenant_id) references public.tenants(id) on delete cascade;
+exception when duplicate_object then null;
+end $$;
+
+create index if not exists idx_crm_company_tenants_tenant
+on public.crm_company_tenants (tenant_id);
+
+create index if not exists idx_crm_company_tenants_linked_tenant
+on public.crm_company_tenants (linked_tenant_id)
+where linked_tenant_id is not null;
+
+create index if not exists idx_crm_contact_tenants_tenant
+on public.crm_contact_tenants (tenant_id);
+
+create index if not exists idx_crm_contact_tenants_linked_tenant
+on public.crm_contact_tenants (linked_tenant_id)
+where linked_tenant_id is not null;
+
 drop trigger if exists trg_crm_contacts_consent_timestamps on public.crm_contacts;
 
 drop trigger if exists trg_crm_leads_conversion_timestamp on public.crm_leads;

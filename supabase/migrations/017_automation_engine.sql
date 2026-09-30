@@ -505,6 +505,13 @@ begin
             coalesce(p_payload->'payload', '{}'::jsonb)
         );
 
+        perform platform.log_audit(
+            'automation.event_dispatched',
+            'automation_event',
+            null::uuid,
+            jsonb_build_object('event_type', p_payload->>'event_type', 'dispatched', v_result->'dispatched')
+        );
+
     when 'start_run' then
         v_run_id := public.automation_start_run(
             (p_payload->>'workflow_id')::uuid,
@@ -519,8 +526,21 @@ begin
             where ar.id = v_run_id and ar.tenant_id = v_tid
         ) t;
 
+        perform platform.log_audit(
+            'automation_run.started',
+            'automation_run',
+            v_run_id,
+            jsonb_build_object('workflow_id', p_payload->>'workflow_id', 'trigger_type', p_payload->>'trigger_type')
+        );
+
     when 'cancel_run' then
         v_result := public.automation_cancel_run((p_payload->>'id')::uuid);
+
+        perform platform.log_audit(
+            'automation_run.cancelled',
+            'automation_run',
+            (p_payload->>'id')::uuid
+        );
 
     else
         return public.automation_domain_ext(p_op, p_payload);
@@ -601,6 +621,13 @@ begin
         returning id, tenant_id, workflow_trigger_id, is_active, created_at into v_row;
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'automation_subscription.upserted',
+            'automation_subscription',
+            v_row.id,
+            jsonb_build_object('workflow_trigger_id', v_row.workflow_trigger_id, 'is_active', v_row.is_active)
+        );
+
     when 'delete_subscription' then
         if v_tid is null then
             raise exception 'no active tenant';
@@ -610,6 +637,12 @@ begin
           and aes.tenant_id = v_tid;
         if not found then raise exception 'subscription not found'; end if;
         v_result := jsonb_build_object('deleted', true, 'id', p_payload->>'id');
+
+        perform platform.log_audit(
+            'automation_subscription.deleted',
+            'automation_subscription',
+            (p_payload->>'id')::uuid
+        );
 
     else
         raise exception 'unknown automation_domain operation: %', p_op;

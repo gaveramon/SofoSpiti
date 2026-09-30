@@ -227,6 +227,89 @@ before insert or update of tenant_id, target_type, target_id on platform.payment
 for each row execute function platform.enforce_payment_intent_target_tenant();
 
 
+
+-- =====================================================================
+-- 5. TELEMETRY AND TRIAL RETENTION (NEW)
+-- =====================================================================
+
+-- Device telemetry retention: remove rows older than the configured
+-- retention period. Configured in the VPS healthcheck script env.
+-- Default: 7 days.
+--
+-- Raw telemetry is append-only; this purge is safe to run frequently
+-- (idempotent, no foreign keys).
+create or replace function platform.cleanup_old_telemetry(p_days int default 7)
+returns table (
+    rows_deleted bigint,
+    seconds_elapsed numeric
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_start timestamptz;
+    v_rows bigint;
+begin
+    v_start := now();
+
+    delete from public.device_telemetry_raw
+    where received_at < now() - (p_days || ' days')::interval;
+
+    get diagnostics v_rows = row_count;
+
+    return query select
+        v_rows,
+        extract(epoch from (now() - v_start))::numeric;
+end;
+$$;
+
+comment on function platform.cleanup_old_telemetry(int) is
+    'Purge raw device telemetry older than p_days (default 7). Called by the daily maintenance job.';
+
+-- Trial subscription expiry: move subscriptions from 'trial' to
+-- 'trial_expired' when the trial period ends.
+--
+-- The trial period is inferred from:
+-- - current_period_end = the trial end date
+-- - status = 'trial'
+--
+-- A trial upgrade (change_plan to paid) leaves status as-is, so we
+-- never overwrite it.
+--
+-- This function is idempotent: re-running touches nothing.
+create or replace function platform.expire_trial_subscriptions()
+returns table (
+    subscriptions_expired bigint,
+    seconds_elapsed numeric
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_start timestamptz;
+    v_rows bigint;
+begin
+    v_start := now();
+
+    update public.subscriptions
+    set status = 'trial_expired'::public.subscription_status,
+        updated_at = now()
+    where status = 'trial'
+      and current_period_end < now();
+
+    get diagnostics v_rows = row_count;
+
+    return query select
+        v_rows,
+        extract(epoch from (now() - v_start))::numeric;
+end;
+$$;
+
+comment on function platform.expire_trial_subscriptions() is
+    'Move subscriptions from "trial" to "trial_expired" when their trial period ends. Called by the daily maintenance job.';
+
 -- =====================================================
 -- 6. PLATFORM SCHEDULED JOB REGISTRATION
 -- =====================================================
@@ -416,81 +499,22 @@ begin
         where c.table_schema = 'public'
           and c.column_name = 'tenant_id'
           and t.table_type = 'BASE TABLE'
-          and not pc.relrowsecurity
+          and (
+              not pc.relrowsecurity
+              or not exists (
+                  select 1
+                  from pg_policies p
+                  where p.schemaname = 'public'
+                    and p.tablename = c.table_name
+              )
+          )
         order by c.table_name
     loop
         raise warning
-            '023 bootstrap: public.% has tenant_id but RLS is disabled',
+            '023 bootstrap: public.% has tenant_id but RLS is disabled or has no policies',
             v_row.table_name;
     end loop;
 end $$;
-
-
--- =====================================================
--- 12B. PLATFORM ADMIN BOOTSTRAP (BACKEND ONLY)
--- =====================================================
--- platform.platform_admins is empty on a fresh database, and the
--- portal cannot add rows (no direct table access). Without a first
--- platform admin nobody can manage plans, prices, discount codes
--- or providers.
---
--- Usage (SQL editor / psql / service_role) after the user signed up:
---
---     select platform.bootstrap_platform_admin('admin@example.com');
---
--- Idempotent. EXECUTE is limited to service_role.
--- =====================================================
-
-create or replace function platform.bootstrap_platform_admin(p_email text)
-returns uuid
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_user_id uuid;
-begin
-    if coalesce((select auth.role()), '') in ('anon', 'authenticated') then
-        raise exception 'BACKEND_EXECUTION_REQUIRED';
-    end if;
-
-    if p_email is null or btrim(p_email) = '' then
-        raise exception 'p_email is required';
-    end if;
-
-    select p.id
-    into v_user_id
-    from platform.profiles p
-    where lower(p.email::text) = lower(btrim(p_email))
-      and coalesce(p.is_active, true);
-
-    if v_user_id is null then
-        raise exception
-            'No active profile for %. The user must sign up first.', p_email;
-    end if;
-
-    insert into platform.platform_admins (user_id)
-    values (v_user_id)
-    on conflict (user_id) do nothing;
-
-    perform platform.log_audit(
-        'platform_admin.bootstrapped',
-        'platform_admin',
-        v_user_id,
-        jsonb_build_object('email', lower(btrim(p_email)))
-    );
-
-    return v_user_id;
-end;
-$$;
-
-revoke all
-on function platform.bootstrap_platform_admin(text)
-from public, anon, authenticated;
-
-grant execute
-on function platform.bootstrap_platform_admin(text)
-to service_role;
 
 
 -- =====================================================

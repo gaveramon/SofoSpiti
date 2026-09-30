@@ -515,6 +515,13 @@ $$;
 -- used for listing or administration.
 -- -----------------------------------------------------
 
+-- Server-side "selected tenant" pointer.
+-- switch_tenant writes it; the resolver only uses it to ORDER the
+-- user's valid memberships. Not an authority by itself.
+alter table platform.profiles
+    add column if not exists active_tenant_id uuid
+    references public.tenants(id) on delete set null;
+
 create or replace function platform._rev21_resolve_membership(
     p_user_id uuid,
     p_verify_tenant_id uuid default null
@@ -597,7 +604,18 @@ begin
     where tm.user_id = p_user_id
       and tm.is_active = true
       and t.status not in ('suspended', 'deleted')
-    order by tm.created_at desc
+    order by
+        -- The tenant picked via switch_tenant wins, but only among
+        -- memberships that passed the validity filter above, so a
+        -- stale or foreign pointer can never grant access.
+        (
+            tm.tenant_id is not distinct from (
+                select p.active_tenant_id
+                from platform.profiles p
+                where p.id = p_user_id
+            )
+        ) desc,
+        tm.created_at desc
     limit 1;
 end;
 $$;
@@ -1905,6 +1923,10 @@ begin
             v_target_tid
         );
 
+    update platform.profiles
+    set active_tenant_id = v_target_tid
+    where id = v_uid;
+
     update auth.users
     set raw_app_meta_data =
         coalesce(
@@ -1960,6 +1982,10 @@ begin
             'owner',
             true
         );
+
+        update platform.profiles
+        set active_tenant_id = new.id
+        where id = (select auth.uid());
 
     end if;
 
@@ -2062,6 +2088,54 @@ begin
     return new;
 end;
 $$;
+
+-- =====================================================
+-- 014B. Trial expiry ending
+-- =====================================================
+-- Trial subscription expiry: move subscriptions from 
+-- 'trial' to 'trial_expired' when the trial period ends.
+--
+-- The trial period is inferred from:
+-- - current_period_end = the trial end date
+-- - status = 'trial'
+--
+-- A trial upgrade (change_plan to paid) leaves status as-is, so we
+-- never overwrite it.
+--
+-- This function is idempotent: re-running touches nothing.
+-- =====================================================
+
+create or replace function platform.expire_trial_subscriptions()
+returns table (
+    subscriptions_expired bigint,
+    seconds_elapsed numeric
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_start timestamptz;
+    v_rows bigint;
+begin
+    v_start := now();
+
+    update public.subscriptions
+    set status = 'trial_expired'::public.subscription_status,
+        updated_at = now()
+    where status = 'trial'
+      and current_period_end < now();
+
+    get diagnostics v_rows = row_count;
+
+    return query select
+        v_rows,
+        extract(epoch from (now() - v_start))::numeric;
+end;
+$$;
+
+comment on function platform.expire_trial_subscriptions() is
+    'Move subscriptions from "trial" to "trial_expired" when their trial period ends. Called by the daily maintenance job.';
 
 
 -- =====================================================

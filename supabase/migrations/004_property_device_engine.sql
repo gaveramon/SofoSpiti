@@ -34,6 +34,12 @@
 -- IMPORTANT:
 --   devices_domain remains an internal SECURITY DEFINER domain function.
 --   devices_api is the authenticated-facing API contract expected by 022.
+--
+-- AUDIT:
+--   platform.log_audit() is owned by the Platform/Audit layer 000.
+--   004 only invokes the platform audit contract.
+--
+-- =====================================================
 
 
 -- =====================================================
@@ -332,6 +338,7 @@ before update on public.properties
 for each row
 execute function public.prevent_tenant_id_change();
 
+
 drop trigger if exists trg_devices_tenant_immutable
 on public.devices;
 
@@ -339,6 +346,7 @@ create trigger trg_devices_tenant_immutable
 before update on public.devices
 for each row
 execute function public.prevent_tenant_id_change();
+
 
 -- =====================================================
 -- 12. DEVICE OVERVIEW
@@ -447,7 +455,7 @@ begin
         update public.device_assignments
         set room_id = p_room_id
         where id = v_existing
-        returning device_id, room_id, assigned_at
+        returning id, device_id, room_id, assigned_at
         into v_row;
 
     else
@@ -462,7 +470,7 @@ begin
             p_device_id,
             p_room_id
         )
-        returning device_id, room_id, assigned_at
+        returning id, device_id, room_id, assigned_at
         into v_row;
 
     end if;
@@ -479,10 +487,11 @@ begin
 
 
     -- -------------------------------------------------
-    -- 5. Return assignment
+    -- 5. Return actual assignment
     -- -------------------------------------------------
 
     return jsonb_build_object(
+        'assignment_id', v_row.id,
         'device_id', v_row.device_id,
         'room_id', v_row.room_id,
         'assigned_at', v_row.assigned_at
@@ -490,6 +499,7 @@ begin
 
 end;
 $$;
+
 
 -- =====================================================
 -- 14. DEVICES DOMAIN API
@@ -517,6 +527,7 @@ declare
     v_result jsonb;
     v_row record;
     v_device_id uuid;
+    v_previous_room_id uuid;
 begin
 
     p_payload := coalesce(
@@ -565,7 +576,6 @@ begin
         ) t;
 
 
-
     when 'get_property' then
 
         v_tid := platform.current_tenant_id();
@@ -597,7 +607,6 @@ begin
         if v_result is null then
             raise exception 'Property not found';
         end if;
-
 
 
     when 'create_property' then
@@ -644,6 +653,11 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'property.created',
+            'property',
+            v_row.id
+        );
 
 
     when 'update_property' then
@@ -711,6 +725,11 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'property.updated',
+            'property',
+            v_row.id
+        );
 
 
     when 'delete_property' then
@@ -741,6 +760,11 @@ begin
             p_payload->>'id'
         );
 
+        perform platform.log_audit(
+            'property.deleted',
+            'property',
+            (p_payload->>'id')::uuid
+        );
 
 
     -- =================================================
@@ -823,7 +847,6 @@ begin
         end if;
 
 
-
     when 'get_room' then
 
         v_tid := platform.current_tenant_id();
@@ -855,7 +878,6 @@ begin
         if v_result is null then
             raise exception 'Room not found';
         end if;
-
 
 
     when 'create_room' then
@@ -911,6 +933,11 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'room.created',
+            'room',
+            v_row.id
+        );
 
 
     when 'update_room' then
@@ -978,6 +1005,12 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'room.updated',
+            'room',
+            v_row.id
+        );
+
 
     when 'delete_room' then
 
@@ -1007,6 +1040,12 @@ begin
             true,
             'id',
             p_payload->>'id'
+        );
+
+        perform platform.log_audit(
+            'room.deleted',
+            'room',
+            (p_payload->>'id')::uuid
         );
 
 
@@ -1362,6 +1401,16 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'device.created',
+            'device',
+            v_row.id,
+            jsonb_build_object(
+                'category_code',
+                v_row.category_code
+            )
+        );
+
 
     when 'update_device' then
 
@@ -1475,6 +1524,12 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'device.updated',
+            'device',
+            v_row.id
+        );
+
 
     when 'delete_device' then
 
@@ -1504,6 +1559,12 @@ begin
             p_payload->>'id'
         );
 
+        perform platform.log_audit(
+            'device.deleted',
+            'device',
+            (p_payload->>'id')::uuid
+        );
+
 
     when 'assign_device' then
 
@@ -1521,6 +1582,23 @@ begin
                 (p_payload->>'device_id')::uuid,
                 (p_payload->>'room_id')::uuid
             );
+
+
+        -- Audit the actual assignment returned by the
+        -- assignment workflow, not merely the requested
+        -- payload values.
+
+        perform platform.log_audit(
+            'device.assigned',
+            'device',
+            (v_result->>'device_id')::uuid,
+            jsonb_build_object(
+                'room_id',
+                (v_result->>'room_id')::uuid,
+                'assignment_id',
+                (v_result->>'assignment_id')::uuid
+            )
+        );
 
 
     when 'unassign_device' then
@@ -1545,16 +1623,50 @@ begin
         end if;
 
 
+        -- Capture the existing room before deleting the
+        -- assignment. This preserves the historical
+        -- context in the audit record.
+
+        select da.room_id
+        into v_previous_room_id
+        from public.device_assignments da
+        where da.device_id =
+            (p_payload->>'device_id')::uuid;
+
+
+        if v_previous_room_id is null then
+            raise exception 'Device assignment not found';
+        end if;
+
+
         delete from public.device_assignments da
         where da.device_id =
             (p_payload->>'device_id')::uuid;
+
+
+        if not found then
+            raise exception 'Device assignment not found';
+        end if;
 
 
         v_result := jsonb_build_object(
             'unassigned',
             true,
             'device_id',
-            p_payload->>'device_id'
+            p_payload->>'device_id',
+            'previous_room_id',
+            v_previous_room_id
+        );
+
+
+        perform platform.log_audit(
+            'device.unassigned',
+            'device',
+            (p_payload->>'device_id')::uuid,
+            jsonb_build_object(
+                'previous_room_id',
+                v_previous_room_id
+            )
         );
 
 
@@ -1651,6 +1763,11 @@ begin
 
         v_result := to_jsonb(v_row);
 
+        perform platform.log_audit(
+            'device.config.upserted',
+            'device',
+            (p_payload->>'device_id')::uuid
+        );
 
 
     -- =================================================
@@ -1705,11 +1822,13 @@ begin
               )
               and (
                   p_payload->>'since' is null
-                  or dm.observed_at >= (p_payload->>'since')::timestamptz
+                  or dm.observed_at >=
+                      (p_payload->>'since')::timestamptz
               )
               and (
                   p_payload->>'until' is null
-                  or dm.observed_at <= (p_payload->>'until')::timestamptz
+                  or dm.observed_at <=
+                      (p_payload->>'until')::timestamptz
               )
             order by dm.observed_at desc
             limit least(
@@ -1717,7 +1836,6 @@ begin
                 2000
             )
         ) t;
-
 
 
     when 'get_device_current_state' then
@@ -1765,7 +1883,6 @@ begin
           and dcs.tenant_id = v_tid;
 
 
-
     when 'list_tenant_device_current_state' then
 
         v_tid := platform.current_tenant_id();
@@ -1800,10 +1917,10 @@ begin
             where dcs.tenant_id = v_tid
               and (
                   p_payload->>'category_code' is null
-                  or d.category_code = p_payload->>'category_code'
+                  or d.category_code =
+                      p_payload->>'category_code'
               )
         ) t;
-
 
 
     else
@@ -1851,7 +1968,6 @@ $$;
 
 comment on function public.devices_api(text, jsonb) is
     'Approved authenticated API boundary for the Property & Device Engine. Delegates to internal devices_domain().';
-
 
 
 comment on function public.devices_domain(text, jsonb) is
@@ -2088,7 +2204,6 @@ $$;
 -- must become inactive.
 -- =====================================================
 
-
 create or replace function public.deactivate_unassigned_device()
 returns trigger
 language plpgsql
@@ -2126,6 +2241,7 @@ before update on public.properties
 for each row
 execute function platform.set_updated_at();
 
+
 drop trigger if exists trg_devices_hierarchy
 on public.devices;
 
@@ -2134,6 +2250,7 @@ before insert or update
 on public.devices
 for each row
 execute function public.enforce_device_hierarchy();
+
 
 drop trigger if exists trg_devices_gateway_demotion
 on public.devices;
@@ -2144,6 +2261,7 @@ on public.devices
 for each row
 execute function public.prevent_gateway_demotion_with_children();
 
+
 drop trigger if exists trg_device_assignment_tenant_consistency
 on public.device_assignments;
 
@@ -2152,6 +2270,7 @@ before insert or update
 on public.device_assignments
 for each row
 execute function public.enforce_device_assignment_tenant_consistency();
+
 
 drop trigger if exists trg_device_configurations_updated_at
 on public.device_configurations;
@@ -2162,6 +2281,7 @@ on public.device_configurations
 for each row
 execute function platform.set_updated_at();
 
+
 drop trigger if exists trg_deactivate_unassigned_device
 on public.device_assignments;
 
@@ -2170,13 +2290,15 @@ after delete on public.device_assignments
 for each row
 execute function public.deactivate_unassigned_device();
 
+
 -- =====================================================
 -- 21. MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('004_property_device_engine', 'REV1', false)
+insert into platform.schema_migrations (migration_name,version,rollback_available)
+values ('004_property_device_engine','REV1',false)
 on conflict (migration_name) do nothing;
+
 
 -- =====================================================
 -- END 004 PROPERTY & DEVICE ENGINE

@@ -5181,7 +5181,7 @@ for each row execute function platform.set_updated_at();
 
 insert into platform.constants (key, value, description)
 values
-('platform_name', '"REV22_SAAS"', 'Platform identifier'),
+('platform_name', '"REV1_SAAS"', 'Platform identifier'),
 ('max_tenants_baseline', '10000', 'Target scale baseline'),
 ('default_timezone', '"UTC"', 'System timezone contract')
 on conflict (key) do nothing;

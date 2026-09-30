@@ -4,54 +4,78 @@
 -- =====================================================
 --
 -- Purpose:
--- Raw device telemetry ingestion and immutable storage
+--   Raw device telemetry ingestion and immutable storage.
 --
 -- Authority:
--- 004_property_device_engine.sql = DEVICE SSOT
+--   004_PROPERTY_DEVICE_ENGINE.SQL = DEVICE SSOT
 --
 -- SSOT RULE:
--- This module stores RAW DEVICE INPUT only.
+--   This module stores RAW DEVICE INPUT only.
 --
 -- Responsibility:
--- - Store immutable device telemetry exactly as received
---   after integration identity has been resolved.
--- - Provide the single raw telemetry ingest boundary.
+--   - Store immutable device telemetry exactly as received
+--     after integration identity has been resolved.
+--   - Provide the single raw telemetry ingest boundary.
+--   - Maintain raw telemetry partitioning through pg_partman.
+--   - Maintain raw telemetry retention through pg_partman.
 --
 -- 007 MUST NOT:
--- - resolve providers
--- - resolve tenants
--- - resolve SmartHellas devices
--- - interpret provider payloads
--- - calculate metrics
--- - normalize telemetry
--- - calculate device state
--- - make automation decisions
+--   - resolve providers
+--   - resolve tenants
+--   - resolve SmartHellas devices
+--   - interpret provider payloads
+--   - calculate metrics
+--   - normalize telemetry
+--   - calculate device state
+--   - make automation decisions
 --
 -- 006 Integration Engine resolves:
--- - provider
--- - tenant
--- - device
--- - provider_event_id
--- - observed_at
+--   - provider
+--   - tenant
+--   - device
+--   - provider_event_id
+--   - observed_at
 --
 -- 008 Device Telemetry Processing owns:
--- - normalization
--- - metric extraction
--- - validation beyond raw ingest
--- - derived telemetry
+--   - normalization
+--   - metric extraction
+--   - validation beyond raw ingest
+--   - derived telemetry
 --
 -- Raw payload is immutable.
+--
+-- Partitioning:
+--   - RANGE partitioning on received_at
+--   - Daily partitions
+--   - pg_partman owns partition creation
+--   - pg_partman owns partition retention
+--   - Raw telemetry retention: 7 days
+--
 -- =====================================================
 
 begin;
 
+
+
+
 -- =====================================================
 -- 1. RAW TELEMETRY TABLE
 -- =====================================================
+--
+-- The table is partitioned directly at creation time.
+--
+-- received_at is the operational partition key because
+-- retention is based on ingestion time, not provider event
+-- time.
+--
+-- observed_at may be NULL and must never determine
+-- retention or partition placement.
+--
+-- =====================================================
 
 create table if not exists public.device_telemetry_raw (
-
-    id uuid primary key default gen_random_uuid(),
+    id uuid not null
+        default gen_random_uuid(),
 
     tenant_id uuid not null,
 
@@ -73,52 +97,90 @@ create table if not exists public.device_telemetry_raw (
 
     created_at timestamptz not null
         default now()
-);
+)
+partition by range (received_at);
 
 
 -- =====================================================
--- 2. IDEMPOTENCY
+-- 2. RAW TELEMETRY QUERY INDEXES
+-- =====================================================
 --
--- One provider event may only be stored once for a
--- tenant/provider combination.
+-- These indexes are created on the partitioned parent.
+-- PostgreSQL/pg_partman will propagate them to the
+-- partitions.
 --
--- provider_event_id is supplied by 006.
--- =====================================================
-
-create unique index if not exists
-    uq_device_telemetry_raw_event
-on public.device_telemetry_raw (
-    tenant_id,
-    source,
-    provider_event_id
-);
-
-
--- =====================================================
--- 3. QUERY INDEXES
 -- =====================================================
 
 create index if not exists
-    idx_device_telemetry_raw_device_observed
+idx_device_telemetry_raw_device_observed
 on public.device_telemetry_raw (
     device_id,
     observed_at desc
 );
 
-
 create index if not exists
-    idx_device_telemetry_raw_tenant_received
+idx_device_telemetry_raw_tenant_received
 on public.device_telemetry_raw (
     tenant_id,
     received_at desc
 );
 
-
 create index if not exists
-    idx_device_telemetry_raw_source_event
+idx_device_telemetry_raw_source_event
 on public.device_telemetry_raw (
     source,
     provider_event_id
+);
+
+
+-- =====================================================
+-- 3. IDEMPOTENCY REGISTRY
+-- =====================================================
+--
+-- PostgreSQL cannot enforce a UNIQUE constraint across
+-- all time partitions unless the partition key is part
+-- of the constraint.
+--
+-- Therefore the global provider-event identity is kept
+-- in a small non-partitioned registry.
+--
+-- This registry is NOT telemetry data.
+-- It is an ingestion/idempotency control structure.
+--
+-- Key:
+--   tenant_id
+--   source
+--   provider_event_id
+--
+-- This preserves hard idempotency independently from
+-- received_at partition boundaries.
+--
+-- =====================================================
+
+create table if not exists public.device_telemetry_raw_idempotency (
+    tenant_id uuid not null,
+
+    source text not null,
+
+    provider_event_id text not null,
+
+    telemetry_id uuid not null,
+
+    first_received_at timestamptz not null
+        default now(),
+
+    primary key (
+        tenant_id,
+        source,
+        provider_event_id
+    )
+);
+
+
+create index if not exists
+idx_device_telemetry_raw_idempotency_telemetry
+on public.device_telemetry_raw_idempotency (
+    telemetry_id
 );
 
 
@@ -127,7 +189,11 @@ on public.device_telemetry_raw (
 -- =====================================================
 
 comment on table public.device_telemetry_raw is
-'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. No provider-specific interpretation or processing belongs here.';
+'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. Partitioned by received_at and maintained by pg_partman. No provider-specific interpretation or processing belongs here.';
+
+
+comment on table public.device_telemetry_raw_idempotency is
+'Global raw telemetry ingestion idempotency registry. Maintains tenant + source + provider_event_id uniqueness independently from raw telemetry partitions. This table contains ingestion identity metadata, not telemetry payloads.';
 
 
 comment on column public.device_telemetry_raw.tenant_id is
@@ -143,7 +209,7 @@ comment on column public.device_telemetry_raw.source is
 
 
 comment on column public.device_telemetry_raw.provider_event_id is
-'Provider-side event identifier used for hard idempotency.';
+'Provider-side event identifier supplied by Integration Engine (006) and used for hard idempotency.';
 
 
 comment on column public.device_telemetry_raw.observed_at is
@@ -151,16 +217,16 @@ comment on column public.device_telemetry_raw.observed_at is
 
 
 comment on column public.device_telemetry_raw.received_at is
-'Timestamp at which the event entered the SmartHellas platform boundary.';
+'Timestamp at which the event entered the SmartHellas platform boundary. This is the partition and retention control timestamp.';
 
 
 comment on column public.device_telemetry_raw.raw_payload is
 'Original provider payload. Must not be normalized, transformed or mutated after ingestion.';
 
 
-
 -- =====================================================
--- 3. DEVICE ↔ TENANT INVARIANT
+-- 5. DEVICE ↔ TENANT INVARIANT
+-- =====================================================
 --
 -- 004 is the SSOT for device ownership.
 --
@@ -168,9 +234,11 @@ comment on column public.device_telemetry_raw.raw_payload is
 -- than the tenant that owns the referenced device.
 --
 -- This is an integrity boundary, not business logic.
+--
 -- =====================================================
 
-create or replace function public.enforce_device_telemetry_tenant_consistency()
+create or replace function
+public.enforce_device_telemetry_tenant_consistency()
 returns trigger
 language plpgsql
 set search_path = ''
@@ -185,7 +253,8 @@ begin
     where d.id = new.device_id;
 
     if not found then
-        raise exception 'device not found';
+        raise exception
+            'device not found';
     end if;
 
     if v_device_tenant <> new.tenant_id then
@@ -194,30 +263,100 @@ begin
     end if;
 
     return new;
+
 end;
 $$;
 
-drop trigger if exists trg_device_telemetry_tenant_consistency
+
+drop trigger if exists
+trg_device_telemetry_tenant_consistency
 on public.device_telemetry_raw;
 
-create trigger trg_device_telemetry_tenant_consistency
+
+create trigger
+trg_device_telemetry_tenant_consistency
 before insert on public.device_telemetry_raw
 for each row
-execute function public.enforce_device_telemetry_tenant_consistency();
+execute function
+public.enforce_device_telemetry_tenant_consistency();
 
--- =====================================================
--- 7. FUNCTION SECURITY HARDENING
---
--- The integrity trigger must never depend on an unsafe
--- caller-controlled search_path.
--- =====================================================
 
-alter function public.enforce_device_telemetry_tenant_consistency()
+alter function
+public.enforce_device_telemetry_tenant_consistency()
 set search_path = '';
 
 
 -- =====================================================
--- 5. RAW TELEMETRY INGEST
+-- 6. PG_PARTMAN PARTITION SETUP
+-- =====================================================
+--
+-- Daily partitions.
+--
+-- Example:
+--
+--   p2026_09_29
+--   p2026_09_30
+--   p2026_10_01
+--
+-- pg_partman owns:
+--   - future partition creation
+--   - premake
+--   - maintenance
+--   - retention
+--
+-- Raw telemetry retention:
+--   7 days
+--
+-- =====================================================
+
+select partman.create_partition(
+    p_parent_table := 'public.device_telemetry_raw',
+    p_control := 'received_at',
+    p_interval := '1 day',
+    p_type := 'range',
+    p_premake := 7,
+    p_default_table := false,
+    p_automatic_maintenance := 'on',
+    p_jobmon := true,
+    p_control_not_null := true
+);
+
+
+-- =====================================================
+-- 7. PG_PARTMAN RETENTION CONFIGURATION
+-- =====================================================
+--
+-- Retention is handled by pg_partman by dropping old
+-- partitions rather than issuing row-level DELETEs.
+--
+-- retention_keep_table = false:
+--   old partitions are removed completely.
+--
+-- retention_keep_index = false:
+--   indexes belonging to removed partitions are removed
+--   with the partition.
+--
+-- =====================================================
+
+update partman.part_config
+set
+    retention = '7 days',
+    retention_keep_table = false,
+    retention_keep_index = false,
+    automatic_maintenance = 'on'
+where parent_table = 'public.device_telemetry_raw';
+
+
+-- =====================================================
+-- 8. PARTITIONING CONTRACT
+-- =====================================================
+
+comment on table public.device_telemetry_raw is
+'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. Partitioned daily by received_at and maintained by pg_partman. Raw retention is 7 days. No provider-specific interpretation or processing belongs here.';
+
+
+-- =====================================================
+-- 9. RAW TELEMETRY INGEST
 -- =====================================================
 --
 -- This is the ONLY write boundary for raw telemetry.
@@ -227,6 +366,7 @@ set search_path = '';
 --
 -- The function does not know anything about Aqara,
 -- TTLock, Shelly, etc.
+--
 -- =====================================================
 
 create or replace function public.ingest_device_telemetry_raw(
@@ -245,12 +385,14 @@ set search_path = ''
 as $$
 declare
     v_id uuid;
-    v_inserted boolean := false;
+    v_source text;
+    v_event_id text;
+    v_received_at timestamptz;
 begin
 
-    -- =====================================================
+    -- =================================================
     -- 1. INPUT VALIDATION
-    -- =====================================================
+    -- =================================================
 
     if p_tenant_id is null then
         raise exception
@@ -278,11 +420,22 @@ begin
     end if;
 
 
-    -- =====================================================
+    v_source :=
+        lower(btrim(p_source));
+
+    v_event_id :=
+        btrim(p_provider_event_id);
+
+    v_received_at :=
+        coalesce(
+            p_received_at,
+            now()
+        );
+
+
+    -- =================================================
     -- 2. DEVICE / TENANT CONSISTENCY
-    --
-    -- The device must belong to the supplied tenant.
-    -- =====================================================
+    -- =================================================
 
     if not exists (
         select 1
@@ -299,13 +452,83 @@ begin
     end if;
 
 
-    -- =====================================================
-    -- 3. IMMUTABLE RAW INSERT
+    -- =================================================
+    -- 3. GLOBAL IDEMPOTENCY CLAIM
+    -- =================================================
     --
-    -- ON CONFLICT makes ingestion idempotent.
-    -- =====================================================
+    -- The registry provides the cross-partition
+    -- uniqueness guarantee.
+    --
+    -- A new telemetry UUID is generated only when the
+    -- event identity is claimed successfully.
+    --
+    -- =================================================
+
+    v_id := gen_random_uuid();
+
+
+    insert into public.device_telemetry_raw_idempotency (
+        tenant_id,
+        source,
+        provider_event_id,
+        telemetry_id,
+        first_received_at
+    )
+    values (
+        p_tenant_id,
+        v_source,
+        v_event_id,
+        v_id,
+        v_received_at
+    )
+    on conflict (
+        tenant_id,
+        source,
+        provider_event_id
+    )
+    do nothing;
+
+
+    -- =================================================
+    -- 4. DUPLICATE EVENT
+    -- =================================================
+
+    if not exists (
+        select 1
+        from public.device_telemetry_raw_idempotency r
+        where r.tenant_id = p_tenant_id
+          and r.source = v_source
+          and r.provider_event_id = v_event_id
+          and r.telemetry_id = v_id
+    ) then
+
+        select r.telemetry_id
+        into v_id
+        from public.device_telemetry_raw_idempotency r
+        where r.tenant_id = p_tenant_id
+          and r.source = v_source
+          and r.provider_event_id = v_event_id;
+
+        if v_id is null then
+            raise exception
+                'Telemetry idempotency registry lookup failed';
+        end if;
+
+        return jsonb_build_object(
+            'ingested', false,
+            'duplicate', true,
+            'telemetry_id', v_id
+        );
+
+    end if;
+
+
+    -- =================================================
+    -- 5. IMMUTABLE RAW INSERT
+    -- =================================================
 
     insert into public.device_telemetry_raw (
+        id,
         tenant_id,
         device_id,
         source,
@@ -315,67 +538,27 @@ begin
         raw_payload
     )
     values (
+        v_id,
         p_tenant_id,
         p_device_id,
-        lower(trim(p_source)),
-        trim(p_provider_event_id),
+        v_source,
+        v_event_id,
         p_observed_at,
-        coalesce(
-            p_received_at,
-            now()
-        ),
+        v_received_at,
         coalesce(
             p_raw_payload,
             '{}'::jsonb
         )
-    )
-    on conflict (
-        tenant_id,
-        source,
-        provider_event_id
-    )
-    do nothing
-    returning id
-    into v_id;
+    );
 
 
-    -- =====================================================
-    -- 4. IDEMPOTENT RESULT
-    -- =====================================================
-
-    if v_id is not null then
-
-        v_inserted := true;
-
-        return jsonb_build_object(
-            'ingested', true,
-            'duplicate', false,
-            'telemetry_id', v_id
-        );
-
-    end if;
-
-
-    -- =====================================================
-    -- 5. EXISTING EVENT
-    -- =====================================================
-
-    select dtr.id
-    into v_id
-    from public.device_telemetry_raw dtr
-    where dtr.tenant_id = p_tenant_id
-      and dtr.source = lower(trim(p_source))
-      and dtr.provider_event_id = trim(p_provider_event_id);
-
-    if v_id is null then
-        raise exception
-            'Telemetry ingest failed without insert or existing event';
-    end if;
-
+    -- =================================================
+    -- 6. SUCCESS
+    -- =================================================
 
     return jsonb_build_object(
-        'ingested', false,
-        'duplicate', true,
+        'ingested', true,
+        'duplicate', false,
         'telemetry_id', v_id
     );
 
@@ -393,16 +576,54 @@ comment on function public.ingest_device_telemetry_raw(
     jsonb
 )
 is
-'Single raw telemetry ingest boundary. Stores immutable provider payloads after Integration Engine (006) resolves tenant, device, provider event identity and observed timestamp. Idempotent on tenant + source + provider_event_id.';
+'Single raw telemetry ingest boundary. Stores immutable provider payloads after Integration Engine (006) resolves tenant, device, provider event identity and observed timestamp. Idempotent on tenant + source + provider_event_id through the raw telemetry idempotency registry.';
 
 
 -- =====================================================
--- 9. SCHEMA MIGRATION REGISTRATION
+-- 10. FUNCTION SECURITY HARDENING
 -- =====================================================
 
-insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('007_device_telemetry_raw','REV1', false)
-on conflict (migration_name) do nothing;
+alter function public.ingest_device_telemetry_raw(
+    uuid,
+    uuid,
+    text,
+    text,
+    timestamptz,
+    timestamptz,
+    jsonb
+)
+set search_path = '';
+
+
+revoke all
+on function public.ingest_device_telemetry_raw(
+    uuid,
+    uuid,
+    text,
+    text,
+    timestamptz,
+    timestamptz,
+    jsonb
+)
+from public, anon, authenticated;
+
+
+-- =====================================================
+-- 11. SCHEMA MIGRATION REGISTRATION
+-- =====================================================
+
+insert into platform.schema_migrations (
+    migration_name,
+    version,
+    rollback_available
+)
+values (
+    '007_device_telemetry_raw',
+    'REV1',
+    false
+)
+on conflict (migration_name)
+do nothing;
 
 
 commit;
@@ -410,20 +631,24 @@ commit;
 
 -- =====================================================
 -- END 007 DEVICE TELEMETRY RAW
+-- =====================================================
 --
 -- SSOT BOUNDARY:
 --
 -- 004 = Device/domain registry SSOT
 -- 007 = Raw telemetry input SSOT
 --
+-- Partitioning:
+--   pg_partman owns partition creation and retention.
+--
 -- Future modules may derive:
--- - normalized measurements
--- - current device state
--- - usage scores
--- - energy metrics
--- - anomaly detection
--- - automation signals
--- - monetization metrics
+--   - normalized measurements
+--   - current device state
+--   - usage scores
+--   - energy metrics
+--   - anomaly detection
+--   - automation signals
+--   - monetization metrics
 --
 -- Such derived data MUST NOT be written into
 -- device_telemetry_raw.
