@@ -56,7 +56,7 @@ values
     -- =================================================
 
     (
-        'public',
+        'partman',
         'part_config',
         'backend',
         'none',
@@ -68,7 +68,7 @@ values
         'pg_partman-managed backend configuration table. No portal or direct authenticated access. RLS is enabled as a public-schema security boundary.'
     ),
     (
-        'public',
+        'partman',
         'part_config_sub',
         'backend',
         'none',
@@ -1287,6 +1287,18 @@ values
         true,
         'Immutable raw device telemetry. Backend/service-role ingestion and processing only; platform-admin visibility through explicit telemetry/observability RPC without direct table access.'
     ),
+    (
+        'public',
+        'device_telemetry_raw_idempotency',
+        'backend',
+        'none',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Backend-only ingestion idempotency registry for raw device telemetry. Contains tenant, provider event identity and telemetry linkage metadata. No direct portal access.'
+    ),
 
     -- =================================================
     -- 008 DEVICE TELEMETRY PROCESSING
@@ -1735,6 +1747,58 @@ values
         true,
         true,
         'Tenant-scoped invoice line items. Written by the backend; portal read access exclusively through commerce API/RPC contracts.'
+    ),
+
+    (
+        'public',
+        'billing_customers',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped fiscal billing identity (legal name, VAT number, address) used on invoices. Portal reads and updates exclusively through commerce API/RPC contracts; Epsilon customer code is gateway-controlled.'
+    ),
+
+    (
+        'public',
+        'billing_item_mappings',
+        'backend',
+        'none',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Plan-to-Epsilon item and myDATA classification mapping. Platform-wide configuration confirmed by the accountant; no portal access.'
+    ),
+
+    (
+        'public',
+        'invoice_snapshots',
+        'backend',
+        'none',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Immutable snapshot of each invoice as frozen for Epsilon. Insert-only (update/delete blocked by trigger); service-role/workers only.'
+    ),
+
+    (
+        'public',
+        'epsilon_submissions',
+        'backend',
+        'none',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Epsilon e-invoicing outbox: API tracking, retries and idempotency keys. Written by platform.epsilon_* functions; service-role/workers only.'
     ),
 
     -- =================================================

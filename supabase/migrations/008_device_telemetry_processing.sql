@@ -4,62 +4,65 @@
 -- =====================================================
 --
 -- Purpose:
--- Turn immutable raw telemetry (007) into typed,
--- queryable data that a portal (Appsmith) can chart and
--- display directly, without ever reading raw_payload.
+-- Normalize raw device telemetry into queryable metrics
+-- and maintain the latest state per device and metric.
 --
 -- Authority:
 -- 007_device_telemetry_raw.sql = RAW TELEMETRY SSOT
 -- 004_property_device_engine.sql = DEVICE SSOT
 --
--- SSOT RULE:
--- This module owns DERIVED telemetry only.
--- It never rewrites or deletes raw_payload (007 stays
--- immutable) - it only reads it and produces new rows in
--- its own tables.
---
--- Responsibility:
--- - Claim pending rows from public.device_telemetry_raw
--- - Normalize provider payloads into typed metrics
---   (device_metrics: time series, for charts)
--- - Maintain a latest-value snapshot per device/metric
---   (device_current_state: for dashboards/lists)
--- - Expose both through devices_domain()/devices_api()
---   read operations so Appsmith never queries these
---   tables directly (RPC-only, same as every other
---   governed table in this schema)
+-- Ownership:
+-- 008 owns normalized metrics, current state and
+-- processing logic.
 --
 -- 008 MUST NOT:
--- - mutate public.device_telemetry_raw.raw_payload
--- - resolve providers/tenants/devices (006 already did)
--- - make automation decisions (017 owns that)
--- - be read directly by the portal (public.devices_api
---   is the only sanctioned read path)
+-- - Modify raw_payload or raw telemetry identity.
+-- - Resolve providers, tenants or devices (006/004).
+-- - Make automation decisions (017).
+-- - Grant the portal direct table access.
+-- - Implement raw telemetry retention (007/pg_partman).
+--
+-- Raw telemetry is partitioned by received_at.
+-- Its primary key is (id, received_at).
 --
 -- =====================================================
 
-begin;
+BEGIN;
+
 
 -- =====================================================
 -- 1. PROCESSING BOOKKEEPING ON THE RAW TABLE
 -- =====================================================
--- Adds processing metadata to 007's table. This does not
--- touch raw_payload and does not violate 007's raw-payload
--- immutability rule. It tracks processing state, attempts and
--- retry timing for the derived telemetry worker.
--- =====================================================
 
-alter table public.device_telemetry_raw
-    add column if not exists processing_status text
-        not null default 'pending';
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS processing_status text
+        NOT NULL DEFAULT 'pending';
 
-alter table public.device_telemetry_raw
-    drop constraint if exists chk_device_telemetry_raw_processing_status;
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS processing_error text;
 
-alter table public.device_telemetry_raw
-    add constraint chk_device_telemetry_raw_processing_status
-    check (
-        processing_status in (
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS processed_at timestamptz;
+
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS processing_attempts integer
+        NOT NULL DEFAULT 0;
+
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS last_processing_at timestamptz;
+
+ALTER TABLE public.device_telemetry_raw
+    ADD COLUMN IF NOT EXISTS next_processing_at timestamptz;
+
+
+ALTER TABLE public.device_telemetry_raw
+    DROP CONSTRAINT IF EXISTS
+        chk_device_telemetry_raw_processing_status;
+
+ALTER TABLE public.device_telemetry_raw
+    ADD CONSTRAINT chk_device_telemetry_raw_processing_status
+    CHECK (
+        processing_status IN (
             'pending',
             'processing',
             'processed',
@@ -67,33 +70,33 @@ alter table public.device_telemetry_raw
         )
     );
 
-alter table public.device_telemetry_raw
-    add column if not exists processing_error text;
 
-alter table public.device_telemetry_raw
-    add column if not exists processed_at timestamptz;
+ALTER TABLE public.device_telemetry_raw
+    DROP CONSTRAINT IF EXISTS
+        chk_device_telemetry_raw_processing_attempts;
 
-alter table public.device_telemetry_raw
-    add column if not exists processing_attempts integer
-        not null default 0;
+ALTER TABLE public.device_telemetry_raw
+    ADD CONSTRAINT chk_device_telemetry_raw_processing_attempts
+    CHECK (processing_attempts >= 0);
 
-alter table public.device_telemetry_raw
-    add column if not exists last_processing_at timestamptz;
 
-alter table public.device_telemetry_raw
-    add column if not exists next_processing_at timestamptz;
+CREATE INDEX IF NOT EXISTS
+    idx_device_telemetry_raw_processing_queue
+ON public.device_telemetry_raw (
+    received_at,
+    id
+)
+WHERE processing_status IN ('pending', 'failed');
 
-alter table public.device_telemetry_raw
-    drop constraint if exists chk_device_telemetry_raw_processing_attempts;
 
-alter table public.device_telemetry_raw
-    add constraint chk_device_telemetry_raw_processing_attempts
-    check (processing_attempts >= 0);
+COMMENT ON COLUMN public.device_telemetry_raw.processing_status IS
+'Processing state maintained by module 008. Does not modify raw_payload or raw telemetry identity.';
 
-create index if not exists
-    idx_device_telemetry_raw_pending
-on public.device_telemetry_raw (received_at)
-where processing_status in ('pending', 'failed');
+COMMENT ON COLUMN public.device_telemetry_raw.processing_attempts IS
+'Number of processing attempts started for this telemetry row.';
+
+COMMENT ON COLUMN public.device_telemetry_raw.next_processing_at IS
+'Earliest retry time for a failed telemetry row. NULL means immediately eligible for retry.';
 
 
 -- =====================================================
@@ -103,62 +106,63 @@ where processing_status in ('pending', 'failed');
 -- powers Appsmith line/bar charts over time.
 -- =====================================================
 
-create table if not exists public.device_metrics (
-    id uuid primary key default gen_random_uuid(),
+CREATE TABLE IF NOT EXISTS public.device_metrics (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
 
-    tenant_id uuid not null
-        references public.tenants(id)
-        on delete cascade,
+    tenant_id uuid NOT NULL
+        REFERENCES public.tenants(id)
+        ON DELETE CASCADE,
 
-    device_id uuid not null
-        references public.devices(id)
-        on delete cascade,
+    device_id uuid NOT NULL
+        REFERENCES public.devices(id)
+        ON DELETE CASCADE,
 
-    -- Source telemetry identifier is retained for provenance only.
-    -- Intentionally NOT an FK: derived metrics have their own retention
-    -- lifecycle and must survive deletion/retention of raw telemetry (007).
-    telemetry_id uuid not null,
+    telemetry_id uuid NOT NULL,
 
-    metric_key text not null,
+    metric_key text NOT NULL,
 
     metric_value numeric,
     metric_value_text text,
 
     unit text,
 
-    observed_at timestamptz not null,
+    observed_at timestamptz NOT NULL,
 
-    created_at timestamptz not null default now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
 
-    constraint chk_device_metrics_value_present
-        check (
-            metric_value is not null
-            or metric_value_text is not null
+    CONSTRAINT chk_device_metrics_value_present
+        CHECK (
+            metric_value IS NOT NULL
+            OR metric_value_text IS NOT NULL
         ),
 
-    unique (telemetry_id, metric_key)
+    CONSTRAINT uq_device_metrics_telemetry_metric
+        UNIQUE (telemetry_id, metric_key)
 );
 
 
-create index if not exists
+CREATE INDEX IF NOT EXISTS
     idx_device_metrics_device_key_observed
-on public.device_metrics (
+ON public.device_metrics (
     device_id,
     metric_key,
-    observed_at desc
+    observed_at DESC
 );
 
 
-create index if not exists
+CREATE INDEX IF NOT EXISTS
     idx_device_metrics_tenant_observed
-on public.device_metrics (
+ON public.device_metrics (
     tenant_id,
-    observed_at desc
+    observed_at DESC
 );
 
 
-comment on table public.device_metrics is
-'Normalized, typed telemetry time series derived from public.device_telemetry_raw. One row per metric per raw event. Portal access exclusively through devices_api()/devices_domain() read operations.';
+COMMENT ON TABLE public.device_metrics IS
+'Normalized typed telemetry time series derived from raw telemetry. One row per metric per raw event. Portal access is exclusively through approved RPC operations.';
+
+COMMENT ON COLUMN public.device_metrics.telemetry_id IS
+'Source telemetry event ID. Provenance only; intentionally has no FK to the partitioned raw telemetry table.';
 
 
 -- =====================================================
@@ -170,44 +174,52 @@ comment on table public.device_metrics is
 -- time series.
 -- =====================================================
 
-create table if not exists public.device_current_state (
-    device_id uuid not null
-        references public.devices(id)
-        on delete cascade,
+CREATE TABLE IF NOT EXISTS public.device_current_state (
+    device_id uuid NOT NULL
+        REFERENCES public.devices(id)
+        ON DELETE CASCADE,
 
-    metric_key text not null,
+    metric_key text NOT NULL,
 
-    -- Last source event used for deterministic tie-breaking.
-    -- Provenance only; intentionally no FK to 007.
-    telemetry_id uuid not null,
+    tenant_id uuid NOT NULL
+        REFERENCES public.tenants(id)
+        ON DELETE CASCADE,
 
-    tenant_id uuid not null
-        references public.tenants(id)
-        on delete cascade,
+    telemetry_id uuid NOT NULL,
 
     metric_value numeric,
     metric_value_text text,
 
     unit text,
 
-    observed_at timestamptz not null,
+    observed_at timestamptz NOT NULL,
 
-    updated_at timestamptz not null default now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
 
-    primary key (device_id, metric_key)
+    CONSTRAINT device_current_state_pkey
+        PRIMARY KEY (device_id, metric_key),
+
+    CONSTRAINT chk_device_current_state_value_present
+        CHECK (
+            metric_value IS NOT NULL
+            OR metric_value_text IS NOT NULL
+        )
 );
 
 
-create index if not exists
+CREATE INDEX IF NOT EXISTS
     idx_device_current_state_tenant
-on public.device_current_state (
+ON public.device_current_state (
     tenant_id,
     device_id
 );
 
 
-comment on table public.device_current_state is
-'Latest known value per device/metric_key, upserted by process_device_telemetry_batch(). Portal access exclusively through devices_api()/devices_domain() read operations.';
+COMMENT ON TABLE public.device_current_state IS
+'Latest known value per device and metric. Updated by process_device_telemetry_batch(). Portal access is exclusively through approved RPC operations.';
+
+COMMENT ON COLUMN public.device_current_state.telemetry_id IS
+'Source telemetry event ID for the current value; used as a deterministic tie-breaker when observed_at is equal.';
 
 
 -- =====================================================
@@ -216,51 +228,61 @@ comment on table public.device_current_state is
 -- new tables.
 -- =====================================================
 
-create or replace function public.enforce_device_metrics_tenant_consistency()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-declare
+CREATE OR REPLACE FUNCTION
+    public.enforce_device_metrics_tenant_consistency()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
     v_device_tenant uuid;
-begin
+BEGIN
+    SELECT d.tenant_id
+    INTO v_device_tenant
+    FROM public.devices AS d
+    WHERE d.id = NEW.device_id;
 
-    select d.tenant_id
-    into v_device_tenant
-    from public.devices d
-    where d.id = new.device_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'device not found';
+    END IF;
 
-    if not found then
-        raise exception 'device not found';
-    end if;
-
-    if v_device_tenant <> new.tenant_id then
-        raise exception
+    IF v_device_tenant IS DISTINCT FROM NEW.tenant_id THEN
+        RAISE EXCEPTION
             'metric tenant must match device tenant';
-    end if;
+    END IF;
 
-    return new;
-end;
+    RETURN NEW;
+END;
 $$;
 
-alter function public.enforce_device_metrics_tenant_consistency()
-set search_path = '';
 
-drop trigger if exists trg_device_metrics_tenant_consistency
-on public.device_metrics;
+ALTER FUNCTION
+    public.enforce_device_metrics_tenant_consistency()
+SET search_path = '';
 
-create trigger trg_device_metrics_tenant_consistency
-before insert on public.device_metrics
-for each row
-execute function public.enforce_device_metrics_tenant_consistency();
 
-drop trigger if exists trg_device_current_state_tenant_consistency
-on public.device_current_state;
+DROP TRIGGER IF EXISTS
+    trg_device_metrics_tenant_consistency
+ON public.device_metrics;
 
-create trigger trg_device_current_state_tenant_consistency
-before insert or update on public.device_current_state
-for each row
-execute function public.enforce_device_metrics_tenant_consistency();
+CREATE TRIGGER trg_device_metrics_tenant_consistency
+BEFORE INSERT OR UPDATE OF device_id, tenant_id
+ON public.device_metrics
+FOR EACH ROW
+EXECUTE FUNCTION
+    public.enforce_device_metrics_tenant_consistency();
+
+
+DROP TRIGGER IF EXISTS
+    trg_device_current_state_tenant_consistency
+ON public.device_current_state;
+
+CREATE TRIGGER trg_device_current_state_tenant_consistency
+BEFORE INSERT OR UPDATE OF device_id, tenant_id
+ON public.device_current_state
+FOR EACH ROW
+EXECUTE FUNCTION
+    public.enforce_device_metrics_tenant_consistency();
 
 
 -- =====================================================
@@ -281,22 +303,24 @@ execute function public.enforce_device_metrics_tenant_consistency();
 -- normalize_device_telemetry_payload(...)`.
 -- =====================================================
 
-create or replace function public.normalize_device_telemetry_payload(
-    p_category_code text,
-    p_raw_payload jsonb
-)
-returns table (
+CREATE OR REPLACE FUNCTION
+    public.normalize_device_telemetry_payload(
+        p_category_code text,
+        p_raw_payload jsonb
+    )
+RETURNS TABLE (
     metric_key text,
     metric_value numeric,
     metric_value_text text,
     unit text
 )
-language plpgsql
-immutable
-set search_path = ''
-as $$
-declare
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = ''
+AS $$
+DECLARE
     v_payload jsonb := coalesce(p_raw_payload, '{}'::jsonb);
+
     v_raw_temp text;
     v_raw_target_temp text;
     v_raw_humidity text;
@@ -306,204 +330,223 @@ declare
     v_raw_state text;
     v_raw_online text;
     v_raw_command text;
-begin
-
-    -- -----------------------------------------------
-    -- Common numeric aliases (apply to any category
-    -- that happens to report them)
-    -- -----------------------------------------------
+BEGIN
 
     v_raw_temp := coalesce(
-        v_payload->>'temperature',
-        v_payload->>'temp'
+        v_payload ->> 'temperature',
+        v_payload ->> 'temp'
     );
 
     v_raw_target_temp := coalesce(
-        v_payload->>'target_temperature',
-        v_payload->>'target_temp',
-        v_payload->>'set_point'
+        v_payload ->> 'target_temperature',
+        v_payload ->> 'target_temp',
+        v_payload ->> 'set_point'
     );
 
     v_raw_humidity := coalesce(
-        v_payload->>'humidity',
-        v_payload->>'hum'
+        v_payload ->> 'humidity',
+        v_payload ->> 'hum'
     );
 
     v_raw_battery := coalesce(
-        v_payload->>'battery_pct',
-        v_payload->>'battery_level',
-        v_payload->>'battery'
+        v_payload ->> 'battery_pct',
+        v_payload ->> 'battery_level',
+        v_payload ->> 'battery'
     );
 
     v_raw_power := coalesce(
-        v_payload->>'power_w',
-        v_payload->>'power',
-        v_payload->>'watt'
+        v_payload ->> 'power_w',
+        v_payload ->> 'power',
+        v_payload ->> 'watt'
     );
 
     v_raw_energy := coalesce(
-        v_payload->>'energy_kwh',
-        v_payload->>'energy'
+        v_payload ->> 'energy_kwh',
+        v_payload ->> 'energy'
     );
 
-    if v_raw_temp is not null and v_raw_temp ~ '^-?[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_temp IS NOT NULL
+       AND v_raw_temp ~ '^-?[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'temperature';
         metric_value := v_raw_temp::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := '°C';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
-    if v_raw_target_temp is not null and v_raw_target_temp ~ '^-?[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_target_temp IS NOT NULL
+       AND v_raw_target_temp ~ '^-?[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'target_temperature';
         metric_value := v_raw_target_temp::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := '°C';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
-    if v_raw_humidity is not null and v_raw_humidity ~ '^[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_humidity IS NOT NULL
+       AND v_raw_humidity ~ '^[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'humidity';
         metric_value := v_raw_humidity::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := '%';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
-    if v_raw_battery is not null and v_raw_battery ~ '^[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_battery IS NOT NULL
+       AND v_raw_battery ~ '^[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'battery_pct';
         metric_value := v_raw_battery::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := '%';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
-    if v_raw_power is not null and v_raw_power ~ '^[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_power IS NOT NULL
+       AND v_raw_power ~ '^[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'power_w';
         metric_value := v_raw_power::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := 'W';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
-    if v_raw_energy is not null and v_raw_energy ~ '^[0-9]+(\.[0-9]+)?$' then
+
+    IF v_raw_energy IS NOT NULL
+       AND v_raw_energy ~ '^[0-9]+(\.[0-9]+)?$'
+    THEN
         metric_key := 'energy_kwh';
         metric_value := v_raw_energy::numeric;
-        metric_value_text := null;
+        metric_value_text := NULL;
         unit := 'kWh';
-        return next;
-    end if;
+        RETURN NEXT;
+    END IF;
 
 
-    -- -----------------------------------------------
-    -- Category-specific state / text metrics
-    -- -----------------------------------------------
+    CASE p_category_code
 
-    case p_category_code
-
-        when 'lock' then
+        WHEN 'lock' THEN
 
             v_raw_state := coalesce(
-                v_payload->>'lock_state',
-                v_payload->>'state'
+                v_payload ->> 'lock_state',
+                v_payload ->> 'state'
             );
 
-            if v_raw_state is not null then
+            IF v_raw_state IS NOT NULL THEN
                 metric_key := 'lock_state';
-                metric_value := null;
-                metric_value_text :=
-                    case lower(v_raw_state)
-                        when 'locked' then 'locked'
-                        when 'lock' then 'locked'
-                        when 'unlocked' then 'unlocked'
-                        when 'unlock' then 'unlocked'
-                        else lower(v_raw_state)
-                    end;
-                unit := null;
-                return next;
-            end if;
+                metric_value := NULL;
 
-        when 'switch' then
+                metric_value_text :=
+                    CASE lower(v_raw_state)
+                        WHEN 'locked' THEN 'locked'
+                        WHEN 'lock' THEN 'locked'
+                        WHEN 'unlocked' THEN 'unlocked'
+                        WHEN 'unlock' THEN 'unlocked'
+                        ELSE lower(v_raw_state)
+                    END;
+
+                unit := NULL;
+                RETURN NEXT;
+            END IF;
+
+
+        WHEN 'switch' THEN
 
             v_raw_state := coalesce(
-                v_payload->>'switch_state',
-                v_payload->>'power_state',
-                v_payload->>'state'
+                v_payload ->> 'switch_state',
+                v_payload ->> 'power_state',
+                v_payload ->> 'state'
             );
 
-            if v_raw_state is not null then
+            IF v_raw_state IS NOT NULL THEN
                 metric_key := 'switch_state';
-                metric_value := null;
-                metric_value_text :=
-                    case lower(v_raw_state)
-                        when 'on' then 'on'
-                        when 'true' then 'on'
-                        when '1' then 'on'
-                        when 'off' then 'off'
-                        when 'false' then 'off'
-                        when '0' then 'off'
-                        else lower(v_raw_state)
-                    end;
-                unit := null;
-                return next;
-            end if;
+                metric_value := NULL;
 
-        when 'gateway' then
+                metric_value_text :=
+                    CASE lower(v_raw_state)
+                        WHEN 'on' THEN 'on'
+                        WHEN 'true' THEN 'on'
+                        WHEN '1' THEN 'on'
+                        WHEN 'off' THEN 'off'
+                        WHEN 'false' THEN 'off'
+                        WHEN '0' THEN 'off'
+                        ELSE lower(v_raw_state)
+                    END;
+
+                unit := NULL;
+                RETURN NEXT;
+            END IF;
+
+
+        WHEN 'gateway' THEN
 
             v_raw_online := coalesce(
-                v_payload->>'online',
-                v_payload->>'is_online',
-                v_payload->>'status'
+                v_payload ->> 'online',
+                v_payload ->> 'is_online',
+                v_payload ->> 'status'
             );
 
-            if v_raw_online is not null then
+            IF v_raw_online IS NOT NULL THEN
                 metric_key := 'online';
-                metric_value := null;
-                metric_value_text :=
-                    case lower(v_raw_online)
-                        when 'true' then 'true'
-                        when 'online' then 'true'
-                        when '1' then 'true'
-                        else 'false'
-                    end;
-                unit := null;
-                return next;
-            end if;
+                metric_value := NULL;
 
-        when 'ir_controller' then
+                metric_value_text :=
+                    CASE lower(v_raw_online)
+                        WHEN 'true' THEN 'true'
+                        WHEN 'online' THEN 'true'
+                        WHEN '1' THEN 'true'
+                        ELSE 'false'
+                    END;
+
+                unit := NULL;
+                RETURN NEXT;
+            END IF;
+
+
+        WHEN 'ir_controller' THEN
 
             v_raw_command := coalesce(
-                v_payload->>'last_command',
-                v_payload->>'command'
+                v_payload ->> 'last_command',
+                v_payload ->> 'command'
             );
 
-            if v_raw_command is not null then
+            IF v_raw_command IS NOT NULL THEN
                 metric_key := 'last_command';
-                metric_value := null;
+                metric_value := NULL;
                 metric_value_text := v_raw_command;
-                unit := null;
-                return next;
-            end if;
+                unit := NULL;
+                RETURN NEXT;
+            END IF;
 
-        else
 
-            -- 'sensor', 'thermostat', 'other': the common
-            -- numeric block above already covers their
-            -- known metrics. No extra category-specific
-            -- state metric today.
-            null;
+        ELSE
+            NULL;
 
-    end case;
+    END CASE;
 
-    return;
-end;
+    RETURN;
+END;
 $$;
 
-alter function public.normalize_device_telemetry_payload(text, jsonb)
-set search_path = '';
 
-comment on function public.normalize_device_telemetry_payload(text, jsonb) is
-'Pure mapping from a raw provider payload to typed metrics, aware of device_categories.code. Extend here as real provider payload shapes (Aqara, TTLock, Shelly, ...) are confirmed.';
+ALTER FUNCTION
+    public.normalize_device_telemetry_payload(text, jsonb)
+SET search_path = '';
+
+
+COMMENT ON FUNCTION
+    public.normalize_device_telemetry_payload(text, jsonb)
+IS
+'Pure mapping from raw provider payloads to typed metrics, aware of device category. Extend when actual provider payload shapes are confirmed.';
 
 
 -- =====================================================
@@ -523,65 +566,80 @@ comment on function public.normalize_device_telemetry_payload(text, jsonb) is
 -- deterministic latest-value ordering.
 -- =====================================================
 
-create or replace function public.process_device_telemetry_batch(
-    p_batch_size int default 200
-)
-returns jsonb
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
+CREATE OR REPLACE FUNCTION
+    public.process_device_telemetry_batch(
+        p_batch_size int DEFAULT 200
+    )
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
     v_row record;
     v_metric record;
-    v_processed int := 0;
-    v_failed int := 0;
-begin
 
-    for v_row in
+    v_processed integer := 0;
+    v_failed integer := 0;
+    v_batch_size integer;
+BEGIN
 
-        select
+    v_batch_size := greatest(
+        coalesce(p_batch_size, 200),
+        1
+    );
+
+
+    FOR v_row IN
+        SELECT
             dtr.id,
             dtr.tenant_id,
             dtr.device_id,
             dtr.raw_payload,
             dtr.observed_at,
             dtr.received_at,
+            dtr.processing_attempts,
             d.category_code
-        from public.device_telemetry_raw dtr
-        join public.devices d
-          on d.id = dtr.device_id
-        where dtr.processing_status in ('pending', 'failed')
-          and (
-                dtr.next_processing_at is null
-                or dtr.next_processing_at <= now()
-          )
-        order by dtr.received_at
-        limit p_batch_size
-        for update of dtr skip locked
+        FROM public.device_telemetry_raw AS dtr
+        JOIN public.devices AS d
+          ON d.id = dtr.device_id
+        WHERE
+            dtr.processing_status = 'pending'
+            OR (
+                dtr.processing_status = 'failed'
+                AND (
+                    dtr.next_processing_at IS NULL
+                    OR dtr.next_processing_at <= now()
+                )
+            )
+        ORDER BY dtr.received_at, dtr.id
+        LIMIT v_batch_size
+        FOR UPDATE OF dtr SKIP LOCKED
 
-    loop
+    LOOP
 
-        begin
+        UPDATE public.device_telemetry_raw
+        SET
+            processing_status = 'processing',
+            processing_attempts = processing_attempts + 1,
+            last_processing_at = now(),
+            processing_error = NULL,
+            next_processing_at = NULL
+        WHERE id = v_row.id
+          AND received_at = v_row.received_at;
 
-            update public.device_telemetry_raw
-            set
-                processing_status = 'processing',
-                processing_attempts = processing_attempts + 1,
-                last_processing_at = now(),
-                next_processing_at = null
-            where id = v_row.id;
 
+        BEGIN
 
-            for v_metric in
-                select *
-                from public.normalize_device_telemetry_payload(
+            FOR v_metric IN
+                SELECT *
+                FROM public.normalize_device_telemetry_payload(
                     v_row.category_code,
                     v_row.raw_payload
                 )
-            loop
+            LOOP
 
-                insert into public.device_metrics (
+                INSERT INTO public.device_metrics (
                     tenant_id,
                     device_id,
                     telemetry_id,
@@ -591,7 +649,7 @@ begin
                     unit,
                     observed_at
                 )
-                values (
+                VALUES (
                     v_row.tenant_id,
                     v_row.device_id,
                     v_row.id,
@@ -599,144 +657,204 @@ begin
                     v_metric.metric_value,
                     v_metric.metric_value_text,
                     v_metric.unit,
-                    coalesce(v_row.observed_at, v_row.received_at)
+                    coalesce(
+                        v_row.observed_at,
+                        v_row.received_at
+                    )
                 )
-                on conflict (telemetry_id, metric_key)
-                do nothing;
+                ON CONFLICT (
+                    telemetry_id,
+                    metric_key
+                )
+                DO NOTHING;
 
 
-                insert into public.device_current_state (
+                INSERT INTO public.device_current_state (
                     device_id,
                     metric_key,
-                    telemetry_id,
                     tenant_id,
+                    telemetry_id,
                     metric_value,
                     metric_value_text,
                     unit,
                     observed_at
                 )
-                values (
+                VALUES (
                     v_row.device_id,
                     v_metric.metric_key,
-                    v_row.id,
                     v_row.tenant_id,
+                    v_row.id,
                     v_metric.metric_value,
                     v_metric.metric_value_text,
                     v_metric.unit,
-                    coalesce(v_row.observed_at, v_row.received_at)
+                    coalesce(
+                        v_row.observed_at,
+                        v_row.received_at
+                    )
                 )
-                on conflict (device_id, metric_key)
-                do update
-                set
-                    telemetry_id = excluded.telemetry_id,
-                    metric_value = excluded.metric_value,
-                    metric_value_text = excluded.metric_value_text,
-                    unit = excluded.unit,
-                    observed_at = excluded.observed_at,
+                ON CONFLICT (device_id, metric_key)
+                DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    telemetry_id = EXCLUDED.telemetry_id,
+                    metric_value = EXCLUDED.metric_value,
+                    metric_value_text = EXCLUDED.metric_value_text,
+                    unit = EXCLUDED.unit,
+                    observed_at = EXCLUDED.observed_at,
                     updated_at = now()
-                where
-                    excluded.observed_at > public.device_current_state.observed_at
-                    or (
-                        excluded.observed_at = public.device_current_state.observed_at
-                        and excluded.telemetry_id > public.device_current_state.telemetry_id
+                WHERE
+                    EXCLUDED.observed_at
+                        > public.device_current_state.observed_at
+                    OR (
+                        EXCLUDED.observed_at
+                            = public.device_current_state.observed_at
+                        AND EXCLUDED.telemetry_id
+                            > public.device_current_state.telemetry_id
                     );
 
-            end loop;
+            END LOOP;
 
 
-            update public.device_telemetry_raw
-            set
+            UPDATE public.device_telemetry_raw
+            SET
                 processing_status = 'processed',
-                processing_error = null,
+                processing_error = NULL,
                 processed_at = now(),
-                next_processing_at = null
-            where id = v_row.id;
+                next_processing_at = NULL
+            WHERE id = v_row.id
+              AND received_at = v_row.received_at;
 
             v_processed := v_processed + 1;
 
-        exception
-            when others then
 
-                update public.device_telemetry_raw
-                set
+        EXCEPTION
+            WHEN OTHERS THEN
+
+                UPDATE public.device_telemetry_raw
+                SET
                     processing_status = 'failed',
-                    processing_error = sqlerrm,
-                    processed_at = now(),
-                    next_processing_at = now() + least(
-                        interval '1 hour',
-                        interval '1 minute' * power(2::numeric, least(processing_attempts, 10))
-                    )
-                where id = v_row.id;
+                    processing_error = SQLERRM,
+                    processed_at = NULL,
+                    next_processing_at =
+                        now() + make_interval(
+                            mins => least(
+                                1440,
+                                power(
+                                    2::numeric,
+                                    least(
+                                        processing_attempts - 1,
+                                        11
+                                    )
+                                )::integer
+                            )
+                        )
+                WHERE id = v_row.id
+                  AND received_at = v_row.received_at;
 
                 v_failed := v_failed + 1;
 
-        end;
+        END;
 
-    end loop;
+    END LOOP;
 
-    return jsonb_build_object(
+
+    RETURN jsonb_build_object(
         'processed', v_processed,
         'failed', v_failed
     );
-end;
+END;
 $$;
 
-comment on function public.process_device_telemetry_batch(int) is
-'Claims pending public.device_telemetry_raw rows and derives public.device_metrics + public.device_current_state via normalize_device_telemetry_payload(). Intended to be invoked repeatedly by an external scheduler.';
+
+ALTER FUNCTION
+    public.process_device_telemetry_batch(integer)
+SET search_path = '';
+
+
+COMMENT ON FUNCTION
+    public.process_device_telemetry_batch(integer)
+IS
+'Claims eligible raw telemetry rows and derives device_metrics and device_current_state. Uses SKIP LOCKED for concurrent workers, idempotent metric inserts and deterministic current-state ordering.';
 
 
 -- =====================================================
--- 7. SCHEDULING REGISTRATION (CONTROL PLANE ONLY)
+-- 7. FUNCTION PRIVILEGES
+-- =====================================================
+-- Table grants and RLS are handled by the dedicated
+-- security migrations. The worker function is executable
+-- by service_role only.
+-- =====================================================
+
+REVOKE ALL ON FUNCTION
+    public.normalize_device_telemetry_payload(text, jsonb)
+FROM PUBLIC, anon, authenticated;
+
+REVOKE ALL ON FUNCTION
+    public.process_device_telemetry_batch(integer)
+FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE ON FUNCTION
+    public.process_device_telemetry_batch(integer)
+TO service_role;
+
+
 -- =====================================================
 -- Registers intent, not the actual trigger mechanism.
 -- pg_cron / edge-function scheduling of this handler is
 -- infrastructure and out of scope for this migration.
 -- =====================================================
 
-insert into platform.scheduled_jobs (
+INSERT INTO platform.scheduled_jobs (
     job_name,
     cron_expression,
     handler,
     is_active,
     metadata
 )
-values (
+VALUES (
     'device_telemetry_processing',
     '* * * * *',
     'process_device_telemetry_batch',
     true,
     jsonb_build_object(
         'batch_size', 200,
-        'note', 'Invoke public.process_device_telemetry_batch(200) on this schedule via pg_cron or an edge function cron trigger.'
+        'note',
+        'Invoke public.process_device_telemetry_batch(200) every minute using the configured scheduler.'
     )
 )
-on conflict do nothing;
+ON CONFLICT DO NOTHING;
 
 
 -- =====================================================
 -- 8. SCHEMA MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations ( migration_name, version, rollback_available)
-values ('008_device_telemetry_processing', 'REV1', false)
-on conflict (migration_name) do nothing;
+INSERT INTO platform.schema_migrations (
+    migration_name,
+    version,
+    rollback_available
+)
+VALUES (
+    '008_device_telemetry_processing',
+    'REV1',
+    false
+)
+ON CONFLICT (migration_name) DO NOTHING;
 
 
-commit;
+COMMIT;
+
 
 -- =====================================================
 -- END 008 DEVICE TELEMETRY PROCESSING
+-- =====================================================
 --
 -- SSOT BOUNDARY:
 --
--- 007 = Raw telemetry input SSOT (raw payload immutable)
--- 008 = Derived/normalized telemetry SSOT with an independent
--- retention lifecycle from 007 raw telemetry.
+-- 007 = Raw telemetry input SSOT (immutable payload)
+-- 008 = Derived normalized telemetry SSOT
 --
--- Read access for Appsmith is added to devices_domain()/
--- devices_api() in 004/018 (see that migration's
--- 'list_device_metrics', 'get_device_current_state' and
--- 'list_tenant_device_current_state' operations) - never
--- direct table access to device_metrics or
--- device_current_state.
+-- Portal access to derived telemetry is exclusively
+-- through the approved devices_domain()/devices_api()
+-- RPC operations defined by the relevant API migrations.
+--
 -- =====================================================

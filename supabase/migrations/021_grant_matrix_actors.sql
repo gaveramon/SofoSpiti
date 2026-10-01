@@ -353,13 +353,13 @@ with seed (
     -- =================================================
 
     (
-        'public',
+        'partman',
         'part_config',
         'pg_partman',
         'pg_partman-managed backend configuration table. Managed by the pg_partman system actor; no portal or direct authenticated access.'
     ),
     (
-        'public',
+        'partman',
         'part_config_sub',
         'pg_partman',
         'pg_partman-managed backend configuration table. Managed by the pg_partman system actor; no portal or direct authenticated access.'
@@ -1643,6 +1643,19 @@ with seed (
         'platform_admin',
         'Platform administrators require controlled visibility into raw telemetry for support and diagnostics.'
     ),
+    
+    (
+        'public',
+        'device_telemetry_raw_idempotency',
+        'telemetry_worker',
+        'Server-side telemetry processing context responsible for idempotency checks and deduplication of raw device telemetry ingestion.'
+    ),
+    (
+        'public',
+        'device_telemetry_raw_idempotency',
+        'system',
+        'Internal server-side system context for explicitly authorized technical and maintenance operations.'
+    ),
 
     -- =================================================
     -- 008 DEVICE TELEMETRY PROCESSING
@@ -2085,6 +2098,64 @@ with seed (
         'invoice_lines',
         'system',
         'Internal server-side system context (invoice generator) for explicitly authorized technical and maintenance operations.'
+    ),
+
+    (
+        'public',
+        'billing_customers',
+        'portal_user',
+        'Portal users read and update their tenant billing identity through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'billing_customers',
+        'platform_admin',
+        'Authenticated platform administrator. Platform capabilities are exposed through explicitly authorized API/RPC contracts; no direct table access.'
+    ),
+    (
+        'public',
+        'billing_customers',
+        'system',
+        'Internal server-side system context (invoice generator, Epsilon gateway) maintains billing customers and the Epsilon customer code.'
+    ),
+
+    (
+        'public',
+        'billing_item_mappings',
+        'platform_admin',
+        'Platform administrators maintain plan-to-Epsilon item and myDATA classification mappings.'
+    ),
+    (
+        'public',
+        'billing_item_mappings',
+        'system',
+        'Invoice generator reads mappings to complete invoice lines.'
+    ),
+
+    (
+        'public',
+        'invoice_snapshots',
+        'platform_admin',
+        'Platform administrators review frozen invoice snapshots when investigating Epsilon submissions.'
+    ),
+    (
+        'public',
+        'invoice_snapshots',
+        'system',
+        'Epsilon enqueue function writes immutable invoice snapshots.'
+    ),
+
+    (
+        'public',
+        'epsilon_submissions',
+        'platform_admin',
+        'Platform administrators review and re-queue failed Epsilon submissions through explicit RPC contracts.'
+    ),
+    (
+        'public',
+        'epsilon_submissions',
+        'system',
+        'Epsilon gateway claims submissions and records API results.'
     ),
 
     -- =================================================

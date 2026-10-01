@@ -48,6 +48,7 @@
 --   - RANGE partitioning on received_at
 --   - Daily partitions
 --   - pg_partman owns partition creation
+--   - pg_partman owns partition maintenance
 --   - pg_partman owns partition retention
 --   - Raw telemetry retention: 7 days
 --
@@ -55,8 +56,55 @@
 
 begin;
 
+-- =====================================================
+-- 0. PG_PARTMAN PRE-FLIGHT
+-- =====================================================
+--
+-- 000_PLATFORM_BASELINE is responsible for making
+-- pg_partman available.
+--
+-- 007 only consumes that dependency.
+--
+-- =====================================================
+
+do $$
+begin
+
+    if not exists (
+        select 1
+        from pg_extension e
+        where e.extname = 'pg_partman'
+    ) then
+
+        raise exception
+            '007 requires pg_partman, but the extension is not installed';
+
+    end if;
 
 
+    if not exists (
+        select 1
+        from pg_namespace n
+        where n.nspname = 'partman'
+    ) then
+
+        raise exception
+            '007 requires the pg_partman schema "partman"';
+
+    end if;
+
+
+    if to_regprocedure(
+        'partman.create_parent(text,text,text,text,text,integer,text,boolean,text,text[],text,boolean,text,boolean,text,text,bigint)'
+    ) is null then
+
+        raise exception
+            '007 requires pg_partman create_parent() with the expected API';
+
+    end if;
+
+end;
+$$;
 
 -- =====================================================
 -- 1. RAW TELEMETRY TABLE
@@ -65,8 +113,8 @@ begin;
 -- The table is partitioned directly at creation time.
 --
 -- received_at is the operational partition key because
--- retention is based on ingestion time, not provider event
--- time.
+-- retention is based on ingestion time, not provider
+-- event time.
 --
 -- observed_at may be NULL and must never determine
 -- retention or partition placement.
@@ -100,14 +148,12 @@ create table if not exists public.device_telemetry_raw (
 )
 partition by range (received_at);
 
-
 -- =====================================================
 -- 2. RAW TELEMETRY QUERY INDEXES
 -- =====================================================
 --
 -- These indexes are created on the partitioned parent.
--- PostgreSQL/pg_partman will propagate them to the
--- partitions.
+-- PostgreSQL creates corresponding partition indexes.
 --
 -- =====================================================
 
@@ -132,7 +178,6 @@ on public.device_telemetry_raw (
     provider_event_id
 );
 
-
 -- =====================================================
 -- 3. IDEMPOTENCY REGISTRY
 -- =====================================================
@@ -151,9 +196,6 @@ on public.device_telemetry_raw (
 --   tenant_id
 --   source
 --   provider_event_id
---
--- This preserves hard idempotency independently from
--- received_at partition boundaries.
 --
 -- =====================================================
 
@@ -176,53 +218,42 @@ create table if not exists public.device_telemetry_raw_idempotency (
     )
 );
 
-
 create index if not exists
 idx_device_telemetry_raw_idempotency_telemetry
 on public.device_telemetry_raw_idempotency (
     telemetry_id
 );
 
-
 -- =====================================================
 -- 4. TABLE CONTRACT
 -- =====================================================
 
 comment on table public.device_telemetry_raw is
-'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. Partitioned by received_at and maintained by pg_partman. No provider-specific interpretation or processing belongs here.';
-
+'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. Partitioned daily by received_at and maintained by pg_partman. Raw retention is 7 days. No provider-specific interpretation or processing belongs here.';
 
 comment on table public.device_telemetry_raw_idempotency is
 'Global raw telemetry ingestion idempotency registry. Maintains tenant + source + provider_event_id uniqueness independently from raw telemetry partitions. This table contains ingestion identity metadata, not telemetry payloads.';
 
-
 comment on column public.device_telemetry_raw.tenant_id is
 'Authoritative SmartHellas tenant resolved by Integration Engine (006).';
-
 
 comment on column public.device_telemetry_raw.device_id is
 'SmartHellas device resolved by Integration Engine (006).';
 
-
 comment on column public.device_telemetry_raw.source is
 'Provider code resolved by Integration Engine (006).';
-
 
 comment on column public.device_telemetry_raw.provider_event_id is
 'Provider-side event identifier supplied by Integration Engine (006) and used for hard idempotency.';
 
-
 comment on column public.device_telemetry_raw.observed_at is
 'Provider event timestamp resolved by Integration Engine (006). NULL only when the provider event has no usable event timestamp.';
-
 
 comment on column public.device_telemetry_raw.received_at is
 'Timestamp at which the event entered the SmartHellas platform boundary. This is the partition and retention control timestamp.';
 
-
 comment on column public.device_telemetry_raw.raw_payload is
 'Original provider payload. Must not be normalized, transformed or mutated after ingestion.';
-
 
 -- =====================================================
 -- 5. DEVICE ↔ TENANT INVARIANT
@@ -267,11 +298,9 @@ begin
 end;
 $$;
 
-
 drop trigger if exists
 trg_device_telemetry_tenant_consistency
 on public.device_telemetry_raw;
-
 
 create trigger
 trg_device_telemetry_tenant_consistency
@@ -280,17 +309,15 @@ for each row
 execute function
 public.enforce_device_telemetry_tenant_consistency();
 
-
 alter function
 public.enforce_device_telemetry_tenant_consistency()
 set search_path = '';
-
 
 -- =====================================================
 -- 6. PG_PARTMAN PARTITION SETUP
 -- =====================================================
 --
--- Daily partitions.
+-- Daily RANGE partitions on received_at.
 --
 -- Example:
 --
@@ -299,8 +326,8 @@ set search_path = '';
 --   p2026_10_01
 --
 -- pg_partman owns:
---   - future partition creation
---   - premake
+--   - partition creation
+--   - future partition premake
 --   - maintenance
 --   - retention
 --
@@ -309,18 +336,21 @@ set search_path = '';
 --
 -- =====================================================
 
-select partman.create_partition(
-    p_parent_table := 'public.device_telemetry_raw',
-    p_control := 'received_at',
-    p_interval := '1 day',
-    p_type := 'range',
-    p_premake := 7,
-    p_default_table := false,
+select partman.create_parent(
+    p_parent_table          := 'public.device_telemetry_raw',
+    p_control               := 'received_at',
+    p_interval              := '1 day',
+    p_type                  := 'range',
+    p_premake               := 7,
+    p_default_table         := false,
     p_automatic_maintenance := 'on',
-    p_jobmon := true,
-    p_control_not_null := true
+    p_jobmon                := false,
+    p_control_not_null      := true,
+    p_start_partition       := to_char(
+        date_trunc('day', now()),
+        'YYYY-MM-DD'
+    )
 );
-
 
 -- =====================================================
 -- 7. PG_PARTMAN RETENTION CONFIGURATION
@@ -343,9 +373,10 @@ set
     retention = '7 days',
     retention_keep_table = false,
     retention_keep_index = false,
-    automatic_maintenance = 'on'
+    automatic_maintenance = 'on',
+    premake = 7,
+    infinite_time_partitions = false
 where parent_table = 'public.device_telemetry_raw';
-
 
 -- =====================================================
 -- 8. PARTITIONING CONTRACT
@@ -353,7 +384,6 @@ where parent_table = 'public.device_telemetry_raw';
 
 comment on table public.device_telemetry_raw is
 'Immutable raw device telemetry. Stores provider payloads after Integration Engine (006) has resolved tenant, device and provider event identity. Partitioned daily by received_at and maintained by pg_partman. Raw retention is 7 days. No provider-specific interpretation or processing belongs here.';
-
 
 -- =====================================================
 -- 9. RAW TELEMETRY INGEST
@@ -399,12 +429,10 @@ begin
             'tenant_id is required';
     end if;
 
-
     if p_device_id is null then
         raise exception
             'device_id is required';
     end if;
-
 
     if p_source is null
        or btrim(p_source) = '' then
@@ -412,13 +440,11 @@ begin
             'source is required';
     end if;
 
-
     if p_provider_event_id is null
        or btrim(p_provider_event_id) = '' then
         raise exception
             'provider_event_id is required';
     end if;
-
 
     v_source :=
         lower(btrim(p_source));
@@ -431,7 +457,6 @@ begin
             p_received_at,
             now()
         );
-
 
     -- =================================================
     -- 2. DEVICE / TENANT CONSISTENCY
@@ -451,21 +476,11 @@ begin
 
     end if;
 
-
     -- =================================================
     -- 3. GLOBAL IDEMPOTENCY CLAIM
     -- =================================================
-    --
-    -- The registry provides the cross-partition
-    -- uniqueness guarantee.
-    --
-    -- A new telemetry UUID is generated only when the
-    -- event identity is claimed successfully.
-    --
-    -- =================================================
 
     v_id := gen_random_uuid();
-
 
     insert into public.device_telemetry_raw_idempotency (
         tenant_id,
@@ -487,7 +502,6 @@ begin
         provider_event_id
     )
     do nothing;
-
 
     -- =================================================
     -- 4. DUPLICATE EVENT
@@ -522,7 +536,6 @@ begin
 
     end if;
 
-
     -- =================================================
     -- 5. IMMUTABLE RAW INSERT
     -- =================================================
@@ -551,7 +564,6 @@ begin
         )
     );
 
-
     -- =================================================
     -- 6. SUCCESS
     -- =================================================
@@ -565,7 +577,6 @@ begin
 end;
 $$;
 
-
 comment on function public.ingest_device_telemetry_raw(
     uuid,
     uuid,
@@ -577,7 +588,6 @@ comment on function public.ingest_device_telemetry_raw(
 )
 is
 'Single raw telemetry ingest boundary. Stores immutable provider payloads after Integration Engine (006) resolves tenant, device, provider event identity and observed timestamp. Idempotent on tenant + source + provider_event_id through the raw telemetry idempotency registry.';
-
 
 -- =====================================================
 -- 10. FUNCTION SECURITY HARDENING
@@ -594,7 +604,6 @@ alter function public.ingest_device_telemetry_raw(
 )
 set search_path = '';
 
-
 revoke all
 on function public.ingest_device_telemetry_raw(
     uuid,
@@ -606,7 +615,6 @@ on function public.ingest_device_telemetry_raw(
     jsonb
 )
 from public, anon, authenticated;
-
 
 -- =====================================================
 -- 11. SCHEMA MIGRATION REGISTRATION
@@ -625,9 +633,7 @@ values (
 on conflict (migration_name)
 do nothing;
 
-
 commit;
-
 
 -- =====================================================
 -- END 007 DEVICE TELEMETRY RAW
@@ -639,7 +645,8 @@ commit;
 -- 007 = Raw telemetry input SSOT
 --
 -- Partitioning:
---   pg_partman owns partition creation and retention.
+--   pg_partman owns partition creation,
+--   premake, maintenance and retention.
 --
 -- Future modules may derive:
 --   - normalized measurements
@@ -652,4 +659,5 @@ commit;
 --
 -- Such derived data MUST NOT be written into
 -- device_telemetry_raw.
+--
 -- =====================================================

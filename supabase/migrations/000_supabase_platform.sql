@@ -2,13 +2,11 @@
 -- REV1 GREENFIELD BASELINE
 -- 000_SUPABASE_PLATFORM.SQL
 -- =====================================================
---
+
 
 -- =====================================================
 -- 01 CREATING SCHEMAS AND EXTENSIONS
 -- =====================================================
-
-
 
 create schema if not exists platform;
 create extension if not exists pgcrypto;
@@ -19,7 +17,12 @@ create extension if not exists btree_gist;
 create extension if not exists pg_stat_statements;
 CREATE SCHEMA IF NOT EXISTS extensions;
 
-CREATE EXTENSION IF NOT EXISTS pg_partman;
+DROP EXTENSION IF EXISTS pg_partman CASCADE;
+
+CREATE SCHEMA IF NOT EXISTS partman;
+
+CREATE EXTENSION IF NOT EXISTS pg_partman
+    WITH SCHEMA partman;
 
 create extension if not exists pg_cron
 with schema pg_catalog;
