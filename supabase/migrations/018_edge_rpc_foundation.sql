@@ -1278,9 +1278,22 @@ begin
             'apply_discount_to_invoice',
             'list_discount_redemptions',
             'list_invoices',
-            'get_invoice'
+            'get_invoice',
+            'get_billing_customer',
+            'update_billing_customer'
         then
             perform public.edge_require_manager();
+
+        -- Epsilon e-invoicing administration (012 section 16).
+        -- Tables are backend-only; platform admins manage them by RPC only.
+        when
+            'list_billing_item_mappings',
+            'upsert_billing_item_mapping',
+            'deactivate_billing_item_mapping',
+            'list_epsilon_issues',
+            'requeue_epsilon_invoice'
+        then
+            perform public.edge_require_platform_admin();
 
         else
             raise exception

@@ -2099,6 +2099,172 @@ begin
 
             return to_jsonb(v_row);
 
+        -- =================================================
+        -- EPSILON BILLING - PLATFORM ADMIN
+        -- (authorised in commerce_api via edge_require_platform_admin)
+        -- =================================================
+
+        when 'list_billing_item_mappings' then
+
+            select coalesce(jsonb_agg(to_jsonb(m) order by m.item_key), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    bm.id, bm.item_key, bm.plan_id, bm.description,
+                    bm.epsilon_item_id, bm.epsilon_item_code,
+                    bm.mydata_income_class_type, bm.mydata_income_class_category,
+                    bm.default_vat_rate, bm.vat_exemption_category,
+                    bm.is_active, bm.updated_at
+                from public.billing_item_mappings bm
+            ) m;
+
+            return v_result;
+
+        when 'upsert_billing_item_mapping' then
+
+            if nullif(btrim(coalesce(p_payload->>'item_key', '')), '') is null
+               or nullif(btrim(coalesce(p_payload->>'epsilon_item_code', '')), '') is null
+               or nullif(btrim(coalesce(p_payload->>'mydata_income_class_type', '')), '') is null
+               or nullif(btrim(coalesce(p_payload->>'mydata_income_class_category', '')), '') is null
+               or nullif(p_payload->>'default_vat_rate', '') is null then
+                raise exception 'item_key, epsilon_item_code, mydata_income_class_type, mydata_income_class_category and default_vat_rate are required';
+            end if;
+
+            insert into public.billing_item_mappings (
+                item_key, plan_id, description, epsilon_item_id, epsilon_item_code,
+                mydata_income_class_type, mydata_income_class_category,
+                default_vat_rate, vat_exemption_category
+            )
+            values (
+                btrim(p_payload->>'item_key'),
+                nullif(p_payload->>'plan_id', '')::uuid,
+                nullif(btrim(coalesce(p_payload->>'description', '')), ''),
+                nullif(btrim(coalesce(p_payload->>'epsilon_item_id', '')), ''),
+                btrim(p_payload->>'epsilon_item_code'),
+                btrim(p_payload->>'mydata_income_class_type'),
+                btrim(p_payload->>'mydata_income_class_category'),
+                (p_payload->>'default_vat_rate')::numeric,
+                nullif(btrim(coalesce(p_payload->>'vat_exemption_category', '')), '')
+            )
+            on conflict (item_key) do update set
+                plan_id = excluded.plan_id,
+                description = excluded.description,
+                epsilon_item_id = excluded.epsilon_item_id,
+                epsilon_item_code = excluded.epsilon_item_code,
+                mydata_income_class_type = excluded.mydata_income_class_type,
+                mydata_income_class_category = excluded.mydata_income_class_category,
+                default_vat_rate = excluded.default_vat_rate,
+                vat_exemption_category = excluded.vat_exemption_category,
+                is_active = true
+            returning id, item_key, plan_id, epsilon_item_code,
+                      mydata_income_class_type, mydata_income_class_category,
+                      default_vat_rate, vat_exemption_category, is_active
+            into v_row;
+
+            perform platform.log_audit(
+                'billing_item_mapping.upserted',
+                'billing_item_mapping',
+                v_row.id,
+                jsonb_build_object('item_key', v_row.item_key)
+            );
+
+            return to_jsonb(v_row);
+
+        when 'deactivate_billing_item_mapping' then
+
+            update public.billing_item_mappings bm
+            set is_active = false
+            where bm.id = (p_payload->>'id')::uuid
+            returning bm.id, bm.item_key, bm.is_active
+            into v_row;
+
+            if not found then
+                raise exception 'Billing item mapping not found';
+            end if;
+
+            perform platform.log_audit(
+                'billing_item_mapping.deactivated',
+                'billing_item_mapping',
+                v_row.id,
+                jsonb_build_object('item_key', v_row.item_key)
+            );
+
+            return to_jsonb(v_row);
+
+        when 'list_epsilon_issues' then
+
+            v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
+            v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
+
+            -- Platform-wide: invoices that need attention.
+            select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    i.id,
+                    i.tenant_id,
+                    i.invoice_number,
+                    i.document_type,
+                    i.epsilon_status,
+                    i.epsilon_last_error,
+                    i.epsilon_uid,
+                    i.epsilon_mark,
+                    i.locked_at,
+                    i.created_at,
+                    (
+                        select jsonb_build_object(
+                            'id', es.id,
+                            'status', es.status,
+                            'attempts', es.attempts,
+                            'http_status', es.http_status,
+                            'error', es.error,
+                            'next_attempt_at', es.next_attempt_at
+                        )
+                        from public.epsilon_submissions es
+                        where es.invoice_id = i.id
+                        order by es.created_at desc
+                        limit 1
+                    ) as last_submission
+                from public.invoices i
+                where i.epsilon_status in ('queued', 'error', 'rejected')
+                order by i.created_at desc
+                limit v_limit
+                offset v_offset
+            ) t;
+
+            return v_result;
+
+        when 'requeue_epsilon_invoice' then
+
+            select i.id, i.document_type, i.epsilon_status
+            into v_inv
+            from public.invoices i
+            where i.id = (p_payload->>'invoice_id')::uuid;
+
+            if not found then
+                raise exception 'Invoice not found';
+            end if;
+
+            -- A rejection by AADE cannot be fixed by resending the same data;
+            -- that requires a credit note / corrected invoice.
+            if v_inv.epsilon_status <> 'error' then
+                raise exception 'Only invoices with Epsilon status error can be re-queued (status: %)', v_inv.epsilon_status;
+            end if;
+
+            perform platform.epsilon_enqueue_invoice(
+                v_inv.id,
+                case when v_inv.document_type = 'credit_note' then 'credit' else 'issue' end
+            );
+
+            perform platform.log_audit(
+                'invoice.epsilon_requeued',
+                'invoice',
+                v_inv.id,
+                '{}'::jsonb
+            );
+
+            return jsonb_build_object('invoice_id', v_inv.id, 'status', 'queued');
+
         else
             raise exception 'unknown commerce operation: %', p_op;
     end case;
