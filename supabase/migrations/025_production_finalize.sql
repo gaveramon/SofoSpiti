@@ -1,6 +1,6 @@
 -- =====================================================
 -- REV1 GREENFIELD BASELINE
--- 024_PRODUCTION_FINALIZE.SQL
+-- 025_PRODUCTION_FINALIZE.SQL
 -- =====================================================
 --
 -- Purpose:
@@ -32,12 +32,13 @@
 -- 015_optimization_engine.sql
 -- 016_customer_proposal_monetization.sql
 -- 017_automation_engine.sql
--- 018_edge_rpc_foundation.sql
--- 019_security_classification.sql
--- 020_security_hardening.sql
--- 021_grant_matrix_actors.sql
--- 022_grant_matrix.sql
--- 023_platform_bootstrap.sql
+-- 018_inventory_engine.sql
+-- 019_edge_rpc_foundation.sql
+-- 020_security_classification.sql
+-- 021_security_hardening.sql
+-- 022_grant_matrix_actors.sql
+-- 023_grant_matrix.sql
+-- 024_platform_bootstrap.sql
 --
 -- Auditor mapping:
 --
@@ -112,12 +113,13 @@ begin
             ('015_optimization_engine'),
             ('016_customer_proposal_monetization'),
             ('017_automation_engine'),
-            ('018_edge_rpc_foundation'),
-            ('019_security_classification'),
-            ('020_security_hardening'),
-            ('021_grant_matrix_actors'),
-            ('022_grant_matrix'),
-            ('023_platform_bootstrap')
+            ('018_inventory_engine'),
+            ('019_edge_rpc_foundation'),
+            ('020_security_classification'),
+            ('021_security_hardening'),
+            ('022_grant_matrix_actors'),
+            ('023_grant_matrix'),
+            ('024_platform_bootstrap')
     ) as required(migration_name)
 
     where not exists
@@ -628,8 +630,8 @@ values
     'migration',
     null,
     jsonb_build_object(
-        'migration_name', '024_production_finalize',
-        'version', 'REV1.PLATFORM.BOOTSTRAP',
+        'migration_name', '025_production_finalize',
+        'version', 'REV1',
         'checkpoint', 'human_approval',
         'status', 'completed'
     )
@@ -642,7 +644,7 @@ values
 -- =====================================================
 
 insert into platform.schema_migrations( migration_name, version, rollback_available)
-values( '024_production_finalize', 'REV1', false)
+values( '025_production_finalize', 'REV1', false)
 on conflict(migration_name) do nothing;
 
 commit;

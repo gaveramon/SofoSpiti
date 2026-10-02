@@ -1,21 +1,111 @@
 -- =====================================================
--- REV1 GREENFIELD BASELINE
+-- REV2 GREENFIELD BASELINE
 -- 012_COMMERCE_ENGINE.SQL
 -- =====================================================
+-- COMMERCE DOMAIN
+-- 012 OWNS:
+--   - subscription product plans
+--   - plan pricing
+--   - feature entitlements
+--   - subscription <-> plan relationship
+--   - subscription cancellation per end of month
+--   - upsell rules
+--   - billing customers (fiscal identity used on invoices)
+--   - invoices (incl. credit notes)
+--   - invoice lines
+--   - discount codes
+--   - discount redemptions
+--   - Epsilon e-invoicing outbox, immutable invoice snapshots
+--     and plan -> Epsilon item / myDATA classification mapping
+-- 012 DOES NOT OWN:
+--   - tenants / customer identity
+--   - customer accounts
+--   - physical product catalog
+--   - device bundles / BOM
+--   - logistics
+--   - fulfilment
+--   - warehouses
+--   - inventory / stock
+--   - stock movements
+--   - payment execution
+--   - payment provider credentials
+--   - payment webhooks
+-- OWNERSHIP:
+--   002 CORE SaaS
+--       subscriptions baseline
+--             │
+--             ↓
+--   012 COMMERCE
+--       plans
+--       pricing
+--       entitlements
+--       discounts
+--       invoices
+--   003 CUSTOMER / CRM
+--       customer accounts
+--       customer-account discounts
+--             │
+--             ↓
+--       012 applies commercial effect
+--   010 DEVICE / BOM
+--             │
+--             ↓
+--   011 LOGISTICS
+--       fulfilment
+--       warehouses
+--       shipping
+--   018 INVENTORY
+--       stock
+--       reservations
+--       movements
+--   000 PLATFORM EXECUTION
+--       payment execution
+--       payment provider webhooks
 --
--- NO PAYMENT EXECUTION / NO WEBHOOKS / NO TRANSACTIONS
--- BILLING: Supabase decides WHAT is invoiced (customer, lines, VAT,
--- discounts, credit notes). Epsilon issues the official e-invoice and
--- transmits it to AADE/myDATA (section 16). The portal only reads.
--- Campaign SSOT: upsell_rules (plan upgrades) only.
--- Package upsells → 015.upsell_campaigns. Marketing → 003.crm_campaigns.
+-- BILLING / E-INVOICING
+--   Supabase (012) decides WHAT is invoiced: billing customer,
+--   lines, VAT, discounts, credit notes.
+--   Epsilon issues the official electronic invoice and
+--   transmits it to AADE/myDATA (section 27A).
+--   The portal only reads; it never calls Epsilon.
 -- =====================================================
+-- =====================================================
+-- 0. PRECONDITIONS
+-- =====================================================
+do $$
+begin
+if to_regclass('public.tenants') is null then
+    raise exception
+        '012 requires public.tenants from the core SaaS layer';
+end if;
+
+if to_regclass('public.subscriptions') is null then
+    raise exception
+        '012 requires public.subscriptions from the core SaaS layer';
+end if;
+
+if to_regclass('platform.schema_migrations') is null then
+    raise exception
+        '012 requires platform.schema_migrations';
+end if;
+
+if to_regclass('public.crm_companies') is null then
+    raise exception
+        '012 requires public.crm_companies from the CRM layer (003)';
+end if;
+end;
+$$;
 
 
 -- =====================================================
--- 1. COMMERCIAL PRODUCT CATALOG
+-- 1. SUBSCRIPTION PRODUCT PLANS
 -- =====================================================
--- Product plans define the commercial subscription offerings.
+--
+-- Commercial subscription catalog.
+--
+-- IMPORTANT:
+-- This is NOT a physical product catalog.
+-- Physical hardware/product inventory belongs to 018.
 -- =====================================================
 
 create table if not exists public.product_plans (
@@ -27,104 +117,197 @@ create table if not exists public.product_plans (
 
     tier subscription_tier not null,
 
-    is_active boolean default true,
+    is_active boolean not null default true,
 
-    -- Plan every new tenant is provisioned with
-    -- (see provision_default_subscription in section 15).
-    -- At most one plan can be the default (unique index).
     is_default boolean not null default false,
 
-    created_at timestamptz default now(),
+    created_at timestamptz not null default now(),
 
-    updated_at timestamptz default now(),
+    updated_at timestamptz not null default now(),
 
-    constraint chk_product_plans_default_active
-        check (not is_default or is_active is true)
+    constraint chk_product_plans_name_nonempty
+        check (btrim(name) <> '')
 );
 
 
 -- =====================================================
 -- 2. PLAN PRICING
 -- =====================================================
--- Static commercial pricing attached to product plans.
+--
+-- Pricing history is retained through effective_from.
+--
+-- Multiple historical/future prices for the same plan and
+-- currency are therefore allowed.
 -- =====================================================
 
 create table if not exists public.plan_pricing (
     id uuid primary key default gen_random_uuid(),
 
-    plan_id uuid not null references product_plans(id) on delete cascade,
+    plan_id uuid not null
+        references public.product_plans(id)
+        on delete cascade,
 
     currency text not null default 'EUR',
 
-    monthly_price numeric(10,2),
+    monthly_price numeric(12,2),
 
-    yearly_price numeric(10,2),
+    yearly_price numeric(12,2),
 
     effective_from timestamptz not null default now(),
 
-    created_at timestamptz default now(),
+    created_at timestamptz not null default now(),
 
-    constraint chk_plan_pricing_currency_iso
-        check (char_length(currency) = 3),
+    constraint uq_plan_pricing_effective
+        unique (plan_id, currency, effective_from),
 
-    constraint chk_plan_pricing_has_amount
-        check (monthly_price is not null or yearly_price is not null),
+    constraint chk_plan_pricing_currency
+        check (
+            char_length(currency) = 3
+            and currency = upper(currency)
+        ),
 
-    unique (plan_id, currency)
+    constraint chk_plan_pricing_monthly_nonnegative
+        check (
+            monthly_price is null
+            or monthly_price >= 0
+        ),
+
+    constraint chk_plan_pricing_yearly_nonnegative
+        check (
+            yearly_price is null
+            or yearly_price >= 0
+        ),
+
+    constraint chk_plan_pricing_has_price
+        check (
+            monthly_price is not null
+            or yearly_price is not null
+        )
 );
 
 
 -- =====================================================
--- 3. PLAN FEATURE ENTITLEMENTS
--- =====================================================
--- Defines which platform features a plan enables.
+-- 3. FEATURE ENTITLEMENTS
 -- =====================================================
 
 create table if not exists public.feature_entitlements (
     id uuid primary key default gen_random_uuid(),
 
-    plan_id uuid not null references product_plans(id) on delete cascade,
+    plan_id uuid not null
+        references public.product_plans(id)
+        on delete cascade,
 
     feature_key text not null,
-    -- e.g. auto_door_code, energy_reports, guest_messaging
 
-    enabled boolean default true,
+    enabled boolean not null default true,
 
-    unique (plan_id, feature_key)
+    created_at timestamptz not null default now(),
+
+    constraint uq_feature_entitlements_plan_feature
+        unique (plan_id, feature_key),
+
+    constraint chk_feature_entitlements_key_nonempty
+        check (btrim(feature_key) <> '')
 );
 
 
 -- =====================================================
--- 4. UPSELL RULE DEFINITIONS
+-- 4. UPSELL RULES
 -- =====================================================
--- Defines subscription/plan upgrade recommendations only.
--- Package upsells live in 015.upsell_campaigns.
+--
+-- Commercial subscription recommendations only.
+--
+-- Hardware recommendations belong outside Commerce.
+-- Package recommendations belong outside Commerce.
 -- =====================================================
 
 create table if not exists public.upsell_rules (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid references tenants(id) on delete cascade,
+    tenant_id uuid
+        references public.tenants(id)
+        on delete cascade,
 
-    trigger_event upsell_plan_trigger,
+    trigger_event text not null,
 
-    recommended_plan_id uuid references product_plans(id),
+    recommended_plan_id uuid not null
+        references public.product_plans(id)
+        on delete restrict,
 
-    rule_config jsonb,
+    rule_config jsonb not null default '{}'::jsonb,
 
-    is_active boolean default true,
+    is_active boolean not null default true,
 
-    created_at timestamptz default now()
+    created_at timestamptz not null default now(),
+
+    constraint chk_upsell_rules_trigger_nonempty
+        check (btrim(trigger_event) <> '')
 );
 
 
 -- =====================================================
--- 4A. BILLING CUSTOMERS
+-- 5. SUBSCRIPTION -> PLAN RELATIONSHIP
 -- =====================================================
--- Legal/fiscal identity a tenant is invoiced under. A tenant
--- may be linked to a CRM company, but the billing identity is
--- kept separate: invoices are fiscal documents and the data on
--- them (name, VAT number, address) must be stable.
+--
+-- subscriptions belongs to the Core SaaS domain.
+-- 012 adds the commercial plan relationship.
+-- =====================================================
+
+alter table public.subscriptions
+    add column if not exists plan_id uuid;
+
+
+do $$
+begin
+    alter table public.subscriptions
+        add constraint fk_subscriptions_plan
+        foreign key (plan_id)
+        references public.product_plans(id)
+        on delete restrict;
+exception
+    when duplicate_object then
+        null;
+end;
+$$;
+
+
+-- Cancellation per end of month (see section 19A).
+-- subscriptions has exactly one row per tenant (002).
+alter table public.subscriptions
+    add column if not exists cancel_requested_at timestamptz,
+    add column if not exists cancel_effective_at timestamptz,
+    add column if not exists cancel_reason text;
+
+
+do $$
+begin
+    alter table public.subscriptions
+        add constraint chk_subscriptions_cancellation
+        check (
+            (cancel_requested_at is null and cancel_effective_at is null)
+            or (
+                cancel_requested_at is not null
+                and cancel_effective_at is not null
+                and cancel_effective_at > cancel_requested_at
+            )
+        );
+exception
+    when duplicate_object then
+        null;
+end;
+$$;
+
+
+-- =====================================================
+-- 5A. BILLING CUSTOMERS
+-- =====================================================
+--
+-- Legal/fiscal identity a tenant is invoiced under.
+--
+-- Kept separate from the CRM company: an invoice is a fiscal
+-- document and the data on it (name, VAT number, address)
+-- must be stable. A CRM company may be linked for convenience.
+--
 -- Epsilon matches customers on VAT number (CustTin), so the VAT
 -- number is mandatory for business customers at issue time.
 -- =====================================================
@@ -132,24 +315,30 @@ create table if not exists public.upsell_rules (
 create table if not exists public.billing_customers (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null references public.tenants(id) on delete cascade,
+    tenant_id uuid not null
+        references public.tenants(id)
+        on delete cascade,
 
-    crm_company_id uuid references public.crm_companies(id) on delete set null,
+    crm_company_id uuid
+        references public.crm_companies(id)
+        on delete set null,
 
-    customer_type text not null default 'business'
-        check (customer_type in ('business', 'individual')),
+    customer_type text not null default 'business',
 
     legal_name text not null,
+
     trade_name text,
 
     vat_number text,
+
     tax_office text,
 
-    country_code text not null default 'GR'
-        check (country_code ~ '^[A-Z]{2}$'),
+    country_code text not null default 'GR',
 
     address_line text,
+
     postal_code text,
+
     city text,
 
     billing_email text,
@@ -158,410 +347,644 @@ create table if not exists public.billing_customers (
     epsilon_customer_code text,
 
     is_default boolean not null default true,
+
     is_active boolean not null default true,
 
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+
+    updated_at timestamptz not null default now(),
+
+    constraint chk_billing_customers_type
+        check (customer_type in ('business', 'individual')),
+
+    constraint chk_billing_customers_legal_name
+        check (btrim(legal_name) <> ''),
+
+    constraint chk_billing_customers_country
+        check (country_code ~ '^[A-Z]{2}$')
 );
 
-create unique index if not exists uq_billing_customers_default
-on public.billing_customers (tenant_id)
-where is_default;
-
-create unique index if not exists uq_billing_customers_epsilon_code
-on public.billing_customers (epsilon_customer_code)
-where epsilon_customer_code is not null;
-
-create index if not exists idx_billing_customers_tenant
-on public.billing_customers (tenant_id);
-
 
 -- =====================================================
--- 4B. INVOICES
+-- 6. INVOICES
 -- =====================================================
--- Audit fix: public.payment_intents (000) has always
--- supported target_type = 'invoice' and defensively
--- checks `to_regclass('public.invoices')`, but the table
--- itself was never created. This adds the minimal table
--- that check assumes exists.
+--
+-- Commercial invoice SSOT.
+--
+-- Accounting/provider integrations consume this state.
+-- They do not become the Commerce SSOT.
+--
+-- Lifecycle:
+--   draft  -> discounts may be applied, lines may change
+--   issued -> frozen by platform.epsilon_enqueue_invoice()
+--             (snapshot + locked_at); only status/payment/
+--             Epsilon fields may still change. Corrections are
+--             made with a credit note, never by editing.
+--
+-- Credit notes are stored with POSITIVE amounts (as myDATA
+-- type 5.1); the sign comes from document_type.
 -- =====================================================
 
 create table if not exists public.invoices (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null references public.tenants(id) on delete cascade,
+    tenant_id uuid not null
+        references public.tenants(id)
+        on delete cascade,
 
-    subscription_id uuid references public.subscriptions(id) on delete set null,
+    subscription_id uuid
+        references public.subscriptions(id)
+        on delete restrict,
 
     invoice_number text not null,
 
-    status text not null default 'draft'
-        check (status in ('draft', 'open', 'paid', 'void', 'uncollectible')),
+    status text not null default 'draft',
 
-    currency text not null default 'EUR'
-        check (char_length(currency) = 3),
+    currency text not null default 'EUR',
 
-    subtotal numeric(10,2) not null default 0,
-    discount_amount numeric(10,2) not null default 0,
-    tax_amount numeric(10,2) not null default 0,
-    total_amount numeric(10,2) not null default 0,
+    subtotal numeric(12,2) not null default 0,
+
+    discount_amount numeric(12,2) not null default 0,
+
+    tax_amount numeric(12,2) not null default 0,
+
+    total_amount numeric(12,2) not null default 0,
 
     issued_at timestamptz,
+
     due_at timestamptz,
+
     paid_at timestamptz,
 
+    -- Service period covered by the invoice. Required for subscription
+    -- invoices; used to stop billing after a cancellation (19A).
+    period_start date,
+
+    period_end date,
+
     -- ---- billing identity & document type ----
-    billing_customer_id uuid references public.billing_customers(id),
 
-    -- Credit notes are stored with POSITIVE amounts (as in myDATA type 5.1);
-    -- the sign comes from document_type.
-    document_type text not null default 'invoice'
-        check (document_type in ('invoice', 'credit_note')),
+    billing_customer_id uuid
+        references public.billing_customers(id)
+        on delete restrict,
 
-    credited_invoice_id uuid references public.invoices(id),
+    document_type text not null default 'invoice',
+
+    credited_invoice_id uuid
+        references public.invoices(id)
+        on delete restrict,
+
     credit_reason text,
 
     -- Derived from status; no second field to keep in sync.
     payment_status text generated always as (
         case
             when status = 'paid' then 'paid'
-            when status in ('draft', 'void') then 'not_applicable'
+            when status in ('draft', 'void', 'cancelled') then 'not_applicable'
             else 'unpaid'
         end
     ) stored,
 
     -- ---- Epsilon / myDATA (written by platform.epsilon_* only) ----
+
     mydata_document_type text,
+
     epsilon_document_id text,
+
     epsilon_uid text,
+
     epsilon_mark text,
+
+    -- Credit notes (5.x): MARK of the original invoice.
     epsilon_correlated_mark text,
+
     epsilon_status text not null default 'not_submitted',
+
     epsilon_response jsonb,
+
     epsilon_submitted_at timestamptz,
+
     epsilon_accepted_at timestamptz,
+
     epsilon_last_error text,
 
-    -- Set when the invoice is frozen for Epsilon (see section 16).
+    -- Set when the invoice is frozen for Epsilon (section 27A).
     locked_at timestamptz,
+
     snapshot_id uuid,
 
-    created_at timestamptz default now(),
-    updated_at timestamptz default now(),
+    created_at timestamptz not null default now(),
 
-    constraint chk_invoices_total_non_negative
+    updated_at timestamptz not null default now(),
+
+    constraint uq_invoices_tenant_number
+        unique (tenant_id, invoice_number),
+
+    constraint chk_invoices_status
+        check (
+            status in (
+                'draft',
+                'issued',
+                'sent',
+                'paid',
+                'overdue',
+                'void',
+                'cancelled'
+            )
+        ),
+
+    constraint chk_invoices_currency
+        check (
+            char_length(currency) = 3
+            and currency = upper(currency)
+        ),
+
+    constraint chk_invoices_subtotal_nonnegative
+        check (subtotal >= 0),
+
+    constraint chk_invoices_discount_nonnegative
+        check (discount_amount >= 0),
+
+    constraint chk_invoices_tax_nonnegative
+        check (tax_amount >= 0),
+
+    constraint chk_invoices_discount_not_above_subtotal
+        check (discount_amount <= subtotal),
+
+    constraint chk_invoices_total_nonnegative
         check (total_amount >= 0),
 
+    constraint chk_invoices_total_consistency
+        check (
+            total_amount =
+            round(subtotal - discount_amount + tax_amount, 2)
+        ),
+
+    constraint chk_invoices_period
+        check (
+            (period_start is null and period_end is null)
+            or (
+                period_start is not null
+                and period_end is not null
+                and period_end >= period_start
+            )
+        ),
+
+    constraint chk_invoices_document_type
+        check (document_type in ('invoice', 'credit_note')),
+
     constraint chk_invoices_credit_note_link
-        check ((document_type = 'credit_note') = (credited_invoice_id is not null)),
+        check (
+            (document_type = 'credit_note')
+            = (credited_invoice_id is not null)
+        ),
 
     constraint chk_invoices_mydata_document_type
-        check (mydata_document_type is null
-               or mydata_document_type ~ '^[0-9]{1,2}\.[0-9]{1,2}$'),
+        check (
+            mydata_document_type is null
+            or mydata_document_type ~ '^[0-9]{1,2}\.[0-9]{1,2}$'
+        ),
 
     constraint chk_invoices_epsilon_status
-        check (epsilon_status in
-               ('not_submitted', 'queued', 'submitted', 'accepted', 'rejected', 'error')),
+        check (
+            epsilon_status in (
+                'not_submitted',
+                'queued',
+                'submitted',
+                'accepted',
+                'rejected',
+                'error'
+            )
+        ),
 
     constraint chk_invoices_accepted_has_mark
-        check (epsilon_status <> 'accepted' or epsilon_mark is not null),
+        check (
+            epsilon_status <> 'accepted'
+            or epsilon_mark is not null
+        ),
 
     constraint chk_invoices_locked_has_snapshot
-        check (locked_at is null or snapshot_id is not null),
-
-    unique (tenant_id, invoice_number)
+        check (
+            locked_at is null
+            or snapshot_id is not null
+        )
 );
 
-create unique index if not exists uq_invoices_epsilon_document_id
-on public.invoices (epsilon_document_id) where epsilon_document_id is not null;
-
-create unique index if not exists uq_invoices_epsilon_uid
-on public.invoices (epsilon_uid) where epsilon_uid is not null;
-
-create unique index if not exists uq_invoices_epsilon_mark
-on public.invoices (epsilon_mark) where epsilon_mark is not null;
-
-create index if not exists idx_invoices_epsilon_attention
-on public.invoices (epsilon_status)
-where epsilon_status in ('queued', 'error', 'rejected');
-
-create index if not exists idx_invoices_credited
-on public.invoices (credited_invoice_id) where credited_invoice_id is not null;
-
-create index if not exists idx_invoices_tenant_created
-on public.invoices (tenant_id, created_at desc);
-
-create index if not exists idx_invoices_tenant_status
-on public.invoices (tenant_id, status);
-
 
 -- =====================================================
--- 4B.1 INVOICE LINES
+-- 7. INVOICE LINES
 -- =====================================================
--- Line items returned by get_invoice. Written by the backend
--- (invoice generator, service_role); read-only for the portal
--- through commerce_api.
+--
+-- line_amount      = NET amount (quantity * unit_amount), before discount
+-- discount_amount  = discount allocated to this line
+-- vat_amount       = VAT on (line_amount - discount_amount)
+-- gross_amount     = line_amount - discount_amount + vat_amount
+--
+-- gross is verified when the invoice is frozen for Epsilon.
 -- =====================================================
 
 create table if not exists public.invoice_lines (
     id uuid primary key default gen_random_uuid(),
 
     invoice_id uuid not null
-        references public.invoices(id) on delete cascade,
+        references public.invoices(id)
+        on delete cascade,
 
     tenant_id uuid not null
-        references public.tenants(id) on delete cascade,
+        references public.tenants(id)
+        on delete cascade,
 
     description text not null,
 
-    quantity numeric(10,2) not null default 1
-        check (quantity > 0),
+    quantity numeric(12,3) not null default 1,
 
-    unit_amount numeric(10,2) not null default 0,
+    unit_amount numeric(12,2) not null default 0,
 
-    line_amount numeric(10,2) not null default 0,
+    line_amount numeric(12,2) not null default 0,
 
-    sort_order int not null default 0,
+    sort_order integer not null default 0,
 
-    -- line_amount = NET amount (quantity * unit_amount) before discount.
-    -- gross_amount = line_amount - discount_amount + vat_amount
-    -- (verified when the invoice is frozen for Epsilon).
-    product_plan_id uuid references public.product_plans(id) on delete set null,
+    -- ---- product link, VAT and myDATA ----
 
-    vat_rate numeric(5,2)
-        check (vat_rate is null or (vat_rate >= 0 and vat_rate <= 100)),
-    discount_amount numeric(10,2) not null default 0
-        check (discount_amount >= 0),
-    vat_amount numeric(10,2) not null default 0
-        check (vat_amount >= 0),
-    gross_amount numeric(10,2) not null default 0
-        check (gross_amount >= 0),
+    product_plan_id uuid
+        references public.product_plans(id)
+        on delete set null,
 
-    -- Filled from billing_item_mappings (trigger below); required at issue time.
+    vat_rate numeric(5,2),
+
+    discount_amount numeric(12,2) not null default 0,
+
+    vat_amount numeric(12,2) not null default 0,
+
+    gross_amount numeric(12,2) not null default 0,
+
+    -- Filled from billing_item_mappings (trigger in 27A);
+    -- required when the invoice is frozen.
     epsilon_item_code text,
+
     mydata_income_class_type text,
+
     mydata_income_class_category text,
+
     vat_exemption_category text,
 
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+
+    constraint chk_invoice_lines_description
+        check (btrim(description) <> ''),
+
+    constraint chk_invoice_lines_quantity
+        check (quantity > 0),
+
+    constraint chk_invoice_lines_unit_amount
+        check (unit_amount >= 0),
+
+    constraint chk_invoice_lines_line_amount
+        check (line_amount >= 0),
+
+    constraint chk_invoice_lines_vat_rate
+        check (
+            vat_rate is null
+            or (vat_rate >= 0 and vat_rate <= 100)
+        ),
+
+    constraint chk_invoice_lines_discount_amount
+        check (discount_amount >= 0),
+
+    constraint chk_invoice_lines_vat_amount
+        check (vat_amount >= 0),
+
+    constraint chk_invoice_lines_gross_amount
+        check (gross_amount >= 0)
 );
 
-create index if not exists idx_invoice_lines_invoice
-on public.invoice_lines (invoice_id, sort_order);
-
-create index if not exists idx_invoice_lines_tenant
-on public.invoice_lines (tenant_id);
-
-create or replace function public.enforce_invoice_line_tenant_consistency()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-declare
-    v_invoice_tenant uuid;
-begin
-    select i.tenant_id
-    into v_invoice_tenant
-    from public.invoices i
-    where i.id = new.invoice_id;
-
-    if v_invoice_tenant is distinct from new.tenant_id then
-        raise exception 'invoice_lines.tenant_id must match invoices.tenant_id';
-    end if;
-
-    return new;
-end;
-$$;
-
-drop trigger if exists trg_invoice_lines_tenant_consistency on public.invoice_lines;
-
-create trigger trg_invoice_lines_tenant_consistency
-before insert or update of invoice_id, tenant_id on public.invoice_lines
-for each row execute function public.enforce_invoice_line_tenant_consistency();
-
 
 -- =====================================================
--- 4C. DISCOUNTS / COUPONS
--- =====================================================
--- Audit fix: no discount/coupon/voucher concept existed
--- anywhere in the schema. This adds the catalogue and the
--- redemption ledger. RPC wiring lives in commerce_domain() /
--- commerce_api():
---   platform admin : list / create / update / deactivate_discount_code
---   tenant manager : validate_discount_code,
---                    apply_discount_to_invoice,
---                    list_discount_redemptions
--- Rules: one code per invoice, one redemption per tenant per
--- code (relax by dropping uq_discount_redemptions_code_tenant).
+-- 8. DISCOUNT CODES
 -- =====================================================
 
 create table if not exists public.discount_codes (
     id uuid primary key default gen_random_uuid(),
 
-    -- null tenant_id = platform-wide code, usable by any tenant
-    tenant_id uuid references public.tenants(id) on delete cascade,
+    tenant_id uuid
+        references public.tenants(id)
+        on delete cascade,
 
     code text not null,
 
-    discount_type text not null
-        check (discount_type in ('percentage', 'fixed_amount')),
+    discount_type text not null,
 
-    value numeric(10,2) not null
-        check (value > 0),
+    value numeric(12,2) not null,
 
-    currency text default 'EUR'
-        check (currency is null or char_length(currency) = 3),
+    currency text,
 
-    applies_to_plan_id uuid references public.product_plans(id),
+    applies_to_plan_id uuid
+        references public.product_plans(id)
+        on delete restrict,
 
-    max_redemptions int,
-    redeemed_count int not null default 0,
+    max_redemptions integer,
 
-    valid_from timestamptz not null default now(),
+    redeemed_count integer not null default 0,
+
+    valid_from timestamptz,
+
     valid_until timestamptz,
 
     is_active boolean not null default true,
 
-    created_at timestamptz default now(),
-    updated_at timestamptz default now(),
+    created_at timestamptz not null default now(),
 
-    constraint chk_discount_codes_percentage_range
-        check (discount_type <> 'percentage' or (value > 0 and value <= 100)),
+    updated_at timestamptz not null default now(),
 
-    constraint chk_discount_codes_redemption_cap
-        check (max_redemptions is null or redeemed_count <= max_redemptions),
+    constraint chk_discount_codes_code_nonempty
+        check (btrim(code) <> ''),
 
-    constraint chk_discount_codes_max_redemptions_positive
-        check (max_redemptions is null or max_redemptions > 0),
+    constraint chk_discount_codes_type
+        check (
+            discount_type in (
+                'percentage',
+                'fixed_amount'
+            )
+        ),
 
-    constraint chk_discount_codes_code_normalized
-        check (code <> '' and code = upper(btrim(code))),
+    constraint chk_discount_codes_value_nonnegative
+        check (value >= 0),
 
-    constraint chk_discount_codes_validity_window
-        check (valid_until is null or valid_until > valid_from),
+    constraint chk_discount_codes_percentage
+        check (
+            discount_type <> 'percentage'
+            or value <= 100
+        ),
 
-    unique (code)
+    constraint chk_discount_codes_currency
+        check (
+            currency is null
+            or (
+                char_length(currency) = 3
+                and currency = upper(currency)
+            )
+        ),
+
+    constraint chk_discount_codes_fixed_currency
+        check (
+            discount_type <> 'fixed_amount'
+            or currency is not null
+        ),
+
+    constraint chk_discount_codes_max_redemptions
+        check (
+            max_redemptions is null
+            or max_redemptions > 0
+        ),
+
+    constraint chk_discount_codes_redeemed_count
+        check (redeemed_count >= 0),
+
+    constraint chk_discount_codes_validity
+        check (
+            valid_until is null
+            or valid_from is null
+            or valid_until >= valid_from
+        )
 );
+
+
+-- =====================================================
+-- 9. DISCOUNT REDEMPTIONS
+-- =====================================================
 
 create table if not exists public.discount_redemptions (
     id uuid primary key default gen_random_uuid(),
 
-    discount_code_id uuid not null references public.discount_codes(id) on delete cascade,
+    discount_code_id uuid not null
+        references public.discount_codes(id)
+        on delete restrict,
 
-    tenant_id uuid not null references public.tenants(id) on delete cascade,
+    tenant_id uuid not null
+        references public.tenants(id)
+        on delete cascade,
 
-    invoice_id uuid references public.invoices(id) on delete set null,
-    subscription_id uuid references public.subscriptions(id) on delete set null,
+    invoice_id uuid
+        references public.invoices(id)
+        on delete restrict,
 
-    amount_applied numeric(10,2) not null
-        check (amount_applied >= 0),
+    subscription_id uuid
+        references public.subscriptions(id)
+        on delete restrict,
 
-    redeemed_at timestamptz not null default now()
+    amount_applied numeric(12,2) not null default 0,
+
+    redeemed_at timestamptz not null default now(),
+
+    constraint chk_discount_redemptions_amount
+        check (amount_applied >= 0)
 );
 
 
 -- =====================================================
--- 5. SUBSCRIPTION ↔ PLAN BINDING
--- =====================================================
--- Extends the subscriptions SSOT from 002 with the
--- commercial product plan relationship.
+-- 10. NORMALIZE EXISTING COMMERCE CONSTRAINTS
 -- =====================================================
 
-alter table public.subscriptions
-    add column if not exists plan_id uuid references product_plans(id);
+alter table public.product_plans
+    drop constraint if exists chk_product_plans_name_nonempty;
+
+alter table public.product_plans
+    add constraint chk_product_plans_name_nonempty
+    check (btrim(name) <> '');
 
 
-alter table public.subscriptions
-    drop constraint if exists chk_subscriptions_active_plan;
+alter table public.plan_pricing
+    drop constraint if exists chk_plan_pricing_currency;
 
-
-alter table public.subscriptions
-    add constraint chk_subscriptions_active_plan check (
-        status not in ('trial', 'pending', 'active', 'past_due')
-        or plan_id is not null
+alter table public.plan_pricing
+    add constraint chk_plan_pricing_currency
+    check (
+        char_length(currency) = 3
+        and currency = upper(currency)
     );
 
 
-comment on column public.subscriptions.tier is
-    'Denormalized from product_plans.tier when plan_id is set. Do not edit independently.';
+alter table public.discount_codes
+    drop constraint if exists chk_discount_codes_currency;
+
+alter table public.discount_codes
+    add constraint chk_discount_codes_currency
+    check (
+        currency is null
+        or (
+            char_length(currency) = 3
+            and currency = upper(currency)
+        )
+    );
 
 
 -- =====================================================
--- 6. COMMERCE DOMAIN INDEXES
+-- 11. NORMALIZE DISCOUNT CODE VALUES
 -- =====================================================
 
-create index if not exists idx_plan_pricing_plan
-on public.plan_pricing (plan_id);
+update public.discount_codes
+set
+    code = upper(btrim(code)),
+    currency = case
+        when currency is null then null
+        else upper(btrim(currency))
+    end;
+
+
+-- =====================================================
+-- 12. UNIQUE / PERFORMANCE INDEXES
+-- =====================================================
+
+create unique index if not exists uq_product_plans_name_ci
+on public.product_plans (lower(name));
+
+
+create unique index if not exists uq_product_plans_default
+on public.product_plans (is_default)
+where is_default = true;
+
+
+create index if not exists idx_plan_pricing_plan_effective
+on public.plan_pricing (
+    plan_id,
+    currency,
+    effective_from desc
+);
+
 
 create index if not exists idx_feature_entitlements_plan
 on public.feature_entitlements (plan_id);
 
+
 create index if not exists idx_upsell_rules_tenant
 on public.upsell_rules (tenant_id);
 
-create index if not exists idx_upsell_rules_tenant_created
-on public.upsell_rules (tenant_id, created_at desc)
-where tenant_id is not null;
 
-create index if not exists idx_upsell_rules_trigger_active
-on public.upsell_rules (trigger_event)
-where is_active;
+create index if not exists idx_upsell_rules_plan
+on public.upsell_rules (recommended_plan_id);
+
 
 create index if not exists idx_subscriptions_plan
 on public.subscriptions (plan_id);
 
-create index if not exists idx_subscriptions_tenant_created
-on public.subscriptions (tenant_id, created_at desc);
 
-create unique index if not exists uq_product_plans_single_default
-on public.product_plans (is_default)
+create unique index if not exists uq_billing_customers_default
+on public.billing_customers (tenant_id)
 where is_default;
 
-create unique index if not exists uq_product_plans_name
-on public.product_plans ((lower(name)));
 
-create unique index if not exists uq_discount_redemptions_invoice
-on public.discount_redemptions (invoice_id)
-where invoice_id is not null;
+create unique index if not exists uq_billing_customers_epsilon_code
+on public.billing_customers (epsilon_customer_code)
+where epsilon_customer_code is not null;
 
-create unique index if not exists uq_discount_redemptions_code_tenant
-on public.discount_redemptions (discount_code_id, tenant_id);
+
+create index if not exists idx_billing_customers_tenant
+on public.billing_customers (tenant_id);
+
+
+create index if not exists idx_invoices_tenant
+on public.invoices (tenant_id);
+
+
+create index if not exists idx_invoices_subscription
+on public.invoices (subscription_id);
+
+
+create index if not exists idx_invoices_tenant_status
+on public.invoices (tenant_id, status);
+
+
+create index if not exists idx_invoices_billing_customer
+on public.invoices (billing_customer_id);
+
+
+create index if not exists idx_invoices_credited
+on public.invoices (credited_invoice_id)
+where credited_invoice_id is not null;
+
+
+create index if not exists idx_invoices_epsilon_attention
+on public.invoices (epsilon_status)
+where epsilon_status in ('queued', 'error', 'rejected');
+
+
+create unique index if not exists uq_invoices_epsilon_document_id
+on public.invoices (epsilon_document_id)
+where epsilon_document_id is not null;
+
+
+create unique index if not exists uq_invoices_epsilon_uid
+on public.invoices (epsilon_uid)
+where epsilon_uid is not null;
+
+
+create unique index if not exists uq_invoices_epsilon_mark
+on public.invoices (epsilon_mark)
+where epsilon_mark is not null;
+
+
+create index if not exists idx_invoice_lines_invoice
+on public.invoice_lines (invoice_id);
+
+
+create index if not exists idx_invoice_lines_tenant
+on public.invoice_lines (tenant_id);
+
+
+create index if not exists idx_invoice_lines_plan
+on public.invoice_lines (product_plan_id);
+
+
+create unique index if not exists uq_discount_codes_global_ci
+on public.discount_codes (lower(code))
+where tenant_id is null;
+
+
+create unique index if not exists uq_discount_codes_tenant_ci
+on public.discount_codes (
+    tenant_id,
+    lower(code)
+)
+where tenant_id is not null;
+
+
+create index if not exists idx_discount_codes_active
+on public.discount_codes (
+    is_active,
+    valid_from,
+    valid_until
+);
+
+
+create index if not exists idx_discount_redemptions_code
+on public.discount_redemptions (discount_code_id);
+
 
 create index if not exists idx_discount_redemptions_tenant
-on public.discount_redemptions (tenant_id, redeemed_at desc);
+on public.discount_redemptions (tenant_id);
 
-drop index if exists public.uq_subscriptions_active_tenant;
 
-create unique index uq_subscriptions_active_tenant
-on public.subscriptions (tenant_id)
-where status in ('trial', 'pending', 'active', 'past_due');
+create index if not exists idx_discount_redemptions_invoice
+on public.discount_redemptions (invoice_id);
 
--- =====================================================
--- 9. SUBSCRIPTION / COMMERCE VIEWS
--- =====================================================
 
-create or replace view public.v_subscription_overview
-with (security_invoker = true)
-as
-select
-    s.id,
-    s.tenant_id,
-    t.name as tenant_name,
-    s.tier,
-    s.status,
-    s.plan_id,
-    pp.name as plan_name,
-    s.current_period_start,
-    s.current_period_end,
-    s.created_at,
-    s.updated_at
-from public.subscriptions s
-join public.tenants t on t.id = s.tenant_id
-left join public.product_plans pp on pp.id = s.plan_id;
+create index if not exists idx_discount_redemptions_subscription
+on public.discount_redemptions (subscription_id);
+
+
+create unique index if not exists uq_discount_redemptions_invoice
+on public.discount_redemptions (
+    discount_code_id,
+    invoice_id
+)
+where invoice_id is not null;
 
 
 -- =====================================================
--- 10. SUBSCRIPTION PLAN CONSISTENCY FUNCTIONS
+-- 13. SUBSCRIPTION PLAN REQUIRED
+-- =====================================================
+--
+-- Active subscription states require a plan.
 -- =====================================================
 
 create or replace function public.enforce_subscription_plan_required()
@@ -570,185 +993,672 @@ language plpgsql
 set search_path = ''
 as $$
 begin
-    if new.status in ('trial', 'pending', 'active', 'past_due')
-       and new.plan_id is null then
-        raise exception 'subscriptions with active lifecycle status require plan_id';
-    end if;
 
-    if tg_op = 'UPDATE'
-       and new.tier is distinct from old.tier
-       and new.plan_id is null then
-        raise exception 'subscriptions.tier cannot change without plan_id';
+    -- subscription_status enum: trial (not 'trialing').
+    if new.status in (
+        'active',
+        'trial',
+        'past_due'
+    )
+    and new.plan_id is null then
+
+        raise exception
+            'subscription plan_id is required for status %',
+            new.status;
+
     end if;
 
     return new;
+
 end;
 $$;
 
 
-create or replace function public.prevent_subscription_tier_drift()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-begin
-    if new.plan_id is not null
-       and tg_op = 'UPDATE'
-       and new.tier is distinct from old.tier
-       and new.plan_id is not distinct from old.plan_id then
-        raise exception 'subscriptions.tier is derived from plan_id; update plan_id instead';
-    end if;
-
-    return new;
-end;
-$$;
-
+-- =====================================================
+-- 14. SYNC SUBSCRIPTION TIER FROM PLAN
+-- =====================================================
 
 create or replace function public.sync_subscription_tier_from_plan()
 returns trigger
 language plpgsql
 set search_path = ''
 as $$
+declare
+    v_tier public.subscription_tier;
 begin
-    if new.plan_id is not null then
-        select pp.tier
-        into new.tier
-        from public.product_plans pp
-        where pp.id = new.plan_id;
 
-        if not found then
-            raise exception 'plan_id % not found in product_plans', new.plan_id;
-        end if;
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    new.tier := v_tier;
+
+    return new;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 15. PREVENT SUBSCRIPTION TIER DRIFT
+-- =====================================================
+
+create or replace function public.prevent_subscription_tier_drift()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_tier public.subscription_tier;
+begin
+
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    if new.tier <> v_tier then
+        raise exception
+            'subscription tier must match product plan tier';
     end if;
 
     return new;
+
 end;
 $$;
 
 
 -- =====================================================
--- 11. COMMERCE SUBSCRIPTION FUNCTIONS
+-- 16. PREVENT PRODUCT PLAN TIER DRIFT
+-- =====================================================
+--
+-- Once a plan is used by subscriptions, its tier becomes
+-- immutable. Create a new plan instead of changing the
+-- commercial tier of an existing plan.
 -- =====================================================
 
-create or replace function public.commerce_change_subscription_plan(p_plan_id uuid)
-returns jsonb
+create or replace function public.prevent_product_plan_tier_change()
+returns trigger
 language plpgsql
-security definer
+set search_path = ''
+as $$
+begin
+
+    if new.tier is distinct from old.tier
+       and exists (
+            select 1
+            from public.subscriptions s
+            where s.plan_id = old.id
+       )
+    then
+
+        raise exception
+            'product plan tier cannot change after the plan has been used by subscriptions';
+
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 17. INVOICE LINE TENANT CONSISTENCY
+-- =====================================================
+
+create or replace function public.enforce_invoice_line_tenant()
+returns trigger
+language plpgsql
 set search_path = ''
 as $$
 declare
-    v_tid uuid;
-    v_sub record;
+    v_invoice_tenant uuid;
 begin
-    v_tid := platform.current_tenant_id();
 
-    if not exists (
-        select 1 from public.product_plans pp
-        where pp.id = p_plan_id and pp.is_active = true
-    ) then
-        raise exception 'product plan not found or inactive';
-    end if;
-
-    update public.subscriptions s
-    set plan_id = p_plan_id
-    where s.tenant_id = v_tid
-    returning s.id, s.plan_id, s.tier, s.status
-    into v_sub;
+    select i.tenant_id
+    into v_invoice_tenant
+    from public.invoices i
+    where i.id = new.invoice_id;
 
     if not found then
-        raise exception 'subscription not found for tenant';
+        raise exception
+            'invoice % not found',
+            new.invoice_id;
     end if;
 
-    return jsonb_build_object(
-        'subscription_id', v_sub.id,
-        'plan_id', v_sub.plan_id,
-        'tier', v_sub.tier,
-        'status', v_sub.status
-    );
+    if new.tenant_id <> v_invoice_tenant then
+        raise exception
+            'invoice line tenant_id must match invoice tenant_id';
+    end if;
+
+    return new;
+
 end;
 $$;
 
 
-create or replace function public.commerce_create_subscription(
-    p_plan_id uuid,
-    p_tier public.subscription_tier default null
+-- =====================================================
+-- 18. COMMERCE CHANGE SUBSCRIPTION PLAN
+-- =====================================================
+
+create or replace function public.commerce_change_subscription_plan(
+    p_subscription_id uuid,
+    p_plan_id uuid
 )
-returns jsonb
+returns public.subscriptions
 language plpgsql
 security definer
 set search_path = ''
 as $$
 declare
     v_tid uuid;
-    v_row record;
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
 begin
+
     v_tid := platform.current_tenant_id();
+
     if v_tid is null then
         raise exception 'no active tenant';
     end if;
 
-    if not exists (
-        select 1 from public.product_plans pp
-        where pp.id = p_plan_id and pp.is_active = true
-    ) then
-        raise exception 'product plan not found or inactive';
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception
+            'active product plan not found';
     end if;
 
-    insert into public.subscriptions (tenant_id, plan_id, tier, status)
-    values (
-        v_tid,
-        p_plan_id,
-        coalesce(
-            p_tier,
-            (select pp.tier from public.product_plans pp where pp.id = p_plan_id)
-        ),
-        'trial'::public.subscription_status
-    )
-    returning id, tenant_id, plan_id, tier, status, created_at into v_row;
+    select *
+    into v_subscription
+    from public.subscriptions s
+    where s.id = p_subscription_id
+      and s.tenant_id = v_tid
+    for update;
 
-    return to_jsonb(v_row);
+    if not found then
+        raise exception
+            'subscription not found';
+    end if;
+
+    update public.subscriptions
+    set
+        plan_id = v_plan.id
+    where id = v_subscription.id
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.plan_changed',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
 end;
 $$;
 
 
 -- =====================================================
--- 11B. DISCOUNT HELPERS (internal, not portal-callable)
--- =====================================================
--- Execute privilege is revoked for anon/authenticated by 022.
+-- 19. COMMERCE CREATE SUBSCRIPTION
 -- =====================================================
 
-create or replace function public.commerce_compute_discount_amount(
-    p_discount_type text,
-    p_value numeric,
-    p_base numeric
+create or replace function public.commerce_create_subscription(
+    p_tenant_id uuid,
+    p_plan_id uuid,
+    p_status text default 'active'
 )
-returns numeric
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
+begin
+
+    if not public.is_platform_admin()
+       and platform.current_tenant_id() is distinct from p_tenant_id then
+
+        raise exception
+            'tenant context mismatch';
+
+    end if;
+
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception
+            'active product plan not found';
+    end if;
+
+    -- 002: exactly one subscription per tenant (provisioned when the
+    -- tenant is created). Use change_subscription_plan to switch.
+    if exists (
+        select 1
+        from public.subscriptions s
+        where s.tenant_id = p_tenant_id
+    ) then
+        raise exception
+            'tenant already has a subscription; use change_subscription_plan';
+    end if;
+
+    insert into public.subscriptions (
+        tenant_id,
+        plan_id,
+        tier,
+        status
+    )
+    values (
+        p_tenant_id,
+        v_plan.id,
+        v_plan.tier,
+        p_status::public.subscription_status
+    )
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.created',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 19A. SUBSCRIPTION CANCELLATION (END OF MONTH)
+-- =====================================================
+--
+-- Cancelling is only possible per end of the month: the
+-- subscription stays 'active' (features and invoicing continue)
+-- until cancel_effective_at, when the daily job
+-- platform.expire_cancelled_subscriptions() sets 'cancelled'.
+-- There is no mid-month cancellation.
+--
+-- Billing stops at cancel_effective_at; this is enforced in the
+-- database (section 19B). Epsilon is not involved: it has no
+-- subscription concept.
+--
+-- The month boundary is evaluated in platform.billing_timezone().
+-- =====================================================
+
+create or replace function platform.billing_timezone()
+returns text
 language sql
 immutable
 set search_path = ''
 as $$
-    select greatest(
-        0,
-        case p_discount_type
-            when 'percentage'   then round(p_base * p_value / 100, 2)
-            when 'fixed_amount' then least(p_value, p_base)
-            else 0
-        end
-    );
+    select 'Europe/Athens'::text;
 $$;
 
 
--- Returns the discount code row when the tenant may use it right
--- now, otherwise a row with id = null. The reason is deliberately
--- not distinguished (prevents probing for existing codes).
--- p_lock = true takes a row lock so max_redemptions cannot be
--- exceeded by concurrent redemptions.
+create or replace function public.commerce_cancel_subscription(
+    p_reason text default null
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+    v_effective timestamptz;
+    v_effective_date date;
+    v_drafts int;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_sub
+    from public.subscriptions s
+    where s.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.status not in ('active', 'trial', 'past_due') then
+        raise exception
+            'only an active, trial or past_due subscription can be cancelled (status: %)',
+            v_sub.status;
+    end if;
+
+    if v_sub.cancel_requested_at is not null then
+        raise exception
+            'cancellation was already requested (effective %)',
+            v_sub.cancel_effective_at;
+    end if;
+
+    -- First instant of next month in the billing time zone.
+    v_effective := (
+        date_trunc('month', timezone(platform.billing_timezone(), now()))
+        + interval '1 month'
+    ) at time zone platform.billing_timezone();
+
+    update public.subscriptions
+    set
+        cancel_requested_at = now(),
+        cancel_effective_at = v_effective,
+        cancel_reason = nullif(btrim(coalesce(p_reason, '')), '')
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    -- Draft invoices that were already generated for periods after the
+    -- end date are cancelled (issued invoices are never touched).
+    v_effective_date := (
+        v_effective at time zone platform.billing_timezone()
+    )::date;
+
+    update public.invoices i
+    set status = 'cancelled'
+    where i.subscription_id = v_sub.id
+      and i.status = 'draft'
+      and i.document_type = 'invoice'
+      and i.period_end >= v_effective_date;
+
+    get diagnostics v_drafts = row_count;
+
+    perform platform.log_audit(
+        'subscription.cancellation_requested',
+        'subscription',
+        v_sub.id,
+        jsonb_build_object(
+            'effective_at', v_effective,
+            'cancelled_draft_invoices', v_drafts
+        )
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+create or replace function public.commerce_undo_cancel_subscription()
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_sub
+    from public.subscriptions s
+    where s.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.cancel_requested_at is null
+       or v_sub.cancel_effective_at <= now() then
+        raise exception 'there is no pending cancellation to undo';
+    end if;
+
+    update public.subscriptions
+    set
+        cancel_requested_at = null,
+        cancel_effective_at = null,
+        cancel_reason = null
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    perform platform.log_audit(
+        'subscription.cancellation_undone',
+        'subscription',
+        v_sub.id
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+-- Daily job (schedule outside this migration).
+create or replace function platform.expire_cancelled_subscriptions()
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_n int;
+begin
+
+    update public.subscriptions s
+    set status = 'cancelled'
+    where s.cancel_effective_at is not null
+      and s.cancel_effective_at <= now()
+      and s.status in ('active', 'trial', 'past_due');
+
+    get diagnostics v_n = row_count;
+
+    return v_n;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 19B. NO BILLING AFTER THE CANCELLATION DATE
+-- =====================================================
+--
+-- Enforced in the database, not only in the generator:
+--   1. trigger on invoices: a subscription invoice must carry a
+--      service period, and that period must end before
+--      cancel_effective_at (local date in billing time zone).
+--   2. the same check is repeated when an invoice is frozen for
+--      Epsilon (platform.epsilon_enqueue_invoice), because a
+--      draft may have been generated before the cancellation.
+--   3. platform.billable_subscriptions() is the single list the
+--      generator should use.
+-- Credit notes are never blocked.
+-- =====================================================
+
+create or replace function public.enforce_invoice_subscription_term()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_effective timestamptz;
+    v_effective_date date;
+begin
+
+    if new.subscription_id is null
+       or new.document_type <> 'invoice' then
+        return new;
+    end if;
+
+    if new.period_start is null or new.period_end is null then
+        raise exception
+            'a subscription invoice requires period_start and period_end';
+    end if;
+
+    select s.cancel_effective_at
+    into v_effective
+    from public.subscriptions s
+    where s.id = new.subscription_id;
+
+    if v_effective is null then
+        return new;
+    end if;
+
+    v_effective_date := (
+        v_effective at time zone platform.billing_timezone()
+    )::date;
+
+    if new.period_end >= v_effective_date then
+        raise exception
+            'subscription is cancelled as of %: the invoice period (% - %) extends past that date',
+            v_effective_date, new.period_start, new.period_end;
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+drop trigger if exists trg_invoices_subscription_term
+on public.invoices;
+
+create trigger trg_invoices_subscription_term
+before insert or update of subscription_id, period_start, period_end, document_type
+on public.invoices
+for each row
+execute function public.enforce_invoice_subscription_term();
+
+
+-- Subscriptions the generator may bill for a given service period.
+create or replace function platform.billable_subscriptions(
+    p_period_start date,
+    p_period_end date
+)
+returns setof public.subscriptions
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+    select s.*
+    from public.subscriptions s
+    where s.status in ('active', 'past_due')
+      and (
+          s.cancel_effective_at is null
+          or p_period_end < (
+              s.cancel_effective_at at time zone platform.billing_timezone()
+          )::date
+      );
+$$;
+
+
+-- =====================================================
+-- 20. DISCOUNT CALCULATION
+-- =====================================================
+
+create or replace function public.commerce_compute_discount_amount(
+    p_discount_type text,
+    p_discount_value numeric,
+    p_subtotal numeric
+)
+returns numeric
+language plpgsql
+immutable
+set search_path = ''
+as $$
+begin
+
+    if p_subtotal is null or p_subtotal < 0 then
+        raise exception 'subtotal must be non-negative';
+    end if;
+
+    if p_discount_value is null or p_discount_value < 0 then
+        raise exception 'discount value must be non-negative';
+    end if;
+
+    if p_discount_type = 'percentage' then
+
+        return least(
+            p_subtotal,
+            round(
+                p_subtotal * (p_discount_value / 100),
+                2
+            )
+        );
+
+    elsif p_discount_type = 'fixed_amount' then
+
+        return least(
+            p_subtotal,
+            round(p_discount_value, 2)
+        );
+
+    else
+
+        raise exception
+            'unsupported discount type: %',
+            p_discount_type;
+
+    end if;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 21. FIND USABLE DISCOUNT CODE
+-- =====================================================
+
 create or replace function public.commerce_find_usable_discount_code(
-    p_tenant_id uuid,
     p_code text,
-    p_plan_id uuid default null,
-    p_currency text default null,
-    p_lock boolean default false
+    p_plan_id uuid default null
 )
 returns public.discount_codes
 language plpgsql
@@ -756,58 +1666,304 @@ security definer
 set search_path = ''
 as $$
 declare
-    v_row public.discount_codes;
-    v_none public.discount_codes;
+    v_tid uuid;
+    v_code public.discount_codes%rowtype;
 begin
-    if p_code is null or btrim(p_code) = '' then
-        return v_none;
-    end if;
 
-    if p_lock then
-        select dc.*
-        into v_row
-        from public.discount_codes dc
-        where dc.code = upper(btrim(p_code))
-        for update;
-    else
-        select dc.*
-        into v_row
-        from public.discount_codes dc
-        where dc.code = upper(btrim(p_code));
-    end if;
+    v_tid := platform.current_tenant_id();
 
-    if v_row.id is null
-       or not v_row.is_active
-       or v_row.valid_from > now()
-       or (v_row.valid_until is not null and v_row.valid_until <= now())
-       or (v_row.max_redemptions is not null
-           and v_row.redeemed_count >= v_row.max_redemptions)
-       or (v_row.tenant_id is not null
-           and v_row.tenant_id is distinct from p_tenant_id)
-       or (v_row.applies_to_plan_id is not null
-           and p_plan_id is not null
-           and v_row.applies_to_plan_id <> p_plan_id)
-       or (v_row.discount_type = 'fixed_amount'
-           and p_currency is not null
-           and v_row.currency is not null
-           and upper(v_row.currency) <> upper(p_currency))
-       or exists (
-            select 1
-            from public.discount_redemptions r
-            where r.discount_code_id = v_row.id
-              and r.tenant_id = p_tenant_id
-       )
-    then
-        return v_none;
-    end if;
+    select dc.*
+    into v_code
+    from public.discount_codes dc
+    where upper(btrim(dc.code)) = upper(btrim(p_code))
 
-    return v_row;
+      and dc.is_active = true
+
+      and (
+          dc.tenant_id is null
+          or dc.tenant_id = v_tid
+      )
+
+      and (
+          dc.valid_from is null
+          or dc.valid_from <= now()
+      )
+
+      and (
+          dc.valid_until is null
+          or dc.valid_until >= now()
+      )
+
+      and (
+          dc.max_redemptions is null
+          or dc.redeemed_count < dc.max_redemptions
+      )
+
+      and (
+          dc.applies_to_plan_id is null
+          or (
+              p_plan_id is not null
+              and dc.applies_to_plan_id = p_plan_id
+          )
+      )
+
+    order by
+        case
+            when dc.tenant_id = v_tid then 0
+            else 1
+        end,
+        dc.created_at
+
+    limit 1
+    for update;
+
+    return v_code;
+
 end;
 $$;
 
 
 -- =====================================================
--- 12. COMMERCE DOMAIN API
+-- 22. APPLY DISCOUNT TO INVOICE
+-- =====================================================
+--
+-- Draft invoices only. The discount is distributed pro rata
+-- over the invoice lines (rounding remainder on the last line)
+-- and VAT is recomputed per line, so that lines and invoice
+-- totals stay consistent for the Epsilon/myDATA submission.
+-- Only one discount per invoice.
+-- =====================================================
+
+create or replace function public.commerce_apply_discount_to_invoice(
+    p_invoice_id uuid,
+    p_code text
+)
+returns public.invoices
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_invoice public.invoices%rowtype;
+    v_subscription_plan uuid;
+    v_discount public.discount_codes%rowtype;
+    v_amount numeric(12,2);
+    v_new_tax numeric(12,2);
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_invoice
+    from public.invoices i
+    where i.id = p_invoice_id
+      and i.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'invoice not found';
+    end if;
+
+    if v_invoice.status not in ('draft') then
+        raise exception
+            'discounts can only be applied to draft invoices';
+    end if;
+
+    if v_invoice.document_type <> 'invoice' then
+        raise exception
+            'a discount cannot be applied to a credit note';
+    end if;
+
+    if v_invoice.locked_at is not null then
+        raise exception
+            'this invoice has already been issued';
+    end if;
+
+    if v_invoice.discount_amount > 0
+       or exists (
+            select 1
+            from public.discount_redemptions r
+            where r.invoice_id = v_invoice.id
+       ) then
+        raise exception
+            'a discount was already applied to this invoice';
+    end if;
+
+    if v_invoice.subscription_id is not null then
+
+        select s.plan_id
+        into v_subscription_plan
+        from public.subscriptions s
+        where s.id = v_invoice.subscription_id
+          and s.tenant_id = v_tid;
+
+    end if;
+
+    v_discount := public.commerce_find_usable_discount_code(
+        p_code,
+        v_subscription_plan
+    );
+
+    if v_discount.id is null then
+        raise exception
+            'usable discount code not found';
+    end if;
+
+    if v_discount.currency is not null
+       and v_discount.currency <> v_invoice.currency then
+
+        raise exception
+            'discount currency does not match invoice currency';
+
+    end if;
+
+    v_amount := public.commerce_compute_discount_amount(
+        v_discount.discount_type,
+        v_discount.value,
+        v_invoice.subtotal
+    );
+
+    if v_amount <= 0 then
+        raise exception
+            'discount code does not reduce this invoice';
+    end if;
+
+    if exists (
+        select 1
+        from public.invoice_lines il
+        where il.invoice_id = v_invoice.id
+    ) then
+
+        -- Pro rata over the lines; remainder on the last line.
+        with ordered as (
+            select
+                il.id,
+                il.line_amount,
+                il.vat_rate,
+                row_number() over (
+                    order by il.sort_order desc, il.created_at desc, il.id
+                ) as rn_last,
+                sum(il.line_amount) over () as total_net
+            from public.invoice_lines il
+            where il.invoice_id = v_invoice.id
+        ),
+        alloc as (
+            select
+                o.id,
+                o.line_amount,
+                o.vat_rate,
+                o.rn_last,
+                case
+                    when o.total_net > 0
+                        then round(v_amount * o.line_amount / o.total_net, 2)
+                    else 0
+                end as share
+            from ordered o
+        ),
+        fixed as (
+            select
+                a.id,
+                a.line_amount,
+                a.vat_rate,
+                a.share + case
+                    when a.rn_last = 1
+                        then v_amount - sum(a.share) over ()
+                    else 0
+                end as disc
+            from alloc a
+        )
+        update public.invoice_lines il
+        set
+            discount_amount = f.disc,
+            vat_amount = round(
+                (il.line_amount - f.disc) * coalesce(f.vat_rate, 0) / 100,
+                2
+            ),
+            gross_amount = (il.line_amount - f.disc)
+                + round(
+                    (il.line_amount - f.disc) * coalesce(f.vat_rate, 0) / 100,
+                    2
+                )
+        from fixed f
+        where il.id = f.id;
+
+        select coalesce(sum(il.vat_amount), 0)
+        into v_new_tax
+        from public.invoice_lines il
+        where il.invoice_id = v_invoice.id;
+
+    else
+
+        -- Header-only invoice (no lines): scale tax proportionally
+        -- (assumes a uniform tax rate on the invoice).
+        v_new_tax := case
+            when v_invoice.subtotal > 0
+                then round(
+                    v_invoice.tax_amount
+                    * (v_invoice.subtotal - v_amount)
+                    / v_invoice.subtotal,
+                    2
+                )
+            else v_invoice.tax_amount
+        end;
+
+    end if;
+
+    update public.invoices
+    set
+        discount_amount = v_amount,
+        tax_amount = v_new_tax,
+        total_amount = round(
+            subtotal - v_amount + v_new_tax,
+            2
+        )
+    where id = v_invoice.id
+    returning *
+    into v_invoice;
+
+    insert into public.discount_redemptions (
+        discount_code_id,
+        tenant_id,
+        invoice_id,
+        subscription_id,
+        amount_applied
+    )
+    values (
+        v_discount.id,
+        v_tid,
+        v_invoice.id,
+        v_invoice.subscription_id,
+        v_amount
+    );
+
+    update public.discount_codes
+    set
+        redeemed_count = redeemed_count + 1
+    where id = v_discount.id;
+
+    perform platform.log_audit(
+        'invoice.discount_applied',
+        'invoice',
+        v_invoice.id,
+        jsonb_build_object(
+            'discount_code_id', v_discount.id,
+            'amount_applied', v_amount
+        )
+    );
+
+    return v_invoice;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 23. COMMERCE DOMAIN API
 -- =====================================================
 
 create or replace function public.commerce_domain(
@@ -822,101 +1978,150 @@ as $$
 declare
     v_tid uuid;
     v_row record;
-    v_result jsonb;
-    v_plan record;
-    v_sub record;
-    v_code public.discount_codes;
     v_inv record;
-    v_base numeric;
-    v_discount numeric;
-    v_new_tax numeric;
+    v_plan public.product_plans%rowtype;
+    v_result jsonb;
     v_limit int;
     v_offset int;
+    v_plan_id uuid;
+    v_target uuid;
+    v_amount numeric(12,2);
+    v_entitled boolean;
 begin
-    p_payload := coalesce(p_payload, '{}'::jsonb);
+
+    p_payload := coalesce(
+        p_payload,
+        '{}'::jsonb
+    );
 
     case p_op
+
+
+        -- =================================================
+        -- PLAN: LIST
+        -- =================================================
+
         when 'list_product_plans' then
 
             select coalesce(
-                jsonb_agg(to_jsonb(pp) order by pp.tier),
+                jsonb_agg(
+                    jsonb_build_object(
+                        'id', pp.id,
+                        'name', pp.name,
+                        'description', pp.description,
+                        'tier', pp.tier,
+                        'is_active', pp.is_active,
+                        'is_default', pp.is_default,
+                        'pricing', coalesce(
+                            (
+                                select jsonb_agg(
+                                    jsonb_build_object(
+                                        'id', px.id,
+                                        'currency', px.currency,
+                                        'monthly_price', px.monthly_price,
+                                        'yearly_price', px.yearly_price,
+                                        'effective_from', px.effective_from
+                                    )
+                                    order by px.effective_from desc
+                                )
+                                from public.plan_pricing px
+                                where px.plan_id = pp.id
+                            ),
+                            '[]'::jsonb
+                        ),
+                        'entitlements', coalesce(
+                            (
+                                select jsonb_agg(
+                                    jsonb_build_object(
+                                        'feature_key', fe.feature_key,
+                                        'enabled', fe.enabled
+                                    )
+                                    order by fe.feature_key
+                                )
+                                from public.feature_entitlements fe
+                                where fe.plan_id = pp.id
+                            ),
+                            '[]'::jsonb
+                        )
+                    )
+                    order by pp.tier, pp.name
+                ),
                 '[]'::jsonb
             )
             into v_result
-            from (
-                select
-                    p.id,
-                    p.name,
-                    p.description,
-                    p.tier,
-                    p.is_active,
-                    p.created_at,
-                    p.updated_at
-                from public.product_plans p
-                where p.is_active = true
-            ) pp;
+            from public.product_plans pp
+            where pp.is_active = true;
 
             return v_result;
+
+
+        -- =================================================
+        -- PLAN: GET
+        -- =================================================
 
         when 'get_product_plan' then
 
-            select
-                p.id,
-                p.name,
-                p.description,
-                p.tier,
-                p.is_active,
-                p.created_at,
-                p.updated_at
-            into v_plan
-            from public.product_plans p
-            where p.id = coalesce(
-                nullif(p_payload->>'id', '')::uuid,
-                nullif(p_payload->>'plan_id', '')::uuid
-            );
-
-            if not found then
-                raise exception 'Product plan not found';
-            end if;
-
             select jsonb_build_object(
-                'plan', to_jsonb(v_plan),
-                'pricing', coalesce((
-                    select jsonb_agg(to_jsonb(pr) order by pr.currency)
-                    from (
-                        select
-                            pp.id,
-                            pp.plan_id,
-                            pp.currency,
-                            pp.monthly_price,
-                            pp.yearly_price,
-                            pp.effective_from,
-                            pp.created_at
-                        from public.plan_pricing pp
-                        where pp.plan_id = v_plan.id
-                    ) pr
-                ), '[]'::jsonb),
-                'entitlements', coalesce((
-                    select jsonb_agg(to_jsonb(fe) order by fe.feature_key)
-                    from (
-                        select
-                            fe.id,
-                            fe.plan_id,
-                            fe.feature_key,
-                            fe.enabled
+                'id', pp.id,
+                'name', pp.name,
+                'description', pp.description,
+                'tier', pp.tier,
+                'is_active', pp.is_active,
+                'is_default', pp.is_default,
+                'pricing', coalesce(
+                    (
+                        select jsonb_agg(
+                            jsonb_build_object(
+                                'id', px.id,
+                                'currency', px.currency,
+                                'monthly_price', px.monthly_price,
+                                'yearly_price', px.yearly_price,
+                                'effective_from', px.effective_from
+                            )
+                            order by px.effective_from desc
+                        )
+                        from public.plan_pricing px
+                        where px.plan_id = pp.id
+                    ),
+                    '[]'::jsonb
+                ),
+                'entitlements', coalesce(
+                    (
+                        select jsonb_agg(
+                            jsonb_build_object(
+                                'feature_key', fe.feature_key,
+                                'enabled', fe.enabled
+                            )
+                            order by fe.feature_key
+                        )
                         from public.feature_entitlements fe
-                        where fe.plan_id = v_plan.id
-                    ) fe
-                ), '[]'::jsonb)
+                        where fe.plan_id = pp.id
+                    ),
+                    '[]'::jsonb
+                )
             )
-            into v_result;
+            into v_result
+            from public.product_plans pp
+            where pp.id = (p_payload->>'id')::uuid;
+
+            if v_result is null then
+                raise exception 'product plan not found';
+            end if;
 
             return v_result;
 
+
+        -- =================================================
+        -- PLAN: CREATE
+        -- PLATFORM ADMIN
+        -- =================================================
+
         when 'create_product_plan' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
@@ -925,36 +2130,54 @@ begin
                 name,
                 description,
                 tier,
-                is_active
+                is_active,
+                is_default
             )
             values (
-                p_payload->>'name',
+                btrim(p_payload->>'name'),
                 p_payload->>'description',
                 (p_payload->>'tier')::public.subscription_tier,
-                coalesce((p_payload->>'is_active')::boolean, true)
+                coalesce(
+                    (p_payload->>'is_active')::boolean,
+                    true
+                ),
+                coalesce(
+                    (p_payload->>'is_default')::boolean,
+                    false
+                )
             )
-            returning
-                id,
-                name,
-                description,
-                tier,
-                is_active,
-                created_at,
-                updated_at
-            into v_row;
+            returning *
+            into v_plan;
+
+            if v_plan.is_default then
+
+                update public.product_plans
+                set is_default = false
+                where id <> v_plan.id
+                  and is_default = true;
+
+            end if;
 
             perform platform.log_audit(
                 'product_plan.created',
                 'product_plan',
-                v_row.id
+                v_plan.id
             );
 
-            return to_jsonb(v_row);
+            return to_jsonb(v_plan);
+
+
+        -- =================================================
+        -- PLAN: UPDATE
+        -- PLATFORM ADMIN
+        -- =================================================
 
         when 'update_product_plan' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
@@ -962,99 +2185,489 @@ begin
             update public.product_plans pp
             set
                 name = case
-                    when p_payload ? 'name' then p_payload->>'name'
+                    when p_payload ? 'name'
+                        then btrim(p_payload->>'name')
                     else pp.name
                 end,
+
                 description = case
-                    when p_payload ? 'description' then p_payload->>'description'
+                    when p_payload ? 'description'
+                        then p_payload->>'description'
                     else pp.description
                 end,
+
                 tier = case
                     when p_payload ? 'tier'
                         then (p_payload->>'tier')::public.subscription_tier
                     else pp.tier
                 end,
+
                 is_active = case
                     when p_payload ? 'is_active'
                         then (p_payload->>'is_active')::boolean
                     else pp.is_active
+                end,
+
+                is_default = case
+                    when p_payload ? 'is_default'
+                        then (p_payload->>'is_default')::boolean
+                    else pp.is_default
                 end
+
             where pp.id = (p_payload->>'id')::uuid
-            returning
-                pp.id,
-                pp.name,
-                pp.description,
-                pp.tier,
-                pp.is_active,
-                pp.created_at,
-                pp.updated_at
-            into v_row;
+
+            returning *
+            into v_plan;
 
             if not found then
-                raise exception 'Product plan not found';
+                raise exception 'product plan not found';
+            end if;
+
+            if v_plan.is_default then
+
+                update public.product_plans
+                set is_default = false
+                where id <> v_plan.id
+                  and is_default = true;
+
             end if;
 
             perform platform.log_audit(
                 'product_plan.updated',
                 'product_plan',
+                v_plan.id,
+                p_payload - 'id'
+            );
+
+            return to_jsonb(v_plan);
+
+
+        -- =================================================
+        -- SUBSCRIPTION: CHANGE PLAN
+        -- =================================================
+
+        when 'change_subscription_plan', 'change_plan' then
+
+            v_row := public.commerce_change_subscription_plan(
+                (p_payload->>'subscription_id')::uuid,
+                (p_payload->>'plan_id')::uuid
+            );
+
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- DISCOUNT: CREATE
+        -- PLATFORM ADMIN
+        -- =================================================
+
+        when 'create_discount_code' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            insert into public.discount_codes (
+                tenant_id,
+                code,
+                discount_type,
+                value,
+                currency,
+                applies_to_plan_id,
+                max_redemptions,
+                valid_from,
+                valid_until,
+                is_active
+            )
+            values (
+                nullif(
+                    p_payload->>'tenant_id',
+                    ''
+                )::uuid,
+
+                upper(
+                    btrim(p_payload->>'code')
+                ),
+
+                p_payload->>'discount_type',
+
+                (p_payload->>'value')::numeric,
+
+                case
+                    when p_payload->>'currency' is null
+                        then null
+                    else upper(
+                        btrim(p_payload->>'currency')
+                    )
+                end,
+
+                nullif(
+                    p_payload->>'applies_to_plan_id',
+                    ''
+                )::uuid,
+
+                nullif(
+                    p_payload->>'max_redemptions',
+                    ''
+                )::integer,
+
+                nullif(
+                    p_payload->>'valid_from',
+                    ''
+                )::timestamptz,
+
+                nullif(
+                    p_payload->>'valid_until',
+                    ''
+                )::timestamptz,
+
+                coalesce(
+                    (p_payload->>'is_active')::boolean,
+                    true
+                )
+            )
+            returning *
+            into v_row;
+
+            perform platform.log_audit(
+                'discount_code.created',
+                'discount_code',
+                v_row.id
+            );
+
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- DISCOUNT: LIST
+        -- PLATFORM ADMIN
+        -- =================================================
+
+        when 'list_discount_codes' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            select coalesce(
+                jsonb_agg(
+                    to_jsonb(dc)
+                    order by dc.created_at desc
+                ),
+                '[]'::jsonb
+            )
+            into v_result
+            from public.discount_codes dc;
+
+            return v_result;
+
+
+        -- =================================================
+        -- DISCOUNT: UPDATE
+        -- PLATFORM ADMIN
+        -- =================================================
+
+        when 'update_discount_code' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            update public.discount_codes dc
+            set
+                code = case
+                    when p_payload ? 'code'
+                        then upper(
+                            btrim(p_payload->>'code')
+                        )
+                    else dc.code
+                end,
+
+                discount_type = case
+                    when p_payload ? 'discount_type'
+                        then p_payload->>'discount_type'
+                    else dc.discount_type
+                end,
+
+                value = case
+                    when p_payload ? 'value'
+                        then (p_payload->>'value')::numeric
+                    else dc.value
+                end,
+
+                currency = case
+                    when p_payload ? 'currency'
+                        then upper(
+                            btrim(p_payload->>'currency')
+                        )
+                    else dc.currency
+                end,
+
+                applies_to_plan_id = case
+                    when p_payload ? 'applies_to_plan_id'
+                        then nullif(
+                            p_payload->>'applies_to_plan_id',
+                            ''
+                        )::uuid
+                    else dc.applies_to_plan_id
+                end,
+
+                max_redemptions = case
+                    when p_payload ? 'max_redemptions'
+                        then nullif(
+                            p_payload->>'max_redemptions',
+                            ''
+                        )::integer
+                    else dc.max_redemptions
+                end,
+
+                valid_from = case
+                    when p_payload ? 'valid_from'
+                        then nullif(
+                            p_payload->>'valid_from',
+                            ''
+                        )::timestamptz
+                    else dc.valid_from
+                end,
+
+                valid_until = case
+                    when p_payload ? 'valid_until'
+                        then nullif(
+                            p_payload->>'valid_until',
+                            ''
+                        )::timestamptz
+                    else dc.valid_until
+                end,
+
+                is_active = case
+                    when p_payload ? 'is_active'
+                        then (p_payload->>'is_active')::boolean
+                    else dc.is_active
+                end
+
+            where dc.id = (p_payload->>'id')::uuid
+
+            returning *
+            into v_row;
+
+            if not found then
+                raise exception 'discount code not found';
+            end if;
+
+            perform platform.log_audit(
+                'discount_code.updated',
+                'discount_code',
                 v_row.id,
                 p_payload - 'id'
             );
 
             return to_jsonb(v_row);
 
-        when 'delete_product_plan' then
+
+        -- =================================================
+        -- DISCOUNT: DEACTIVATE
+        -- PLATFORM ADMIN
+        -- =================================================
+
+        when 'deactivate_discount_code' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
 
-            delete from public.product_plans pp
-            where pp.id = (p_payload->>'id')::uuid;
+            update public.discount_codes
+            set is_active = false
+            where id = (p_payload->>'id')::uuid
+            returning *
+            into v_row;
 
             if not found then
-                raise exception 'Product plan not found';
+                raise exception 'discount code not found';
             end if;
 
             perform platform.log_audit(
-                'product_plan.deleted',
-                'product_plan',
-                (p_payload->>'id')::uuid
+                'discount_code.deactivated',
+                'discount_code',
+                v_row.id
             );
 
-            return jsonb_build_object(
-                'deleted', true,
-                'id', p_payload->>'id'
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- DISCOUNT: APPLY
+        -- =================================================
+
+        when 'apply_discount', 'apply_discount_to_invoice' then
+
+            v_row := public.commerce_apply_discount_to_invoice(
+                (p_payload->>'invoice_id')::uuid,
+                p_payload->>'code'
             );
+
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- ENTITLEMENTS: TENANT (READ ONLY)
+        -- =================================================
+        --
+        -- Shape (Appsmith: {{ent.data.features.devices}}):
+        --   {
+        --     "plan": {"id", "name", "tier"} | null,
+        --     "subscription_status": "<status>" | null,
+        --     "cancel_effective_at": "<timestamp>" | null,
+        --     "is_entitled": true | false,
+        --     "features": {"<feature_key>": true | false}
+        --   }
+        --
+        -- Features are granted only while the subscription status is
+        -- active, trial or past_due. A cancellation requested for the
+        -- end of the month keeps the status 'active' until the
+        -- end-of-month job sets 'cancelled'.
+        -- Otherwise is_entitled = false and features = {}.
+        -- =================================================
+
+        when 'get_tenant_entitlements' then
+
+            v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
+            -- Best subscription: entitled statuses first.
+            select s.id, s.plan_id, s.status, s.cancel_effective_at
+            into v_row
+            from public.subscriptions s
+            where s.tenant_id = v_tid
+            order by
+                case s.status
+                    when 'active' then 1
+                    when 'trial' then 2
+                    when 'past_due' then 3
+                    when 'pending' then 4
+                    when 'suspended' then 5
+                    when 'expired' then 6
+                    when 'trial_expired' then 7
+                    else 8
+                end,
+                s.id
+            limit 1;
+
+            v_entitled := v_row.id is not null
+                and v_row.status in ('active', 'trial', 'past_due')
+                and (
+                    v_row.cancel_effective_at is null
+                    or v_row.cancel_effective_at > now()
+                );
+
+            if v_row.id is null then
+                return jsonb_build_object(
+                    'plan', null,
+                    'subscription_status', null,
+                    'cancel_effective_at', null,
+                    'is_entitled', false,
+                    'features', '{}'::jsonb
+                );
+            end if;
+
+            select jsonb_build_object(
+                'plan', (
+                    select jsonb_build_object(
+                        'id', pp.id,
+                        'name', pp.name,
+                        'tier', pp.tier
+                    )
+                    from public.product_plans pp
+                    where pp.id = v_row.plan_id
+                ),
+                'subscription_status', v_row.status,
+                'cancel_effective_at', v_row.cancel_effective_at,
+                'is_entitled', v_entitled,
+                'features', case
+                    when v_entitled
+                        then coalesce(
+                            (
+                                select jsonb_object_agg(fe.feature_key, fe.enabled)
+                                from public.feature_entitlements fe
+                                where fe.plan_id = v_row.plan_id
+                            ),
+                            '{}'::jsonb
+                        )
+                    else '{}'::jsonb
+                end
+            )
+            into v_result;
+
+            return v_result;
+
+
+        -- =================================================
+        -- PLAN PRICING: LIST (tenants see active plans only)
+        -- =================================================
 
         when 'list_plan_pricing' then
 
             select coalesce(
-                jsonb_agg(to_jsonb(pr) order by pr.currency),
+                jsonb_agg(
+                    to_jsonb(t)
+                    order by t.plan_id, t.currency, t.effective_from desc
+                ),
                 '[]'::jsonb
             )
             into v_result
             from (
                 select
-                    pp.id,
-                    pp.plan_id,
-                    pp.currency,
-                    pp.monthly_price,
-                    pp.yearly_price,
-                    pp.effective_from,
-                    pp.created_at
-                from public.plan_pricing pp
-                where pp.plan_id = (p_payload->>'plan_id')::uuid
-            ) pr;
+                    px.id,
+                    px.plan_id,
+                    px.currency,
+                    px.monthly_price,
+                    px.yearly_price,
+                    px.effective_from
+                from public.plan_pricing px
+                join public.product_plans pp
+                  on pp.id = px.plan_id
+                where (public.is_platform_admin() or pp.is_active)
+                  and (
+                      nullif(p_payload->>'plan_id', '') is null
+                      or px.plan_id = (p_payload->>'plan_id')::uuid
+                  )
+            ) t;
 
             return v_result;
 
+
+        -- =================================================
+        -- PLAN PRICING: CREATE / UPDATE / DELETE
+        -- PLATFORM ADMIN
+        -- History is retained: only FUTURE prices may be changed
+        -- or removed; for a new price add a row with a later
+        -- effective_from.
+        -- =================================================
+
         when 'create_plan_pricing' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
@@ -1068,22 +2681,12 @@ begin
             )
             values (
                 (p_payload->>'plan_id')::uuid,
-                coalesce(p_payload->>'currency', 'EUR'),
-                (p_payload->>'monthly_price')::numeric,
-                (p_payload->>'yearly_price')::numeric,
-                coalesce(
-                    (p_payload->>'effective_from')::timestamptz,
-                    now()
-                )
+                upper(btrim(coalesce(p_payload->>'currency', 'EUR'))),
+                nullif(p_payload->>'monthly_price', '')::numeric,
+                nullif(p_payload->>'yearly_price', '')::numeric,
+                coalesce(nullif(p_payload->>'effective_from', '')::timestamptz, now())
             )
-            returning
-                id,
-                plan_id,
-                currency,
-                monthly_price,
-                yearly_price,
-                effective_from,
-                created_at
+            returning *
             into v_row;
 
             perform platform.log_audit(
@@ -1094,49 +2697,50 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'update_plan_pricing' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
 
-            update public.plan_pricing pp
+            if not exists (
+                select 1
+                from public.plan_pricing px
+                where px.id = (p_payload->>'id')::uuid
+                  and px.effective_from > now()
+            ) then
+                raise exception 'only future pricing can be changed; add a new price with a later effective_from';
+            end if;
+
+            update public.plan_pricing px
             set
-                currency = case
-                    when p_payload ? 'currency' then p_payload->>'currency'
-                    else pp.currency
-                end,
                 monthly_price = case
                     when p_payload ? 'monthly_price'
-                        then (p_payload->>'monthly_price')::numeric
-                    else pp.monthly_price
+                        then nullif(p_payload->>'monthly_price', '')::numeric
+                    else px.monthly_price
                 end,
+
                 yearly_price = case
                     when p_payload ? 'yearly_price'
-                        then (p_payload->>'yearly_price')::numeric
-                    else pp.yearly_price
+                        then nullif(p_payload->>'yearly_price', '')::numeric
+                    else px.yearly_price
                 end,
+
                 effective_from = case
                     when p_payload ? 'effective_from'
                         then (p_payload->>'effective_from')::timestamptz
-                    else pp.effective_from
+                    else px.effective_from
                 end
-            where pp.id = (p_payload->>'id')::uuid
-            returning
-                pp.id,
-                pp.plan_id,
-                pp.currency,
-                pp.monthly_price,
-                pp.yearly_price,
-                pp.effective_from,
-                pp.created_at
-            into v_row;
 
-            if not found then
-                raise exception 'Plan pricing not found';
-            end if;
+            where px.id = (p_payload->>'id')::uuid
+
+            returning *
+            into v_row;
 
             perform platform.log_audit(
                 'plan_pricing.updated',
@@ -1147,55 +2751,84 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'delete_plan_pricing' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
 
-            delete from public.plan_pricing pp
-            where pp.id = (p_payload->>'id')::uuid;
-
-            if not found then
-                raise exception 'Plan pricing not found';
+            if not exists (
+                select 1
+                from public.plan_pricing px
+                where px.id = (p_payload->>'id')::uuid
+                  and px.effective_from > now()
+            ) then
+                raise exception 'only future pricing can be deleted';
             end if;
+
+            delete from public.plan_pricing px
+            where px.id = (p_payload->>'id')::uuid
+            returning px.id
+            into v_row;
 
             perform platform.log_audit(
                 'plan_pricing.deleted',
                 'plan_pricing',
-                (p_payload->>'id')::uuid
+                v_row.id
             );
 
-            return jsonb_build_object(
-                'deleted', true,
-                'id', p_payload->>'id'
-            );
+            return jsonb_build_object('id', v_row.id, 'deleted', true);
+
+
+        -- =================================================
+        -- FEATURE ENTITLEMENTS: LIST (tenants: active plans only)
+        -- =================================================
 
         when 'list_feature_entitlements' then
 
             select coalesce(
-                jsonb_agg(to_jsonb(fe) order by fe.feature_key),
+                jsonb_agg(
+                    to_jsonb(t)
+                    order by t.plan_id, t.feature_key
+                ),
                 '[]'::jsonb
             )
             into v_result
             from (
                 select
-                    f.id,
-                    f.plan_id,
-                    f.feature_key,
-                    f.enabled
-                from public.feature_entitlements f
-                where f.plan_id = (p_payload->>'plan_id')::uuid
-            ) fe;
+                    fe.id,
+                    fe.plan_id,
+                    fe.feature_key,
+                    fe.enabled
+                from public.feature_entitlements fe
+                join public.product_plans pp
+                  on pp.id = fe.plan_id
+                where (public.is_platform_admin() or pp.is_active)
+                  and (
+                      nullif(p_payload->>'plan_id', '') is null
+                      or fe.plan_id = (p_payload->>'plan_id')::uuid
+                  )
+            ) t;
 
             return v_result;
 
+
+        -- =================================================
+        -- FEATURE ENTITLEMENTS: CREATE / UPDATE / DELETE
+        -- PLATFORM ADMIN
+        -- =================================================
+
         when 'create_feature_entitlement' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
@@ -1207,28 +2840,28 @@ begin
             )
             values (
                 (p_payload->>'plan_id')::uuid,
-                p_payload->>'feature_key',
+                btrim(p_payload->>'feature_key'),
                 coalesce((p_payload->>'enabled')::boolean, true)
             )
-            returning
-                id,
-                plan_id,
-                feature_key,
-                enabled
+            returning *
             into v_row;
 
             perform platform.log_audit(
                 'feature_entitlement.created',
                 'feature_entitlement',
-                v_row.id
+                v_row.id,
+                jsonb_build_object('feature_key', v_row.feature_key)
             );
 
             return to_jsonb(v_row);
 
+
         when 'update_feature_entitlement' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
@@ -1236,24 +2869,24 @@ begin
             update public.feature_entitlements fe
             set
                 feature_key = case
-                    when p_payload ? 'feature_key' then p_payload->>'feature_key'
+                    when p_payload ? 'feature_key'
+                        then btrim(p_payload->>'feature_key')
                     else fe.feature_key
                 end,
+
                 enabled = case
                     when p_payload ? 'enabled'
                         then (p_payload->>'enabled')::boolean
                     else fe.enabled
                 end
+
             where fe.id = (p_payload->>'id')::uuid
-            returning
-                fe.id,
-                fe.plan_id,
-                fe.feature_key,
-                fe.enabled
+
+            returning *
             into v_row;
 
             if not found then
-                raise exception 'Feature entitlement not found';
+                raise exception 'feature entitlement not found';
             end if;
 
             perform platform.log_audit(
@@ -1265,65 +2898,139 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'delete_feature_entitlement' then
+
             if (select auth.uid()) is null then
                 raise exception 'authentication required';
             end if;
+
             if not public.is_platform_admin() then
                 raise exception 'platform admin role required';
             end if;
 
             delete from public.feature_entitlements fe
-            where fe.id = (p_payload->>'id')::uuid;
+            where fe.id = (p_payload->>'id')::uuid
+            returning fe.id, fe.feature_key
+            into v_row;
 
             if not found then
-                raise exception 'Feature entitlement not found';
+                raise exception 'feature entitlement not found';
             end if;
 
             perform platform.log_audit(
                 'feature_entitlement.deleted',
                 'feature_entitlement',
-                (p_payload->>'id')::uuid
+                v_row.id,
+                jsonb_build_object('feature_key', v_row.feature_key)
             );
 
-            return jsonb_build_object(
-                'deleted', true,
-                'id', p_payload->>'id'
+            return jsonb_build_object('id', v_row.id, 'deleted', true);
+
+
+        -- =================================================
+        -- PLAN: DELETE
+        -- PLATFORM ADMIN
+        -- Plans that are in use are deactivated, never deleted.
+        -- =================================================
+
+        when 'delete_product_plan' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            v_plan_id := (p_payload->>'id')::uuid;
+
+            if exists (select 1 from public.subscriptions s where s.plan_id = v_plan_id) then
+                raise exception 'plan is in use by subscriptions; deactivate it instead';
+            end if;
+
+            if exists (select 1 from public.invoice_lines il where il.product_plan_id = v_plan_id) then
+                raise exception 'plan is referenced by invoice lines; deactivate it instead';
+            end if;
+
+            if exists (select 1 from public.upsell_rules ur where ur.recommended_plan_id = v_plan_id) then
+                raise exception 'plan is used by upsell rules; remove those rules first';
+            end if;
+
+            if exists (select 1 from public.discount_codes dc where dc.applies_to_plan_id = v_plan_id) then
+                raise exception 'plan is used by discount codes; deactivate it instead';
+            end if;
+
+            delete from public.product_plans pp
+            where pp.id = v_plan_id
+            returning pp.id, pp.name
+            into v_row;
+
+            if not found then
+                raise exception 'product plan not found';
+            end if;
+
+            perform platform.log_audit(
+                'product_plan.deleted',
+                'product_plan',
+                v_row.id,
+                jsonb_build_object('name', v_row.name)
             );
+
+            return jsonb_build_object('id', v_row.id, 'deleted', true);
+
+
+        -- =================================================
+        -- UPSELL RULES
+        -- Tenant managers manage rules of their own tenant.
+        -- Global rules (tenant_id null) are platform-admin only.
+        -- =================================================
 
         when 'list_upsell_rules' then
+
             v_tid := platform.current_tenant_id();
 
             select coalesce(
-                jsonb_agg(to_jsonb(ur) order by ur.created_at),
+                jsonb_agg(
+                    to_jsonb(t)
+                    order by t.created_at
+                ),
                 '[]'::jsonb
             )
             into v_result
             from (
                 select
-                    u.id,
-                    u.tenant_id,
-                    u.trigger_event,
-                    u.recommended_plan_id,
-                    u.rule_config,
-                    u.is_active,
-                    u.created_at
-                from public.upsell_rules u
-                where u.is_active = true
+                    ur.id,
+                    ur.tenant_id,
+                    ur.trigger_event,
+                    ur.recommended_plan_id,
+                    ur.rule_config,
+                    ur.is_active,
+                    ur.created_at
+                from public.upsell_rules ur
+                where ur.is_active
                   and (
-                      u.tenant_id is null
-                      or u.tenant_id = v_tid
+                      ur.tenant_id is null
+                      or ur.tenant_id = v_tid
                   )
-                  and (
-                      p_payload->>'trigger_event' is null
-                      or u.trigger_event = (p_payload->>'trigger_event')::public.upsell_plan_trigger
-                  )
-            ) ur;
+            ) t;
 
             return v_result;
 
+
         when 'create_upsell_rule' then
+
             v_tid := platform.current_tenant_id();
+
+            if public.is_platform_admin() then
+                v_target := nullif(p_payload->>'tenant_id', '')::uuid;
+            else
+                if v_tid is null then
+                    raise exception 'no active tenant';
+                end if;
+                v_target := v_tid;
+            end if;
 
             insert into public.upsell_rules (
                 tenant_id,
@@ -1333,20 +3040,13 @@ begin
                 is_active
             )
             values (
-                v_tid,
-                nullif(p_payload->>'trigger_event', '')::public.upsell_plan_trigger,
-                nullif(p_payload->>'recommended_plan_id', '')::uuid,
-                p_payload->'rule_config',
+                v_target,
+                btrim(p_payload->>'trigger_event'),
+                (p_payload->>'recommended_plan_id')::uuid,
+                coalesce(p_payload->'rule_config', '{}'::jsonb),
                 coalesce((p_payload->>'is_active')::boolean, true)
             )
-            returning
-                id,
-                tenant_id,
-                trigger_event,
-                recommended_plan_id,
-                rule_config,
-                is_active,
-                created_at
+            returning *
             into v_row;
 
             perform platform.log_audit(
@@ -1357,44 +3057,48 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'update_upsell_rule' then
+
             v_tid := platform.current_tenant_id();
 
-            update public.upsell_rules u
+            update public.upsell_rules ur
             set
                 trigger_event = case
                     when p_payload ? 'trigger_event'
-                        then nullif(p_payload->>'trigger_event', '')::public.upsell_plan_trigger
-                    else u.trigger_event
+                        then btrim(p_payload->>'trigger_event')
+                    else ur.trigger_event
                 end,
+
                 recommended_plan_id = case
                     when p_payload ? 'recommended_plan_id'
-                        then nullif(p_payload->>'recommended_plan_id', '')::uuid
-                    else u.recommended_plan_id
+                        then (p_payload->>'recommended_plan_id')::uuid
+                    else ur.recommended_plan_id
                 end,
+
                 rule_config = case
-                    when p_payload ? 'rule_config' then p_payload->'rule_config'
-                    else u.rule_config
+                    when p_payload ? 'rule_config'
+                        then coalesce(p_payload->'rule_config', '{}'::jsonb)
+                    else ur.rule_config
                 end,
+
                 is_active = case
                     when p_payload ? 'is_active'
                         then (p_payload->>'is_active')::boolean
-                    else u.is_active
+                    else ur.is_active
                 end
-            where u.id = (p_payload->>'id')::uuid
-              and u.tenant_id = v_tid
-            returning
-                u.id,
-                u.tenant_id,
-                u.trigger_event,
-                u.recommended_plan_id,
-                u.rule_config,
-                u.is_active,
-                u.created_at
+
+            where ur.id = (p_payload->>'id')::uuid
+              and (
+                  public.is_platform_admin()
+                  or ur.tenant_id = v_tid
+              )
+
+            returning *
             into v_row;
 
             if not found then
-                raise exception 'Upsell rule not found';
+                raise exception 'upsell rule not found';
             end if;
 
             perform platform.log_audit(
@@ -1406,463 +3110,117 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'delete_upsell_rule' then
+
             v_tid := platform.current_tenant_id();
 
-            delete from public.upsell_rules u
-            where u.id = (p_payload->>'id')::uuid
-              and u.tenant_id = v_tid;
+            delete from public.upsell_rules ur
+            where ur.id = (p_payload->>'id')::uuid
+              and (
+                  public.is_platform_admin()
+                  or ur.tenant_id = v_tid
+              )
+            returning ur.id
+            into v_row;
 
             if not found then
-                raise exception 'Upsell rule not found';
+                raise exception 'upsell rule not found';
             end if;
 
             perform platform.log_audit(
                 'upsell_rule.deleted',
                 'upsell_rule',
-                (p_payload->>'id')::uuid
-            );
-
-            return jsonb_build_object(
-                'deleted', true,
-                'id', p_payload->>'id'
-            );
-
-        when 'get_tenant_entitlements' then
-            v_tid := platform.current_tenant_id();
-
-            select s.plan_id, s.tier
-            into v_sub
-            from public.subscriptions s
-            where s.tenant_id = v_tid;
-
-            if not found then
-                raise exception 'Subscription not found for tenant';
-            end if;
-
-            if v_sub.plan_id is null then
-                return jsonb_build_object(
-                    'tenant_id', v_tid,
-                    'plan_id', null,
-                    'tier', v_sub.tier,
-                    'features', '[]'::jsonb
-                );
-            end if;
-
-            select jsonb_build_object(
-                'tenant_id', v_tid,
-                'plan_id', v_sub.plan_id,
-                'tier', v_sub.tier,
-                'features', coalesce((
-                    select jsonb_agg(to_jsonb(fe) order by fe.feature_key)
-                    from (
-                        select
-                            f.id,
-                            f.plan_id,
-                            f.feature_key,
-                            f.enabled
-                        from public.feature_entitlements f
-                        where f.plan_id = v_sub.plan_id
-                          and f.enabled = true
-                    ) fe
-                ), '[]'::jsonb)
-            )
-            into v_result;
-
-            return v_result;
-
-        when 'change_plan' then
-            -- A tenant may only switch itself to a FREE plan (pricing row
-            -- present, no positive price). Paid plans are activated by the
-            -- backend after a successful payment (service_role). Without
-            -- this guard any tenant manager could upgrade to any plan for
-            -- free. Platform admins are exempt.
-            if not public.is_platform_admin() then
-                if not exists (
-                    select 1
-                    from public.plan_pricing pr
-                    where pr.plan_id = (p_payload->>'plan_id')::uuid
-                ) or exists (
-                    select 1
-                    from public.plan_pricing pr
-                    where pr.plan_id = (p_payload->>'plan_id')::uuid
-                      and (coalesce(pr.monthly_price, 0) > 0
-                           or coalesce(pr.yearly_price, 0) > 0)
-                ) then
-                    raise exception
-                        'PAYMENT_REQUIRED: this plan is activated after payment (use payment_api create_checkout_session)';
-                end if;
-            end if;
-
-            v_result := public.commerce_change_subscription_plan(
-                (p_payload->>'plan_id')::uuid
-            );
-
-            perform platform.log_audit(
-                'subscription.plan_changed',
-                'subscription',
-                (v_result->>'subscription_id')::uuid,
-                jsonb_build_object(
-                    'plan_id', v_result->>'plan_id',
-                    'tier', v_result->>'tier'
-                )
-            );
-
-            return v_result;
-
-        -- =================================================
-        -- DISCOUNT CODES - PLATFORM ADMIN
-        -- =================================================
-
-        when 'list_discount_codes' then
-
-            select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb)
-            into v_result
-            from (
-                select
-                    dc.id,
-                    dc.tenant_id,
-                    dc.code,
-                    dc.discount_type,
-                    dc.value,
-                    dc.currency,
-                    dc.applies_to_plan_id,
-                    dc.max_redemptions,
-                    dc.redeemed_count,
-                    dc.valid_from,
-                    dc.valid_until,
-                    dc.is_active,
-                    dc.created_at,
-                    dc.updated_at
-                from public.discount_codes dc
-                where (p_payload->>'is_active' is null
-                       or dc.is_active = (p_payload->>'is_active')::boolean)
-                  and (p_payload->>'tenant_id' is null
-                       or dc.tenant_id = (p_payload->>'tenant_id')::uuid)
-            ) t;
-
-            return v_result;
-
-        when 'create_discount_code' then
-
-            insert into public.discount_codes (
-                tenant_id,
-                code,
-                discount_type,
-                value,
-                currency,
-                applies_to_plan_id,
-                max_redemptions,
-                valid_from,
-                valid_until
-            )
-            values (
-                nullif(p_payload->>'tenant_id', '')::uuid,
-                upper(btrim(p_payload->>'code')),
-                p_payload->>'discount_type',
-                (p_payload->>'value')::numeric,
-                case
-                    when p_payload->>'discount_type' = 'fixed_amount'
-                    then upper(coalesce(nullif(p_payload->>'currency', ''), 'EUR'))
-                    else null
-                end,
-                nullif(p_payload->>'applies_to_plan_id', '')::uuid,
-                nullif(p_payload->>'max_redemptions', '')::int,
-                coalesce(nullif(p_payload->>'valid_from', '')::timestamptz, now()),
-                nullif(p_payload->>'valid_until', '')::timestamptz
-            )
-            returning
-                id, tenant_id, code, discount_type, value, currency,
-                applies_to_plan_id, max_redemptions, redeemed_count,
-                valid_from, valid_until, is_active, created_at
-            into v_row;
-
-            perform platform.log_audit(
-                'discount_code.created',
-                'discount_code',
-                v_row.id,
-                jsonb_build_object('code', v_row.code)
-            );
-
-            return to_jsonb(v_row);
-
-        -- Financial terms (code, type, value) are immutable once
-        -- created: deactivate and create a new code instead.
-        when 'update_discount_code' then
-
-            update public.discount_codes dc
-            set
-                is_active = case
-                    when p_payload ? 'is_active'
-                    then (p_payload->>'is_active')::boolean
-                    else dc.is_active
-                end,
-                valid_until = case
-                    when p_payload ? 'valid_until'
-                    then nullif(p_payload->>'valid_until', '')::timestamptz
-                    else dc.valid_until
-                end,
-                max_redemptions = case
-                    when p_payload ? 'max_redemptions'
-                    then nullif(p_payload->>'max_redemptions', '')::int
-                    else dc.max_redemptions
-                end,
-                applies_to_plan_id = case
-                    when p_payload ? 'applies_to_plan_id'
-                    then nullif(p_payload->>'applies_to_plan_id', '')::uuid
-                    else dc.applies_to_plan_id
-                end
-            where dc.id = (p_payload->>'id')::uuid
-            returning
-                dc.id, dc.code, dc.is_active, dc.valid_until,
-                dc.max_redemptions, dc.redeemed_count,
-                dc.applies_to_plan_id, dc.updated_at
-            into v_row;
-
-            if not found then
-                raise exception 'Discount code not found';
-            end if;
-
-            perform platform.log_audit(
-                'discount_code.updated',
-                'discount_code',
                 v_row.id
             );
 
-            return to_jsonb(v_row);
+            return jsonb_build_object('id', v_row.id, 'deleted', true);
 
-        when 'deactivate_discount_code' then
-
-            update public.discount_codes dc
-            set is_active = false
-            where dc.id = (p_payload->>'id')::uuid
-            returning dc.id, dc.code, dc.is_active, dc.updated_at
-            into v_row;
-
-            if not found then
-                raise exception 'Discount code not found';
-            end if;
-
-            perform platform.log_audit(
-                'discount_code.deactivated',
-                'discount_code',
-                v_row.id
-            );
-
-            return to_jsonb(v_row);
 
         -- =================================================
-        -- DISCOUNT CODES - TENANT
+        -- DISCOUNT: VALIDATE (TENANT, no redemption)
+        -- payload: code, optional plan_id, optional invoice_id
+        -- (invoice_id adds the amount the discount would give)
         -- =================================================
 
         when 'validate_discount_code' then
 
             v_tid := platform.current_tenant_id();
 
-            v_code := public.commerce_find_usable_discount_code(
-                v_tid,
-                p_payload->>'code',
-                nullif(p_payload->>'plan_id', '')::uuid,
-                nullif(p_payload->>'currency', ''),
-                false
-            );
-
-            if v_code.id is null then
-                return jsonb_build_object(
-                    'valid', false,
-                    'reason', 'invalid_or_unavailable'
-                );
+            if v_tid is null then
+                raise exception 'no active tenant';
             end if;
 
-            v_base := nullif(p_payload->>'amount', '')::numeric;
+            if nullif(btrim(coalesce(p_payload->>'code', '')), '') is null then
+                raise exception 'code is required';
+            end if;
+
+            v_plan_id := coalesce(
+                nullif(p_payload->>'plan_id', '')::uuid,
+                (
+                    select s.plan_id
+                    from public.subscriptions s
+                    where s.tenant_id = v_tid
+                )
+            );
+
+            v_row := public.commerce_find_usable_discount_code(
+                p_payload->>'code',
+                v_plan_id
+            );
+
+            if v_row.id is null then
+                return jsonb_build_object('valid', false);
+            end if;
+
+            v_amount := null;
+
+            if nullif(p_payload->>'invoice_id', '') is not null then
+
+                select public.commerce_compute_discount_amount(
+                    v_row.discount_type,
+                    v_row.value,
+                    i.subtotal
+                )
+                into v_amount
+                from public.invoices i
+                where i.id = (p_payload->>'invoice_id')::uuid
+                  and i.tenant_id = v_tid;
+
+            end if;
 
             return jsonb_build_object(
                 'valid', true,
-                'code', v_code.code,
-                'discount_type', v_code.discount_type,
-                'value', v_code.value,
-                'currency', v_code.currency,
-                'discount_amount', case
-                    when v_base is null then null
-                    else public.commerce_compute_discount_amount(
-                        v_code.discount_type, v_code.value, v_base
-                    )
-                end
+                'discount_type', v_row.discount_type,
+                'value', v_row.value,
+                'currency', v_row.currency,
+                'applies_to_plan_id', v_row.applies_to_plan_id,
+                'amount', v_amount
             );
 
-        when 'apply_discount_to_invoice' then
 
-            v_tid := platform.current_tenant_id();
-
-            select i.*
-            into v_inv
-            from public.invoices i
-            where i.id = (p_payload->>'invoice_id')::uuid
-              and i.tenant_id = v_tid
-            for update;
-
-            if not found then
-                raise exception 'Invoice not found';
-            end if;
-
-            if v_inv.status <> 'open' then
-                raise exception 'A discount can only be applied to an open invoice';
-            end if;
-
-            if v_inv.document_type <> 'invoice' then
-                raise exception 'A discount cannot be applied to a credit note';
-            end if;
-
-            -- Once frozen for Epsilon the invoice is a fiscal document.
-            if v_inv.locked_at is not null then
-                raise exception 'This invoice has already been issued; a discount can no longer be applied';
-            end if;
-
-            if v_inv.discount_amount > 0
-               or exists (
-                    select 1
-                    from public.discount_redemptions r
-                    where r.invoice_id = v_inv.id
-               ) then
-                raise exception 'A discount was already applied to this invoice';
-            end if;
-
-            -- Totals must not change while a payment is in flight.
-            if exists (
-                select 1
-                from platform.payment_intents pi
-                where pi.target_type = 'invoice'
-                  and pi.target_id = v_inv.id
-                  and pi.status::text in ('pending', 'authorized')
-            ) then
-                raise exception 'Cancel the pending payment before applying a discount';
-            end if;
-
-            v_code := public.commerce_find_usable_discount_code(
-                v_tid,
-                p_payload->>'code',
-                (select s.plan_id
-                 from public.subscriptions s
-                 where s.id = v_inv.subscription_id),
-                v_inv.currency,
-                true
-            );
-
-            if v_code.id is null then
-                raise exception 'Discount code is not valid for this invoice';
-            end if;
-
-            v_discount := public.commerce_compute_discount_amount(
-                v_code.discount_type, v_code.value, v_inv.subtotal
-            );
-
-            if v_discount <= 0 then
-                raise exception 'Discount code does not reduce this invoice';
-            end if;
-
-            if exists (
-                select 1 from public.invoice_lines il where il.invoice_id = v_inv.id
-            ) then
-                -- Distribute the discount pro rata over the lines (rounding rest
-                -- on the last line), recompute VAT per line, roll up to the invoice.
-                with ordered as (
-                    select
-                        il.id,
-                        il.line_amount,
-                        il.vat_rate,
-                        row_number() over (
-                            order by il.sort_order desc, il.created_at desc, il.id
-                        ) as rn_last,
-                        sum(il.line_amount) over () as total_net
-                    from public.invoice_lines il
-                    where il.invoice_id = v_inv.id
-                ),
-                alloc as (
-                    select
-                        o.id, o.line_amount, o.vat_rate, o.rn_last,
-                        case when o.total_net > 0
-                             then round(v_discount * o.line_amount / o.total_net, 2)
-                             else 0 end as share
-                    from ordered o
-                ),
-                fixed as (
-                    select
-                        a.id, a.line_amount, a.vat_rate,
-                        a.share + case when a.rn_last = 1
-                                       then v_discount - sum(a.share) over ()
-                                       else 0 end as disc
-                    from alloc a
-                )
-                update public.invoice_lines il
-                set
-                    discount_amount = f.disc,
-                    vat_amount = round((il.line_amount - f.disc) * coalesce(f.vat_rate, 0) / 100, 2),
-                    gross_amount = (il.line_amount - f.disc)
-                        + round((il.line_amount - f.disc) * coalesce(f.vat_rate, 0) / 100, 2)
-                from fixed f
-                where il.id = f.id;
-
-                select coalesce(sum(il.vat_amount), 0)
-                into v_new_tax
-                from public.invoice_lines il
-                where il.invoice_id = v_inv.id;
-            else
-                -- Header-only invoice (no lines): scale tax proportionally
-                -- (assumes a uniform tax rate on the invoice).
-                v_new_tax := case
-                    when v_inv.subtotal > 0
-                    then round(v_inv.tax_amount * (v_inv.subtotal - v_discount) / v_inv.subtotal, 2)
-                    else v_inv.tax_amount
-                end;
-            end if;
-
-            update public.invoices i
-            set
-                discount_amount = v_discount,
-                tax_amount = v_new_tax,
-                total_amount = v_inv.subtotal - v_discount + v_new_tax
-            where i.id = v_inv.id
-            returning
-                i.id, i.invoice_number, i.status, i.currency, i.subtotal,
-                i.discount_amount, i.tax_amount, i.total_amount
-            into v_row;
-
-            insert into public.discount_redemptions (
-                discount_code_id,
-                tenant_id,
-                invoice_id,
-                subscription_id,
-                amount_applied
-            )
-            values (
-                v_code.id,
-                v_tid,
-                v_inv.id,
-                v_inv.subscription_id,
-                v_discount
-            );
-
-            update public.discount_codes dc
-            set redeemed_count = dc.redeemed_count + 1
-            where dc.id = v_code.id;
-
-            perform platform.log_audit(
-                'discount_code.redeemed',
-                'invoice',
-                v_inv.id,
-                jsonb_build_object(
-                    'code', v_code.code,
-                    'amount_applied', v_discount
-                )
-            );
-
-            return to_jsonb(v_row);
+        -- =================================================
+        -- DISCOUNT: REDEMPTIONS (TENANT)
+        -- =================================================
 
         when 'list_discount_redemptions' then
 
             v_tid := platform.current_tenant_id();
 
-            select coalesce(jsonb_agg(to_jsonb(t) order by t.redeemed_at desc), '[]'::jsonb)
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
+            v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
+            v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
+
+            select coalesce(
+                jsonb_agg(
+                    to_jsonb(t)
+                    order by t.redeemed_at desc
+                ),
+                '[]'::jsonb
+            )
             into v_result
             from (
                 select
@@ -1876,17 +3234,49 @@ begin
                 join public.discount_codes dc
                   on dc.id = r.discount_code_id
                 where r.tenant_id = v_tid
+                  and (
+                      nullif(p_payload->>'invoice_id', '') is null
+                      or r.invoice_id = (p_payload->>'invoice_id')::uuid
+                  )
+                order by r.redeemed_at desc
+                limit v_limit
+                offset v_offset
             ) t;
 
             return v_result;
 
+
         -- =================================================
-        -- INVOICES - TENANT (READ ONLY, drafts are hidden)
+        -- SUBSCRIPTION: CANCEL AT END OF MONTH (TENANT ADMIN)
+        -- =================================================
+
+        when 'cancel_subscription' then
+
+            v_row := public.commerce_cancel_subscription(
+                p_payload->>'reason'
+            );
+
+            return to_jsonb(v_row);
+
+
+        when 'undo_cancel_subscription' then
+
+            v_row := public.commerce_undo_cancel_subscription();
+
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- INVOICES: LIST (TENANT, READ ONLY, drafts hidden)
         -- =================================================
 
         when 'list_invoices' then
 
             v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
 
             v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
             v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
@@ -1899,7 +3289,13 @@ begin
                     i.tenant_id,
                     i.subscription_id,
                     i.invoice_number,
+                    i.document_type,
+                    i.credited_invoice_id,
+                    i.credit_reason,
+                    i.period_start,
+                    i.period_end,
                     i.status,
+                    i.payment_status,
                     i.currency,
                     i.subtotal,
                     i.discount_amount,
@@ -1908,10 +3304,6 @@ begin
                     i.issued_at,
                     i.due_at,
                     i.paid_at,
-                    i.document_type,
-                    i.credited_invoice_id,
-                    i.credit_reason,
-                    i.payment_status,
                     i.epsilon_status,
                     i.epsilon_uid,
                     i.epsilon_mark,
@@ -1928,12 +3320,35 @@ begin
 
             return v_result;
 
+
+        -- =================================================
+        -- INVOICES: GET (TENANT, READ ONLY)
+        -- =================================================
+
         when 'get_invoice' then
 
             v_tid := platform.current_tenant_id();
 
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
             select jsonb_build_object(
                 'invoice', to_jsonb(inv),
+                'billing_customer', (
+                    select jsonb_build_object(
+                        'legal_name', bc.legal_name,
+                        'trade_name', bc.trade_name,
+                        'vat_number', bc.vat_number,
+                        'tax_office', bc.tax_office,
+                        'country_code', bc.country_code,
+                        'address_line', bc.address_line,
+                        'postal_code', bc.postal_code,
+                        'city', bc.city
+                    )
+                    from public.billing_customers bc
+                    where bc.id = inv.billing_customer_id
+                ),
                 'lines', coalesce((
                     select jsonb_agg(to_jsonb(l) order by l.sort_order, l.created_at)
                     from (
@@ -1973,8 +3388,13 @@ begin
                     i.id,
                     i.tenant_id,
                     i.subscription_id,
+                    i.billing_customer_id,
                     i.invoice_number,
+                    i.document_type,
+                    i.credited_invoice_id,
+                    i.credit_reason,
                     i.status,
+                    i.payment_status,
                     i.currency,
                     i.subtotal,
                     i.discount_amount,
@@ -1983,10 +3403,6 @@ begin
                     i.issued_at,
                     i.due_at,
                     i.paid_at,
-                    i.document_type,
-                    i.credited_invoice_id,
-                    i.credit_reason,
-                    i.payment_status,
                     i.epsilon_status,
                     i.epsilon_uid,
                     i.epsilon_mark,
@@ -2001,10 +3417,11 @@ begin
             ) inv;
 
             if v_result is null then
-                raise exception 'Invoice not found';
+                raise exception 'invoice not found';
             end if;
 
             return v_result;
+
 
         -- =================================================
         -- BILLING CUSTOMER - TENANT
@@ -2013,6 +3430,10 @@ begin
         when 'get_billing_customer' then
 
             v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
 
             select to_jsonb(t)
             into v_result
@@ -2037,9 +3458,14 @@ begin
 
             return v_result;
 
+
         when 'update_billing_customer' then
 
             v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
 
             if nullif(btrim(coalesce(p_payload->>'legal_name', '')), '') is null then
                 raise exception 'legal_name is required';
@@ -2052,7 +3478,7 @@ begin
             if coalesce(p_payload->>'customer_type', 'business') = 'business'
                and upper(coalesce(p_payload->>'country_code', 'GR')) = 'GR'
                and coalesce(p_payload->>'vat_number', '') !~ '^[0-9]{9}$' then
-                raise exception 'A Greek business customer requires a 9-digit VAT number';
+                raise exception 'a Greek business customer requires a 9-digit VAT number';
             end if;
 
             insert into public.billing_customers (
@@ -2099,12 +3525,20 @@ begin
 
             return to_jsonb(v_row);
 
+
         -- =================================================
         -- EPSILON BILLING - PLATFORM ADMIN
-        -- (authorised in commerce_api via edge_require_platform_admin)
         -- =================================================
 
         when 'list_billing_item_mappings' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
 
             select coalesce(jsonb_agg(to_jsonb(m) order by m.item_key), '[]'::jsonb)
             into v_result
@@ -2120,7 +3554,16 @@ begin
 
             return v_result;
 
+
         when 'upsert_billing_item_mapping' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
 
             if nullif(btrim(coalesce(p_payload->>'item_key', '')), '') is null
                or nullif(btrim(coalesce(p_payload->>'epsilon_item_code', '')), '') is null
@@ -2170,7 +3613,16 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'deactivate_billing_item_mapping' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
 
             update public.billing_item_mappings bm
             set is_active = false
@@ -2179,7 +3631,7 @@ begin
             into v_row;
 
             if not found then
-                raise exception 'Billing item mapping not found';
+                raise exception 'billing item mapping not found';
             end if;
 
             perform platform.log_audit(
@@ -2191,7 +3643,16 @@ begin
 
             return to_jsonb(v_row);
 
+
         when 'list_epsilon_issues' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
 
             v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
             v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
@@ -2234,7 +3695,16 @@ begin
 
             return v_result;
 
+
         when 'requeue_epsilon_invoice' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
 
             select i.id, i.document_type, i.epsilon_status
             into v_inv
@@ -2242,13 +3712,13 @@ begin
             where i.id = (p_payload->>'invoice_id')::uuid;
 
             if not found then
-                raise exception 'Invoice not found';
+                raise exception 'invoice not found';
             end if;
 
-            -- A rejection by AADE cannot be fixed by resending the same data;
-            -- that requires a credit note / corrected invoice.
+            -- A rejection by AADE cannot be fixed by resending the same
+            -- data; that requires a credit note / corrected invoice.
             if v_inv.epsilon_status <> 'error' then
-                raise exception 'Only invoices with Epsilon status error can be re-queued (status: %)', v_inv.epsilon_status;
+                raise exception 'only invoices with Epsilon status error can be re-queued (status: %)', v_inv.epsilon_status;
             end if;
 
             perform platform.epsilon_enqueue_invoice(
@@ -2265,300 +3735,81 @@ begin
 
             return jsonb_build_object('invoice_id', v_inv.id, 'status', 'queued');
 
+
         else
-            raise exception 'unknown commerce operation: %', p_op;
-    end case;
-end;
-$$;
 
+            raise exception
+                'unknown commerce operation: %',
+                p_op;
 
--- =====================================================
--- 13. PAYMENT STATUS TRANSITION BRIDGE
--- =====================================================
--- Commerce-facing bridge into the platform payment engine
--- defined in 000.
--- =====================================================
-
-create or replace function public.payment_transition_status(
-    p_intent_id uuid,
-    p_new_status public.payment_status,
-    p_source text,
-    p_event_type text default 'status_changed',
-    p_external_event_id text default null,
-    p_metadata jsonb default '{}'::jsonb
-)
-returns void
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_tid uuid;
-begin
-    v_tid := platform.current_tenant_id();
-    if v_tid is null then
-        raise exception 'no active tenant';
-    end if;
-
-    if not exists (
-        select 1 from platform.payment_intents pi
-        where pi.id = p_intent_id and pi.tenant_id = v_tid
-    ) then
-        raise exception 'Payment not found';
-    end if;
-
-    perform platform.apply_payment_status(
-        p_intent_id,
-        p_new_status::text,
-        p_source,
-        p_event_type,
-        p_external_event_id,
-        coalesce(p_metadata, '{}'::jsonb)
-    );
-end;
-$$;
-
-
--- =====================================================
--- 14. PAYMENT DOMAIN API
--- =====================================================
--- Checkout/payment orchestration.
--- Actual payment execution remains outside this domain.
--- =====================================================
-
-create or replace function public.payment_domain(
-    p_op text,
-    p_payload jsonb default '{}'::jsonb
-)
-returns jsonb
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_tid uuid;
-    v_row record;
-    v_result jsonb;
-    v_intent_id uuid;
-    v_status public.payment_status;
-    v_amount numeric;
-    v_currency text;
-    v_inv record;
-begin
-    p_payload := coalesce(p_payload, '{}'::jsonb);
-    v_tid := platform.current_tenant_id();
-
-    case p_op
-    when 'create_checkout_session' then
-        if v_tid is null then raise exception 'no active tenant'; end if;
-
-        if not exists (
-            select 1 from public.integration_providers ip
-            where ip.code = p_payload->>'provider' and ip.is_active = true
-        ) then
-            raise exception 'Unknown or inactive payment provider: %', p_payload->>'provider';
-        end if;
-
-        v_amount := (p_payload->>'amount')::numeric;
-        v_currency := upper(coalesce(p_payload->>'currency', 'EUR'));
-
-        -- For invoices the amount and currency come from the invoice,
-        -- never from the client payload.
-        if p_payload->>'target_type' = 'invoice' then
-            select i.id, i.status, i.total_amount, i.currency, i.document_type
-            into v_inv
-            from public.invoices i
-            where i.id = nullif(p_payload->>'target_id', '')::uuid
-              and i.tenant_id = v_tid;
-
-            if not found then
-                raise exception 'Invoice not found';
-            end if;
-
-            if v_inv.status <> 'open' then
-                raise exception 'Invoice is not payable in status %', v_inv.status;
-            end if;
-
-            if v_inv.document_type <> 'invoice' then
-                raise exception 'A credit note is not payable';
-            end if;
-
-            v_amount := v_inv.total_amount;
-            v_currency := upper(v_inv.currency);
-        end if;
-
-        if v_amount is null or v_amount <= 0 then
-            raise exception 'amount must be positive';
-        end if;
-
-        insert into platform.payment_intents (
-            tenant_id,
-            provider,
-            amount,
-            currency,
-            status,
-            target_type,
-            target_id,
-            metadata
-        )
-        values (
-            v_tid,
-            p_payload->>'provider',
-            v_amount,
-            v_currency,
-            'pending'::public.payment_status,
-            p_payload->>'target_type',
-            (p_payload->>'target_id')::uuid,
-            coalesce(p_payload->'metadata', '{}'::jsonb)
-        )
-        returning id, tenant_id, provider, external_intent_id, amount, currency,
-                  status, target_type, target_id, metadata, created_at, updated_at
-        into v_row;
-
-        insert into platform.payment_events (
-            payment_intent_id, tenant_id, event_type, old_status, new_status, source, payload
-        )
-        values (
-            v_row.id, v_tid, 'intent_created', null, 'pending', 'api',
-            jsonb_build_object('target_type', v_row.target_type, 'target_id', v_row.target_id)
-        );
-
-        perform platform.log_audit(
-            'payment.checkout_created',
-            'payment_intent',
-            v_row.id,
-            jsonb_build_object('provider', v_row.provider, 'amount', v_row.amount)
-        );
-
-        v_result := to_jsonb(v_row);
-
-    when 'get_payment' then
-        if v_tid is null then raise exception 'no active tenant'; end if;
-        select to_jsonb(t) into v_result from (
-            select pi.id, pi.tenant_id, pi.provider, pi.external_intent_id, pi.amount,
-                   pi.currency, pi.status, pi.target_type, pi.target_id, pi.metadata,
-                   pi.created_at, pi.updated_at
-            from platform.payment_intents pi
-            where pi.id = (p_payload->>'id')::uuid and pi.tenant_id = v_tid
-        ) t;
-        if v_result is null then raise exception 'Payment not found'; end if;
-
-    when 'list_payments' then
-        if v_tid is null then raise exception 'no active tenant'; end if;
-        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb) into v_result
-        from (
-            select pi.id, pi.tenant_id, pi.provider, pi.external_intent_id, pi.amount,
-                   pi.currency, pi.status, pi.target_type, pi.target_id, pi.created_at, pi.updated_at
-            from platform.payment_intents pi
-            where pi.tenant_id = v_tid
-              and (p_payload->>'status' is null or pi.status::text = p_payload->>'status')
-              and (p_payload->>'target_type' is null or pi.target_type = p_payload->>'target_type')
-              and (p_payload->>'target_id' is null or pi.target_id = (p_payload->>'target_id')::uuid)
-        ) t;
-
-    when 'cancel_payment' then
-        if v_tid is null then raise exception 'no active tenant'; end if;
-
-        select pi.id, pi.status into v_intent_id, v_status
-        from platform.payment_intents pi
-        where pi.id = (p_payload->>'id')::uuid and pi.tenant_id = v_tid
-        for update;
-
-        if not found then raise exception 'Payment not found'; end if;
-
-        if v_status not in ('pending'::public.payment_status, 'authorized'::public.payment_status) then
-            raise exception 'Payment cannot be cancelled in status %', v_status;
-        end if;
-
-        perform public.payment_transition_status(
-            v_intent_id,
-            'cancelled'::public.payment_status,
-            'api',
-            'cancelled',
-            null,
-            coalesce(p_payload->'metadata', '{}'::jsonb)
-        );
-
-        select to_jsonb(t) into v_result from (
-            select pi.id, pi.tenant_id, pi.provider, pi.status, pi.updated_at
-            from platform.payment_intents pi where pi.id = v_intent_id
-        ) t;
-
-        perform platform.log_audit('payment.cancelled', 'payment_intent', v_intent_id);
-
-    when 'payment_history' then
-        if v_tid is null then raise exception 'no active tenant'; end if;
-
-        if not exists (
-            select 1 from platform.payment_intents pi
-            where pi.id = (p_payload->>'payment_intent_id')::uuid and pi.tenant_id = v_tid
-        ) then
-            raise exception 'Payment not found';
-        end if;
-
-        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb) into v_result
-        from (
-            select pe.id, pe.payment_intent_id, pe.event_type, pe.old_status, pe.new_status,
-                   pe.source, pe.external_event_id, pe.payload, pe.created_at
-            from platform.payment_events pe
-            where pe.payment_intent_id = (p_payload->>'payment_intent_id')::uuid
-              and pe.tenant_id = v_tid
-        ) t;
-
-    else
-        raise exception 'unknown payment_domain operation: %', p_op;
     end case;
 
-    return v_result;
 end;
 $$;
 
 
 -- =====================================================
--- 15. SUBSCRIPTION / COMMERCE TRIGGERS
+-- 24. CURRENT SUBSCRIPTION OVERVIEW
 -- =====================================================
 
-drop trigger if exists trg_subscriptions_sync_tier_from_plan on public.subscriptions;
+create or replace view public.v_subscription_overview
+with (security_invoker = true)
+as
+select
+    s.id as subscription_id,
+    s.tenant_id,
+    s.status,
+    s.tier,
 
+    s.plan_id,
 
-drop trigger if exists trg_subscriptions_prevent_tier_drift on public.subscriptions;
+    pp.name as plan_name,
 
+    pp.description as plan_description,
 
-drop trigger if exists trg_subscriptions_plan_required on public.subscriptions;
+    pp.is_active as plan_is_active,
 
+    pp.is_default as plan_is_default,
 
-create trigger trg_product_plans_updated_at
-before update on product_plans
-for each row execute function platform.set_updated_at();
+    pricing.currency,
 
+    pricing.monthly_price,
 
-create trigger trg_subscriptions_sync_tier_from_plan
-before insert or update of plan_id on public.subscriptions
-for each row execute function public.sync_subscription_tier_from_plan();
+    pricing.yearly_price,
 
+    pricing.effective_from as pricing_effective_from
 
-create trigger trg_subscriptions_prevent_tier_drift
-before update of tier on public.subscriptions
-for each row execute function public.prevent_subscription_tier_drift();
+from public.subscriptions s
 
+left join public.product_plans pp
+    on pp.id = s.plan_id
 
-create trigger trg_subscriptions_plan_required
-before insert or update on public.subscriptions
-for each row execute function public.enforce_subscription_plan_required();
+left join lateral (
+    select
+        px.currency,
+        px.monthly_price,
+        px.yearly_price,
+        px.effective_from
+
+    from public.plan_pricing px
+
+    where px.plan_id = s.plan_id
+      and px.effective_from <= now()
+
+    order by px.effective_from desc
+
+    limit 1
+) pricing
+    on true;
 
 
 -- =====================================================
--- 15B. DEFAULT SUBSCRIPTION FOR NEW TENANTS
+-- 25. DEFAULT SUBSCRIPTION PROVISIONING
 -- =====================================================
--- Every tenant gets a trial subscription on the default plan
--- (product_plans.is_default). Without it get_tenant_entitlements
--- fails with 'Subscription not found for tenant'.
 --
--- Requires the commerce catalogue seed (seed_commerce.sql):
--- tenant creation fails loudly when no default plan exists.
+-- Called when a tenant is created.
 --
--- Trial length is 14 days. NOTE: nothing in the schema moves an
--- expired trial to 'trial_expired' yet; that needs a scheduled job.
+-- The default commercial plan must already exist.
 -- =====================================================
 
 create or replace function public.provision_default_subscription()
@@ -2568,70 +3819,148 @@ security definer
 set search_path = ''
 as $$
 declare
-    v_plan_id uuid;
-    v_tier public.subscription_tier;
+    v_plan public.product_plans%rowtype;
 begin
-    select pp.id, pp.tier
-    into v_plan_id, v_tier
-    from public.product_plans pp
-    where pp.is_default
-      and pp.is_active is true
+
+    select *
+    into v_plan
+    from public.product_plans
+    where is_default = true
+      and is_active = true
     limit 1;
 
-    if v_plan_id is null then
+    if not found then
         raise exception
-            'NO_DEFAULT_PRODUCT_PLAN: seed public.product_plans (is_default = true) before creating tenants';
+            'cannot provision tenant subscription: no active default product plan exists';
     end if;
 
     insert into public.subscriptions (
         tenant_id,
         plan_id,
         tier,
-        status,
-        current_period_start,
-        current_period_end
+        status
     )
     values (
         new.id,
-        v_plan_id,
-        v_tier,
-        'trial'::public.subscription_status,
-        now(),
-        now() + interval '14 days'
-    )
-    on conflict (tenant_id) do nothing;
+        v_plan.id,
+        v_plan.tier,
+        'active'
+    );
 
     return new;
+
 end;
 $$;
 
-drop trigger if exists trg_tenants_provision_default_subscription on public.tenants;
 
-create trigger trg_tenants_provision_default_subscription
-after insert on public.tenants
-for each row execute function public.provision_default_subscription();
+-- =====================================================
+-- 26. TRIGGERS
+-- =====================================================
 
-drop trigger if exists trg_invoices_updated_at on public.invoices;
+drop trigger if exists trg_product_plans_updated_at
+on public.product_plans;
 
-create trigger trg_invoices_updated_at
-before update on public.invoices
-for each row execute function platform.set_updated_at();
+create trigger trg_product_plans_updated_at
+before update on public.product_plans
+for each row
+execute function platform.set_updated_at();
 
-drop trigger if exists trg_billing_customers_updated_at on public.billing_customers;
+
+drop trigger if exists trg_product_plan_tier_immutable
+on public.product_plans;
+
+create trigger trg_product_plan_tier_immutable
+before update on public.product_plans
+for each row
+execute function public.prevent_product_plan_tier_change();
+
+
+drop trigger if exists trg_subscriptions_sync_tier_from_plan
+on public.subscriptions;
+
+create trigger trg_subscriptions_sync_tier_from_plan
+before insert or update of plan_id
+on public.subscriptions
+for each row
+execute function public.sync_subscription_tier_from_plan();
+
+
+drop trigger if exists trg_subscriptions_prevent_tier_drift
+on public.subscriptions;
+
+create trigger trg_subscriptions_prevent_tier_drift
+before insert or update
+on public.subscriptions
+for each row
+execute function public.prevent_subscription_tier_drift();
+
+
+drop trigger if exists trg_subscriptions_plan_required
+on public.subscriptions;
+
+create trigger trg_subscriptions_plan_required
+before insert or update
+on public.subscriptions
+for each row
+execute function public.enforce_subscription_plan_required();
+
+
+drop trigger if exists trg_billing_customers_updated_at
+on public.billing_customers;
 
 create trigger trg_billing_customers_updated_at
 before update on public.billing_customers
-for each row execute function platform.set_updated_at();
+for each row
+execute function platform.set_updated_at();
 
-drop trigger if exists trg_discount_codes_updated_at on public.discount_codes;
+
+drop trigger if exists trg_invoices_updated_at
+on public.invoices;
+
+create trigger trg_invoices_updated_at
+before update on public.invoices
+for each row
+execute function platform.set_updated_at();
+
+
+drop trigger if exists trg_discount_codes_updated_at
+on public.discount_codes;
 
 create trigger trg_discount_codes_updated_at
 before update on public.discount_codes
-for each row execute function platform.set_updated_at();
+for each row
+execute function platform.set_updated_at();
+
+
+drop trigger if exists trg_invoice_lines_tenant_consistency
+on public.invoice_lines;
+
+create trigger trg_invoice_lines_tenant_consistency
+before insert or update
+on public.invoice_lines
+for each row
+execute function public.enforce_invoice_line_tenant();
 
 
 -- =====================================================
--- 16. EPSILON E-INVOICING
+-- 27. TENANT DEFAULT SUBSCRIPTION TRIGGER
+-- =====================================================
+--
+-- This trigger is deliberately created only if the tenant
+-- table does not already have an equivalent 012 trigger.
+-- =====================================================
+
+drop trigger if exists trg_tenants_provision_default_subscription
+on public.tenants;
+
+create trigger trg_tenants_provision_default_subscription
+after insert on public.tenants
+for each row
+execute function public.provision_default_subscription();
+
+
+-- =====================================================
+-- 27A. EPSILON E-INVOICING
 -- =====================================================
 -- Supabase decides what is invoiced. Epsilon issues the
 -- official electronic invoice and transmits it to AADE.
@@ -2643,15 +3972,15 @@ for each row execute function platform.set_updated_at();
 --                           execute is revoked for anon/authenticated by 022)
 --
 -- Flow:
---   1. generator creates invoice + lines (status 'open')
+--   1. generator creates invoice + lines (status 'draft'; discounts allowed)
 --   2. platform.epsilon_enqueue_invoice() validates, freezes (snapshot +
---      locked_at) and queues a submission
+--      locked_at), sets status 'issued' and queues a submission
 --   3. gateway: epsilon_claim_submissions -> HTTP call -> epsilon_record_result
 --   4. later MARK/UID/rejection: epsilon_apply_status
 -- No dynamic SQL is used in this section.
 -- =====================================================
 
--- 16.1 PLAN -> EPSILON ITEM / myDATA MAPPING
+-- 27A.1 PLAN -> EPSILON ITEM / myDATA MAPPING
 -- Deliberately NOT seeded: classification codes and VAT categories
 -- must be confirmed by the accountant.
 
@@ -2694,7 +4023,7 @@ before update on public.billing_item_mappings
 for each row execute function platform.set_updated_at();
 
 
--- 16.2 AUTO-FILL LINE DEFAULTS FROM THE MAPPING
+-- 27A.2 AUTO-FILL LINE DEFAULTS FROM THE MAPPING
 -- The generator only sets product_plan_id; item code, classification
 -- and VAT come from the mapping unless explicitly provided.
 
@@ -2737,7 +4066,7 @@ before insert on public.invoice_lines
 for each row execute function public.fill_invoice_line_billing_defaults();
 
 
--- 16.3 IMMUTABLE SNAPSHOT
+-- 27A.3 IMMUTABLE SNAPSHOT
 
 create table if not exists public.invoice_snapshots (
     id uuid primary key default gen_random_uuid(),
@@ -2787,7 +4116,7 @@ before update or delete on public.invoice_snapshots
 for each row execute function platform.deny_mutation();
 
 
--- 16.4 API TRACKING + IDEMPOTENCY
+-- 27A.4 API TRACKING + IDEMPOTENCY
 
 create table if not exists public.epsilon_submissions (
     id uuid primary key default gen_random_uuid(),
@@ -2836,7 +4165,7 @@ create index if not exists idx_epsilon_submissions_tenant
 on public.epsilon_submissions (tenant_id);
 
 
--- 16.5 GUARDS: A FROZEN INVOICE IS A FISCAL DOCUMENT
+-- 27A.5 GUARDS: A FROZEN INVOICE IS A FISCAL DOCUMENT
 -- Only status/payment/Epsilon fields may still change.
 -- Corrections are made with a credit note.
 -- Intended side effect: a tenant with issued invoices cannot be
@@ -2865,6 +4194,12 @@ begin
 
     if (to_jsonb(old) - v_allowed) is distinct from (to_jsonb(new) - v_allowed) then
         raise exception 'invoice % is issued: financial fields cannot be changed (use a credit note)', old.id;
+    end if;
+
+    -- An issued invoice is a fiscal document: it is corrected with a
+    -- credit note, never voided or cancelled by a status change.
+    if new.status in ('void', 'cancelled') and old.status not in ('void', 'cancelled') then
+        raise exception 'invoice % is issued: use a credit note instead of voiding it', old.id;
     end if;
 
     return new;
@@ -2912,7 +4247,7 @@ before insert or update or delete on public.invoice_lines
 for each row execute function platform.invoice_lines_guard_locked();
 
 
--- 16.6 ENQUEUE: VALIDATE, FREEZE, QUEUE (idempotent)
+-- 27A.6 ENQUEUE: VALIDATE, FREEZE, QUEUE (idempotent)
 
 create or replace function platform.epsilon_enqueue_invoice(
     p_invoice_id uuid,
@@ -2935,6 +4270,8 @@ declare
     v_sum_disc numeric;
     v_sum_vat numeric;
     v_corr_mark text;
+    v_orig_total numeric;
+    v_credited numeric;
     v_snap jsonb;
     v_snap_id uuid;
     v_version int;
@@ -2964,9 +4301,31 @@ begin
 
     if v_inv.locked_at is null then
 
-        if v_inv.status not in ('open', 'paid') then
-            raise exception 'invoice % has status %: only open or paid invoices can be issued',
+        if v_inv.status <> 'draft' then
+            raise exception 'invoice % has status %: only draft invoices can be issued',
                 p_invoice_id, v_inv.status;
+        end if;
+
+        if v_inv.document_type = 'invoice' and v_inv.due_at is null then
+            raise exception 'invoice %: due_at is required', p_invoice_id;
+        end if;
+
+        -- ---- subscription term (cancellation per end of month) ----
+        if v_inv.subscription_id is not null
+           and v_inv.document_type = 'invoice' then
+
+            if exists (
+                select 1
+                from public.subscriptions s
+                where s.id = v_inv.subscription_id
+                  and s.cancel_effective_at is not null
+                  and v_inv.period_end >= (
+                      s.cancel_effective_at at time zone platform.billing_timezone()
+                  )::date
+            ) then
+                raise exception 'invoice %: the subscription is cancelled before the end of the invoice period', p_invoice_id;
+            end if;
+
         end if;
 
         -- ---- billing customer ----
@@ -2994,13 +4353,35 @@ begin
         );
 
         if v_inv.document_type = 'credit_note' then
-            select i.epsilon_mark into v_corr_mark
+            select i.epsilon_mark, i.total_amount
+            into v_corr_mark, v_orig_total
             from public.invoices i
-            where i.id = v_inv.credited_invoice_id;
+            where i.id = v_inv.credited_invoice_id
+              and i.tenant_id = v_inv.tenant_id
+              and i.document_type = 'invoice'
+              and i.locked_at is not null;
+
+            if not found then
+                raise exception 'credit note %: the original invoice does not exist, is not an issued invoice, or belongs to another tenant', p_invoice_id;
+            end if;
 
             if v_corr_mark is null then
                 raise exception 'credit note %: the original invoice has no MARK yet', p_invoice_id;
             end if;
+
+            select coalesce(sum(c.total_amount), 0)
+            into v_credited
+            from public.invoices c
+            where c.credited_invoice_id = v_inv.credited_invoice_id
+              and c.id <> v_inv.id
+              and c.locked_at is not null
+              and c.status not in ('void', 'cancelled');
+
+            if v_credited + v_inv.total_amount > v_orig_total then
+                raise exception 'credit note %: total credited (%) would exceed the original invoice total (%)',
+                    p_invoice_id, v_credited + v_inv.total_amount, v_orig_total;
+            end if;
+
             v_inv.epsilon_correlated_mark := v_corr_mark;
         end if;
 
@@ -3043,6 +4424,9 @@ begin
         end if;
 
         -- ---- freeze ----
+        v_inv.status := 'issued';
+        v_inv.issued_at := coalesce(v_inv.issued_at, now());
+
         v_snap := jsonb_build_object(
             'schema_version', 1,
             'invoice', to_jsonb(v_inv),
@@ -3064,6 +4448,8 @@ begin
         set
             locked_at = now(),
             snapshot_id = v_snap_id,
+            status = v_inv.status,
+            issued_at = v_inv.issued_at,
             epsilon_status = 'queued',
             mydata_document_type = v_inv.mydata_document_type,
             epsilon_correlated_mark = v_inv.epsilon_correlated_mark
@@ -3121,7 +4507,7 @@ end;
 $$;
 
 
--- 16.7 CLAIM WORK (parallel workers are safe)
+-- 27A.7 CLAIM WORK (parallel workers are safe)
 
 create or replace function platform.epsilon_claim_submissions(
     p_worker text,
@@ -3152,7 +4538,7 @@ as $$
 $$;
 
 
--- 16.8 STUCK IN-FLIGHT: NEVER RETRY AUTOMATICALLY
+-- 27A.8 STUCK IN-FLIGHT: NEVER RETRY AUTOMATICALLY
 -- The call may have succeeded at Epsilon without the result being
 -- recorded; an automatic retry could create a second fiscal document.
 
@@ -3188,7 +4574,7 @@ end;
 $$;
 
 
--- 16.9 RECORD THE RESULT OF AN API CALL
+-- 27A.9 RECORD THE RESULT OF AN API CALL
 
 create or replace function platform.epsilon_record_result(
     p_submission_id uuid,
@@ -3323,7 +4709,7 @@ end;
 $$;
 
 
--- 16.10 LATER STATUS UPDATE (polling / webhook): UID, MARK, rejection
+-- 27A.10 LATER STATUS UPDATE (polling / webhook): UID, MARK, rejection
 
 create or replace function platform.epsilon_apply_status(
     p_invoice_id uuid,
@@ -3382,10 +4768,178 @@ end;
 $$;
 
 
+
+
 -- =====================================================
--- 17. MIGRATION REGISTRATION
+-- 28. COMMENTS
 -- =====================================================
 
-insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('012_commerce_engine', 'REV1', false)
-on conflict (migration_name) do nothing;
+comment on table public.product_plans is
+    'Commerce subscription plan catalog. Physical products and inventory are not owned here.';
+
+comment on table public.plan_pricing is
+    'Historical and future commercial pricing for subscription plans.';
+
+comment on table public.feature_entitlements is
+    'Feature entitlements attached to subscription plans.';
+
+comment on table public.upsell_rules is
+    'Commercial subscription upgrade recommendation rules.';
+
+comment on column public.subscriptions.plan_id is
+    'Commercial subscription plan reference owned by Commerce 012; subscription identity remains owned by Core SaaS 002.';
+
+comment on table public.billing_customers is
+    'Fiscal billing identity a tenant is invoiced under. Epsilon matches customers on VAT number.';
+
+comment on table public.invoices is
+    'Commercial invoice SSOT (incl. credit notes). Supabase decides what is invoiced; Epsilon issues the official e-invoice towards AADE/myDATA.';
+
+comment on table public.invoice_lines is
+    'Commercial invoice line items with VAT and myDATA classification. Immutable once the invoice is issued.';
+
+comment on table public.discount_codes is
+    'Commercial discount definitions. Customer-account discount ownership remains outside Commerce.';
+
+comment on table public.discount_redemptions is
+    'Immutable commercial record of discounts applied to invoices/subscriptions.';
+
+comment on table public.billing_item_mappings is
+    'Plan to Epsilon item code and myDATA classification mapping. Confirmed by the accountant; not seeded.';
+
+comment on table public.invoice_snapshots is
+    'Immutable snapshot of an invoice as frozen for Epsilon. Insert-only.';
+
+comment on table public.epsilon_submissions is
+    'Epsilon e-invoicing outbox: API tracking, retries and idempotency keys.';
+
+comment on function public.commerce_change_subscription_plan(uuid, uuid) is
+    'Changes the commercial plan of a tenant subscription.';
+
+comment on function public.commerce_apply_discount_to_invoice(uuid, text) is
+    'Validates and applies a Commerce discount to a draft invoice, distributing it over the lines and recomputing VAT.';
+
+comment on function platform.epsilon_enqueue_invoice(uuid, text) is
+    'Validates, freezes (snapshot + lock) and queues an invoice for Epsilon. Idempotent. Backend only.';
+
+comment on view public.v_subscription_overview is
+    'Read-only commerce view combining subscription, plan and currently effective pricing.';
+
+
+-- =====================================================
+-- 29. EXECUTE PRIVILEGES
+-- =====================================================
+--
+-- SECURITY DEFINER functions are explicitly granted only
+-- to authenticated users. Authorization is enforced inside
+-- the functions.
+--
+-- NOTE: the platform.epsilon_* functions (27A) are backend-only
+-- and are intentionally NOT granted here; final execution
+-- privileges are owned by 022 (service_role only).
+-- =====================================================
+
+revoke all
+on function public.commerce_domain(text, jsonb)
+from public;
+
+grant execute
+on function public.commerce_domain(text, jsonb)
+to authenticated;
+
+
+revoke all
+on function public.commerce_change_subscription_plan(uuid, uuid)
+from public;
+
+grant execute
+on function public.commerce_change_subscription_plan(uuid, uuid)
+to authenticated;
+
+
+revoke all
+on function public.commerce_compute_discount_amount(text, numeric, numeric)
+from public;
+
+grant execute
+on function public.commerce_compute_discount_amount(text, numeric, numeric)
+to authenticated;
+
+
+revoke all
+on function public.commerce_find_usable_discount_code(text, uuid)
+from public;
+
+grant execute
+on function public.commerce_find_usable_discount_code(text, uuid)
+to authenticated;
+
+
+revoke all
+on function public.commerce_apply_discount_to_invoice(uuid, text)
+from public;
+
+grant execute
+on function public.commerce_apply_discount_to_invoice(uuid, text)
+to authenticated;
+
+
+revoke all
+on function public.commerce_cancel_subscription(text)
+from public;
+
+grant execute
+on function public.commerce_cancel_subscription(text)
+to authenticated;
+
+
+revoke all
+on function public.commerce_undo_cancel_subscription()
+from public;
+
+grant execute
+on function public.commerce_undo_cancel_subscription()
+to authenticated;
+
+
+revoke all
+on function public.commerce_create_subscription(uuid, uuid, text)
+from public;
+
+grant execute
+on function public.commerce_create_subscription(uuid, uuid, text)
+to authenticated;
+
+
+-- =====================================================
+-- 30. MIGRATION REGISTRATION
+-- =====================================================
+
+insert into platform.schema_migrations (
+    migration_name,
+    version,
+    rollback_available
+)
+values (
+    '012_commerce_engine',
+    'REV2',
+    false
+)
+on conflict (migration_name)
+do update
+set
+    version = excluded.version,
+    rollback_available = excluded.rollback_available;
+
+
+-- =====================================================
+-- END 012 COMMERCE ENGINE
+--
+-- COMMERCE ONLY
+--
+-- Logistics     -> 011
+-- Device/BOM    -> 010
+-- Inventory     -> 018
+-- Customer/CRM  -> 003
+-- Payment exec  -> 000
+-- =====================================================

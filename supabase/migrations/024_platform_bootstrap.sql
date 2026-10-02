@@ -1,6 +1,6 @@
 -- =====================================================
 -- REV1 GREENFIELD BASELINE
--- 023_PLATFORM_BOOTSTRAP.SQL
+-- 024_PLATFORM_BOOTSTRAP.SQL
 -- =====================================================
 --
 -- Mandatory production gate — runs after full domain stack (002–022)
@@ -439,10 +439,10 @@ end $$;
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('023_platform_bootstrap', 'REV1', false)
+values ('024_platform_bootstrap', 'REV1', false)
 on conflict (migration_name) do nothing;
 
 
 -- =====================================================
--- END 023 PLATFORM BOOTSTRAP FINALE
+-- END 024 PLATFORM BOOTSTRAP FINALE
 -- =====================================================

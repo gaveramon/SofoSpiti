@@ -1,5 +1,5 @@
 -- ============================================================
--- SUPABASE FUNCTIONAL HEALTHCHECK SUPPORT  (HARDENED)
+-- 026 SUPABASE FUNCTIONAL HEALTHCHECK SUPPORT  (HARDENED)
 -- ============================================================
 --
 -- Only ONE identity may use this schema, the storage bucket and
