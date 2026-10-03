@@ -1,13 +1,13 @@
 -- =====================================================
 -- REV1 GREENFIELD BASELINE
--- 019_SECURITY_CLASSIFICATION.SQL
+-- 020_SECURITY_CLASSIFICATION.SQL
 -- =====================================================
 --
 -- SECURITY REGISTRY INPUT
 -- =====================================================
 --
 --
--- 020 OWNS
+-- 021 OWNS
 -- ---------
 -- - INPUT FOR API, SECURITY HARDENING AND GRANTS/REVOKES
 
@@ -2490,7 +2490,7 @@ on conflict (
 -- =====================================================
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
-values ( '019_security_classification', 'REV1', false)
+values ( '020_security_classification', 'REV1', false)
 on conflict (migration_name) do nothing;
 
 

@@ -1,6 +1,6 @@
 -- =====================================================
 -- REV1 GREENFIELD BASELINE 
--- 018_EDGE_RPC_FOUNDATION.SQL
+-- 019_EDGE_RPC_FOUNDATION.SQL
 -- =====================================================
 --
 -- Consolidated / hardened API foundation
@@ -2344,10 +2344,10 @@ $$;
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name,version,rollback_available)
-values ('018_edge_rpc_foundation','REV1',false)
+values ('019_edge_rpc_foundation','REV1',false)
 on conflict (migration_name) do nothing;
 
 
 -- =====================================================
--- END 018 EDGE RPC FOUNDATION
+-- END 019 EDGE RPC FOUNDATION
 -- =====================================================

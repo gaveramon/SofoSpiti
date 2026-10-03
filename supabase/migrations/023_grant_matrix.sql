@@ -1,6 +1,6 @@
 -- =====================================================
 -- REV2 GREENFIELD BASELINE
--- 022_GRANT_MATRIX.SQL
+-- 023_GRANT_MATRIX.SQL
 -- =====================================================
 --
 -- ENTERPRISE SECURITY GRANT BOUNDARY
@@ -27,7 +27,7 @@
 -- platform.security_actor
 -- platform.security_table_actor
 --
--- 022 OWNS
+-- 023 OWNS
 -- ----------
 -- PostgreSQL privilege boundary
 -- schema privileges
@@ -39,7 +39,7 @@
 -- security registry protection
 -- final grant validation
 --
--- 022 DOES NOT OWN
+-- 023 DOES NOT OWN
 -- -----------------
 -- RLS creation
 -- RLS policies
@@ -112,22 +112,22 @@ begin
 
     if to_regclass('platform.security_actor') is null then
         raise exception
-            '022 prerequisite missing: platform.security_actor';
+            '023 prerequisite missing: platform.security_actor';
     end if;
 
     if to_regclass('platform.security_table_actor') is null then
         raise exception
-            '022 prerequisite missing: platform.security_table_actor';
+            '023 prerequisite missing: platform.security_table_actor';
     end if;
 
     if to_regclass('platform.security_table_registry') is null then
         raise exception
-            '022 prerequisite missing: platform.security_table_registry';
+            '023 prerequisite missing: platform.security_table_registry';
     end if;
 
     if to_regclass('platform.security_view_registry') is null then
         raise exception
-            '022 prerequisite missing: platform.security_view_registry';
+            '023 prerequisite missing: platform.security_view_registry';
     end if;
 
 end
@@ -156,7 +156,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: invalid actor privilege_profile';
+            '023 validation failed: invalid actor privilege_profile';
 
     end if;
 
@@ -189,7 +189,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: authenticated actor has direct table privilege profile';
+            '023 validation failed: authenticated actor has direct table privilege profile';
 
     end if;
 
@@ -460,7 +460,7 @@ begin
     if found then
 
         raise exception
-            '022 validation failed: invalid security_class for %.% (security_class=%)',
+            '023 validation failed: invalid security_class for %.% (security_class=%)',
             r.table_schema,
             r.table_name,
             coalesce(r.security_class, 'NULL');
@@ -491,7 +491,7 @@ begin
     if found then
 
         raise exception
-            '022 validation failed: business table without rpc portal_access: %.% (security_class=%, portal_access=%)',
+            '023 validation failed: business table without rpc portal_access: %.% (security_class=%, portal_access=%)',
             r.table_schema,
             r.table_name,
             r.security_class,
@@ -523,7 +523,7 @@ begin
     if found then
 
         raise exception
-            '022 validation failed: backend table with portal access: %.% (security_class=%, portal_access=%)',
+            '023 validation failed: backend table with portal access: %.% (security_class=%, portal_access=%)',
             r.table_schema,
             r.table_name,
             r.security_class,
@@ -552,7 +552,7 @@ begin
     if found then
 
         raise exception
-            '022 validation failed: direct authenticated access prohibited for %.% (security_class=%, portal_access=%, direct_authenticated_access=%)',
+            '023 validation failed: direct authenticated access prohibited for %.% (security_class=%, portal_access=%, direct_authenticated_access=%)',
             r.table_schema,
             r.table_name,
             r.security_class,
@@ -591,7 +591,7 @@ begin
         ) is null then
 
             raise exception
-                '022 validation failed: registered table %.% does not exist',
+                '023 validation failed: registered table %.% does not exist',
                 r.table_schema,
                 r.table_name;
 
@@ -661,7 +661,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: active table %.% has no active actor assignment',
+                '023 validation failed: active table %.% has no active actor assignment',
                 r.table_schema,
                 r.table_name;
 
@@ -698,7 +698,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: active table actor references inactive/missing table or actor';
+            '023 validation failed: active table actor references inactive/missing table or actor';
 
     end if;
 
@@ -757,7 +757,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: portal actor has direct table privilege profile';
+            '023 validation failed: portal actor has direct table privilege profile';
 
     end if;
 
@@ -785,7 +785,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: authenticated actor has direct table privilege profile';
+            '023 validation failed: authenticated actor has direct table privilege profile';
 
     end if;
 
@@ -1065,7 +1065,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: security_view_registry contains direct portal/authenticated access';
+            '023 validation failed: security_view_registry contains direct portal/authenticated access';
 
     end if;
 
@@ -1102,7 +1102,7 @@ begin
         ) is null then
 
             raise exception
-                '022 validation failed: registered view %.% does not exist',
+                '023 validation failed: registered view %.% does not exist',
                 r.view_schema,
                 r.view_name;
 
@@ -1348,7 +1348,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: anon has direct table access on %.%',
+                '023 validation failed: anon has direct table access on %.%',
                 r.schema_name,
                 r.relation_name;
 
@@ -1418,7 +1418,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: authenticated has direct table access on %.%',
+                '023 validation failed: authenticated has direct table access on %.%',
                 r.schema_name,
                 r.relation_name;
 
@@ -1463,7 +1463,7 @@ begin
         if to_regprocedure(required_function) is null then
 
             raise exception
-                '022 validation failed: approved API function missing: %',
+                '023 validation failed: approved API function missing: %',
                 required_function;
 
         end if;
@@ -1511,7 +1511,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: authenticated lacks EXECUTE on %',
+                '023 validation failed: authenticated lacks EXECUTE on %',
                 required_function;
 
         end if;
@@ -1637,7 +1637,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: unapproved authenticated EXECUTE privilege on %.%(%)',
+                '023 validation failed: unapproved authenticated EXECUTE privilege on %.%(%)',
                 r.schema_name,
                 r.function_name,
                 r.args;
@@ -1708,7 +1708,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: service_role missing SELECT on %.%',
+                '023 validation failed: service_role missing SELECT on %.%',
                 r.table_schema,
                 r.table_name;
 
@@ -1731,7 +1731,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: service_role missing INSERT on %.%',
+                '023 validation failed: service_role missing INSERT on %.%',
                 r.table_schema,
                 r.table_name;
 
@@ -1753,7 +1753,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: service_role missing UPDATE on %.%',
+                '023 validation failed: service_role missing UPDATE on %.%',
                 r.table_schema,
                 r.table_name;
 
@@ -1772,7 +1772,7 @@ begin
         ) then
 
             raise exception
-                '022 validation failed: service_role missing DELETE on %.%',
+                '023 validation failed: service_role missing DELETE on %.%',
                 r.table_schema,
                 r.table_name;
 
@@ -1805,7 +1805,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: business table violates API/RPC-only boundary';
+            '023 validation failed: business table violates API/RPC-only boundary';
 
     end if;
 
@@ -1832,7 +1832,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: backend table is portal accessible';
+            '023 validation failed: backend table is portal accessible';
 
     end if;
 
@@ -1846,7 +1846,7 @@ $$;
 --
 -- 020 owns the actual RLS implementation.
 --
--- 022 only validates that PostgreSQL state matches
+-- 023 only validates that PostgreSQL state matches
 -- security_table_registry.
 --
 -- =====================================================
@@ -1876,7 +1876,7 @@ begin
         if r.rls_required is distinct from r.relrowsecurity then
 
             raise exception
-                '022 validation failed: RLS mismatch on %.% expected %, actual %',
+                '023 validation failed: RLS mismatch on %.% expected %, actual %',
                 r.table_schema,
                 r.table_name,
                 r.rls_required,
@@ -1888,7 +1888,7 @@ begin
         if r.force_rls_required is distinct from r.relforcerowsecurity then
 
             raise exception
-                '022 validation failed: FORCE RLS mismatch on %.% expected %, actual %',
+                '023 validation failed: FORCE RLS mismatch on %.% expected %, actual %',
                 r.table_schema,
                 r.table_name,
                 r.force_rls_required,
@@ -1916,7 +1916,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: service_role lacks USAGE on public schema';
+            '023 validation failed: service_role lacks USAGE on public schema';
 
     end if;
 
@@ -1928,7 +1928,7 @@ begin
     ) then
 
         raise exception
-            '022 validation failed: service_role lacks USAGE on platform schema';
+            '023 validation failed: service_role lacks USAGE on platform schema';
 
     end if;
 
@@ -1949,7 +1949,7 @@ values (
     'security.grant_boundary.applied',
     'rev22_migration',
     jsonb_build_object(
-        'version', 'REV2.GRANT.MATRIX.022',
+        'version', 'REV2.GRANT.MATRIX.023',
         'model', 'actor_registry_driven',
         'privilege_source', 'security_actor.privilege_profile',
         'table_assignment_source', 'security_table_actor',
@@ -1975,7 +1975,7 @@ values (
 -- =====================================================
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
-values ( '022_grant_matrix', 'REV1', false)
+values ( '023_grant_matrix', 'REV1', false)
 on conflict (migration_name) do nothing;
 
 

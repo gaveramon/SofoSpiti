@@ -155,10 +155,18 @@ create table if not exists public.plan_pricing (
 
     effective_from timestamptz not null default now(),
 
+    effective_until timestamptz,
+
     created_at timestamptz not null default now(),
 
     constraint uq_plan_pricing_effective
         unique (plan_id, currency, effective_from),
+
+    constraint chk_plan_pricing_period
+        check (
+            effective_until is null
+            or effective_until > effective_from
+        ),
 
     constraint chk_plan_pricing_currency
         check (
@@ -185,6 +193,17 @@ create table if not exists public.plan_pricing (
         )
 );
 
+alter table public.plan_pricing
+add constraint ex_plan_pricing_no_overlap
+exclude using gist (
+    plan_id with =,
+    currency with =,
+    tstzrange(
+        effective_from,
+        coalesce(effective_until, 'infinity'::timestamptz),
+        '[)'
+    ) with &&
+);
 
 -- =====================================================
 -- 3. FEATURE ENTITLEMENTS
@@ -1600,6 +1619,80 @@ $$;
 
 
 -- =====================================================
+-- 19C. OVERDUE INVOICES
+-- =====================================================
+--
+-- Daily job (schedule outside this migration): issued/sent
+-- invoices past their due date become 'overdue'. Allowed on
+-- locked invoices (status is one of the fields that may still
+-- change). Credit notes are never overdue.
+-- =====================================================
+
+create or replace function platform.mark_overdue_invoices()
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_n int;
+begin
+
+    update public.invoices i
+    set status = 'overdue'
+    where i.document_type = 'invoice'
+      and i.status in ('issued', 'sent')
+      and i.due_at is not null
+      and i.due_at < now();
+
+    get diagnostics v_n = row_count;
+
+    return v_n;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 19D. TRIAL EXPIRY
+-- =====================================================
+--
+-- Hourly job (schedule outside this migration): a subscription in
+-- status 'trial' whose current_period_end has passed becomes
+-- 'trial_expired'. The end of the trial is current_period_end
+-- (002 has no separate trial column).
+--
+-- A trial without current_period_end never expires: whoever
+-- creates a trial subscription must set it.
+-- Converting a trial to a paid subscription (status 'active')
+-- before the end date is done elsewhere and is not touched here.
+-- =====================================================
+
+-- create or replace function platform.expire_trial_subscriptions()
+-- returns int
+-- language plpgsql
+-- security definer
+-- set search_path = ''
+-- as $$
+-- declare
+--     v_n int;
+-- begin
+
+--     update public.subscriptions s
+--     set status = 'trial_expired'
+--     where s.status = 'trial'
+--       and s.current_period_end is not null
+--       and s.current_period_end <= now();
+
+--     get diagnostics v_n = row_count;
+
+--     return v_n;
+
+-- end;
+-- $$;
+
+
+-- =====================================================
 -- 20. DISCOUNT CALCULATION
 -- =====================================================
 
@@ -2541,6 +2634,7 @@ begin
         -- active, trial or past_due. A cancellation requested for the
         -- end of the month keeps the status 'active' until the
         -- end-of-month job sets 'cancelled'.
+        -- A trial past current_period_end is not entitled either.
         -- Otherwise is_entitled = false and features = {}.
         -- =================================================
 
@@ -2553,7 +2647,7 @@ begin
             end if;
 
             -- Best subscription: entitled statuses first.
-            select s.id, s.plan_id, s.status, s.cancel_effective_at
+            select s.id, s.plan_id, s.status, s.cancel_effective_at, s.current_period_end
             into v_row
             from public.subscriptions s
             where s.tenant_id = v_tid
@@ -2576,6 +2670,11 @@ begin
                 and (
                     v_row.cancel_effective_at is null
                     or v_row.cancel_effective_at > now()
+                )
+                and not (
+                    v_row.status = 'trial'
+                    and v_row.current_period_end is not null
+                    and v_row.current_period_end <= now()
                 );
 
             if v_row.id is null then
