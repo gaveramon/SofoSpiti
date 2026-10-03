@@ -1,8 +1,18 @@
 -- ============================================================
--- REV22 GREENFIELD BASELINE
+-- REV23 GREENFIELD BASELINE
 -- 002_core_saas.sql
 --
 -- Consolidated Core SaaS SSOT
+--
+-- REV23 (SSOT split 002 <-> 012):
+--   002 owns the PLAN (subscription type) and the SUBSCRIPTION
+--   INSTANCE: which plan a tenant has, its status, its term and
+--   its lifecycle (trial expiry, end-of-month cancellation).
+--   012 owns everything that has a PRICE: plan prices, discount
+--   policy, customer-account discount tiers, applied-discount
+--   history, invoices.
+--   002 never stores a price or a discount; 012 never stores
+--   plan identity or subscription state.
 --
 -- ============================================================
 -- ARCHITECTURAL RULES
@@ -16,7 +26,8 @@
 --   public.tenants
 --   public.tenant_memberships
 --   public.service_accounts
---   public.subscriptions
+--   public.product_plans        (plan / subscription type)
+--   public.subscriptions        (subscription instance)
 --
 -- Customer-account model:
 --
@@ -254,7 +265,44 @@ create table if not exists public.service_accounts (
 
 
 -- =====================================================
--- 5. SUBSCRIPTIONS (COMMERCIAL STATE ONLY)
+-- 4B. PRODUCT PLANS (PLAN / SUBSCRIPTION TYPE)
+-- =====================================================
+--
+-- A plan is the TYPE of subscription a tenant can have:
+-- name, tier, whether it is sellable and which plan is the
+-- default for new tenants.
+--
+-- What a plan COSTS (plan_pricing), which features it grants
+-- (feature_entitlements) and upsell rules belong to Commerce
+-- (012) and reference this table. 002 does not know prices.
+--
+-- This is NOT a physical product catalog.
+-- =====================================================
+
+create table if not exists public.product_plans (
+    id uuid primary key default gen_random_uuid(),
+
+    name text not null,
+
+    description text,
+
+    tier public.subscription_tier not null,
+
+    is_active boolean not null default true,
+
+    is_default boolean not null default false,
+
+    created_at timestamptz not null default now(),
+
+    updated_at timestamptz not null default now(),
+
+    constraint chk_product_plans_name_nonempty
+        check (btrim(name) <> '')
+);
+
+
+-- =====================================================
+-- 5. SUBSCRIPTIONS (SUBSCRIPTION INSTANCE)
 -- =====================================================
 --
 -- Subscription ownership remains tenant-based.
@@ -265,25 +313,34 @@ create table if not exists public.service_accounts (
 -- The relationship is:
 --
 --   customer_account
---       ↓
+--       |
 --   tenant
---       ↓
---   subscription
+--       |
+--   subscription  --> product_plans (which plan)
 --
--- Commerce can therefore aggregate all subscriptions belonging
--- to the same customer account without making the subscription
--- itself responsible for customer ownership.
+-- A subscription row is the INSTANCE: which plan the tenant has,
+-- its status, its term (current_period_*) and its cancellation
+-- state.
 --
--- This is important for future volume pricing:
+-- Commerce can aggregate all subscriptions belonging to the same
+-- customer account without making the subscription itself
+-- responsible for customer ownership.
 --
 --   Customer A
---       Tenant 1 → Pro
---       Tenant 2 → Pro
---       Tenant 3 → Pro
+--       Tenant 1 -> Pro
+--       Tenant 2 -> Pro
+--       Tenant 3 -> Pro
 --
--- Commerce can determine the applicable price for each tenant.
+-- 002 does NOT calculate or store prices or discounts.
+-- The discount that was actually applied is recorded by
+-- Commerce (012: applied_discounts).
 --
--- 002 does NOT calculate or store discounts.
+-- Cancellation is per end of month only:
+--   cancel_requested_at  when the customer asked
+--   cancel_effective_at  first instant of the next month
+--                        (platform.billing_timezone())
+--   status stays 'active' until the end-of-month job
+--   platform.expire_cancelled_subscriptions() sets 'cancelled'.
 -- =====================================================
 
 create table if not exists public.subscriptions (
@@ -293,6 +350,10 @@ create table if not exists public.subscriptions (
         references public.tenants(id)
         on delete cascade,
 
+    plan_id uuid
+        references public.product_plans(id)
+        on delete restrict,
+
     tier public.subscription_tier not null,
 
     status public.subscription_status not null default 'trial',
@@ -300,6 +361,12 @@ create table if not exists public.subscriptions (
     current_period_start timestamptz,
 
     current_period_end timestamptz,
+
+    cancel_requested_at timestamptz,
+
+    cancel_effective_at timestamptz,
+
+    cancel_reason text,
 
     created_at timestamptz not null default now(),
 
@@ -311,8 +378,55 @@ create table if not exists public.subscriptions (
     -- Without this constraint, get_subscription() and
     -- update_subscription() could operate on multiple rows,
     -- which would violate the SSOT model.
-    unique (tenant_id)
+    unique (tenant_id),
+
+    constraint chk_subscriptions_cancellation
+        check (
+            (cancel_requested_at is null and cancel_effective_at is null)
+            or (
+                cancel_requested_at is not null
+                and cancel_effective_at is not null
+                and cancel_effective_at > cancel_requested_at
+            )
+        )
 );
+
+
+-- Re-runnable on a database that already has the pre-REV23 table.
+alter table public.subscriptions
+    add column if not exists plan_id uuid,
+    add column if not exists cancel_requested_at timestamptz,
+    add column if not exists cancel_effective_at timestamptz,
+    add column if not exists cancel_reason text;
+
+do $$
+begin
+    alter table public.subscriptions
+        add constraint fk_subscriptions_plan
+        foreign key (plan_id)
+        references public.product_plans(id)
+        on delete restrict;
+exception
+    when duplicate_object then null;
+end;
+$$;
+
+do $$
+begin
+    alter table public.subscriptions
+        add constraint chk_subscriptions_cancellation
+        check (
+            (cancel_requested_at is null and cancel_effective_at is null)
+            or (
+                cancel_requested_at is not null
+                and cancel_effective_at is not null
+                and cancel_effective_at > cancel_requested_at
+            )
+        );
+exception
+    when duplicate_object then null;
+end;
+$$;
 
 
 -- =====================================================
@@ -393,6 +507,32 @@ on public.service_accounts (
     tenant_id,
     created_at desc
 );
+
+
+-- -----------------------------------------------------
+-- Plans and subscriptions.
+-- -----------------------------------------------------
+
+create unique index if not exists uq_product_plans_name_ci
+on public.product_plans (lower(name));
+
+-- At most one default plan (used for new tenants).
+create unique index if not exists uq_product_plans_default
+on public.product_plans (is_default)
+where is_default = true;
+
+create index if not exists idx_subscriptions_plan
+on public.subscriptions (plan_id);
+
+-- End-of-month cancellation job.
+create index if not exists idx_subscriptions_cancel_effective
+on public.subscriptions (cancel_effective_at)
+where cancel_effective_at is not null;
+
+-- Trial expiry job.
+create index if not exists idx_subscriptions_trial_end
+on public.subscriptions (current_period_end)
+where status = 'trial';
 
 
 -- =====================================================
@@ -1547,10 +1687,14 @@ begin
             select
                 s.id,
                 s.tenant_id,
+                s.plan_id,
                 s.tier,
                 s.status,
                 s.current_period_start,
                 s.current_period_end,
+                s.cancel_requested_at,
+                s.cancel_effective_at,
+                s.cancel_reason,
                 s.created_at,
                 s.updated_at
             from public.subscriptions s
@@ -1606,10 +1750,14 @@ begin
         returning
             s.id,
             s.tenant_id,
+            s.plan_id,
             s.tier,
             s.status,
             s.current_period_start,
             s.current_period_end,
+            s.cancel_requested_at,
+            s.cancel_effective_at,
+            s.cancel_reason,
             s.created_at,
             s.updated_at
         into v_row;
@@ -2139,6 +2287,836 @@ comment on function platform.expire_trial_subscriptions() is
 
 
 -- =====================================================
+-- 14C. PLAN AND SUBSCRIPTION LIFECYCLE (002 SSOT)
+-- =====================================================
+--
+-- Everything that creates or changes a plan or a subscription
+-- instance lives here. Commerce (012) calls these functions
+-- from commerce_domain and from the invoice generator; it does
+-- not write public.product_plans or public.subscriptions itself.
+--
+-- These are internal functions: execution is revoked from
+-- public/anon/authenticated at the end of this section. They are
+-- reached through the API layer (commerce_api / auth_api wrappers),
+-- which performs the role check.
+-- =====================================================
+
+-- Month boundaries of the cancellation are evaluated here.
+create or replace function platform.billing_timezone()
+returns text
+language sql
+immutable
+set search_path = ''
+as $$
+    select 'Europe/Athens'::text;
+$$;
+
+
+-- -----------------------------------------------------
+-- Invariants
+-- -----------------------------------------------------
+
+-- Active subscription states require a plan.
+create or replace function public.enforce_subscription_plan_required()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+
+    -- subscription_status enum: trial (not 'trialing').
+    if new.status in ('active', 'trial', 'past_due')
+       and new.plan_id is null then
+
+        raise exception
+            'subscription plan_id is required for status %',
+            new.status;
+
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+-- The tier follows the plan.
+create or replace function public.sync_subscription_tier_from_plan()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_tier public.subscription_tier;
+begin
+
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    new.tier := v_tier;
+
+    return new;
+
+end;
+$$;
+
+
+create or replace function public.prevent_subscription_tier_drift()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_tier public.subscription_tier;
+begin
+
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    if new.tier <> v_tier then
+        raise exception
+            'subscription tier must match product plan tier';
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+-- Once a plan is used by subscriptions its tier is immutable.
+-- Create a new plan instead.
+create or replace function public.prevent_product_plan_tier_change()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+
+    if new.tier is distinct from old.tier
+       and exists (
+            select 1
+            from public.subscriptions s
+            where s.plan_id = old.id
+       )
+    then
+
+        raise exception
+            'product plan tier cannot change after the plan has been used by subscriptions';
+
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+drop trigger if exists trg_product_plan_tier_immutable
+on public.product_plans;
+
+create trigger trg_product_plan_tier_immutable
+before update on public.product_plans
+for each row
+execute function public.prevent_product_plan_tier_change();
+
+
+-- Trigger order matters (BEFORE triggers fire alphabetically):
+-- the tier is first derived from the plan (01), then checked (02).
+-- The pre-REV23 names are dropped so they cannot fire in the wrong order.
+drop trigger if exists trg_subscriptions_sync_tier_from_plan
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_prevent_tier_drift
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_plan_required
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_01_sync_tier_from_plan
+on public.subscriptions;
+
+create trigger trg_subscriptions_01_sync_tier_from_plan
+before insert or update of plan_id
+on public.subscriptions
+for each row
+execute function public.sync_subscription_tier_from_plan();
+
+
+drop trigger if exists trg_subscriptions_02_prevent_tier_drift
+on public.subscriptions;
+
+create trigger trg_subscriptions_02_prevent_tier_drift
+before insert or update
+on public.subscriptions
+for each row
+execute function public.prevent_subscription_tier_drift();
+
+
+drop trigger if exists trg_subscriptions_03_plan_required
+on public.subscriptions;
+
+create trigger trg_subscriptions_03_plan_required
+before insert or update
+on public.subscriptions
+for each row
+execute function public.enforce_subscription_plan_required();
+
+
+-- -----------------------------------------------------
+-- Plan administration (platform admin)
+-- -----------------------------------------------------
+
+create or replace function public.subscription_plan_create(
+    p_payload jsonb
+)
+returns public.product_plans
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+    v_default boolean;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    v_default := coalesce((p_payload->>'is_default')::boolean, false);
+
+    -- Only one default plan: release the old one first.
+    if v_default then
+        update public.product_plans
+        set is_default = false
+        where is_default = true;
+    end if;
+
+    insert into public.product_plans (
+        name,
+        description,
+        tier,
+        is_active,
+        is_default
+    )
+    values (
+        btrim(p_payload->>'name'),
+        p_payload->>'description',
+        (p_payload->>'tier')::public.subscription_tier,
+        coalesce((p_payload->>'is_active')::boolean, true),
+        v_default
+    )
+    returning *
+    into v_plan;
+
+    perform platform.log_audit(
+        'product_plan.created',
+        'product_plan',
+        v_plan.id
+    );
+
+    return v_plan;
+
+end;
+$$;
+
+
+create or replace function public.subscription_plan_update(
+    p_payload jsonb
+)
+returns public.product_plans
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_id uuid;
+    v_plan public.product_plans%rowtype;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    v_id := (p_payload->>'id')::uuid;
+
+    if p_payload ? 'is_default'
+       and coalesce((p_payload->>'is_default')::boolean, false) then
+
+        update public.product_plans
+        set is_default = false
+        where is_default = true
+          and id <> v_id;
+
+    end if;
+
+    update public.product_plans pp
+    set
+        name = case
+            when p_payload ? 'name' then btrim(p_payload->>'name')
+            else pp.name
+        end,
+
+        description = case
+            when p_payload ? 'description' then p_payload->>'description'
+            else pp.description
+        end,
+
+        tier = case
+            when p_payload ? 'tier'
+                then (p_payload->>'tier')::public.subscription_tier
+            else pp.tier
+        end,
+
+        is_active = case
+            when p_payload ? 'is_active'
+                then (p_payload->>'is_active')::boolean
+            else pp.is_active
+        end,
+
+        is_default = case
+            when p_payload ? 'is_default'
+                then (p_payload->>'is_default')::boolean
+            else pp.is_default
+        end
+
+    where pp.id = v_id
+    returning *
+    into v_plan;
+
+    if not found then
+        raise exception 'product plan not found';
+    end if;
+
+    perform platform.log_audit(
+        'product_plan.updated',
+        'product_plan',
+        v_plan.id,
+        p_payload - 'id'
+    );
+
+    return v_plan;
+
+end;
+$$;
+
+
+-- A plan that is still referenced anywhere (subscriptions here;
+-- invoice lines, upsell rules, discount codes in 012) cannot be
+-- deleted: the foreign keys are ON DELETE RESTRICT. Deactivate it.
+create or replace function public.subscription_plan_delete(
+    p_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_name text;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    begin
+
+        delete from public.product_plans pp
+        where pp.id = p_id
+        returning pp.name
+        into v_name;
+
+    exception
+        when foreign_key_violation then
+            raise exception
+                'plan is still in use (subscriptions, invoice lines, upsell rules or discount codes); deactivate it instead';
+    end;
+
+    if not found then
+        raise exception 'product plan not found';
+    end if;
+
+    perform platform.log_audit(
+        'product_plan.deleted',
+        'product_plan',
+        p_id,
+        jsonb_build_object('name', v_name)
+    );
+
+    return jsonb_build_object('id', p_id, 'deleted', true);
+
+end;
+$$;
+
+
+-- -----------------------------------------------------
+-- Subscription creation and provisioning
+-- -----------------------------------------------------
+
+create or replace function public.subscription_create(
+    p_tenant_id uuid,
+    p_plan_id uuid,
+    p_status text default 'active'
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
+begin
+
+    if not public.is_platform_admin()
+       and platform.current_tenant_id() is distinct from p_tenant_id then
+        raise exception 'tenant context mismatch';
+    end if;
+
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception 'active product plan not found';
+    end if;
+
+    -- Exactly one subscription per tenant (provisioned when the
+    -- tenant is created). Use subscription_change_plan to switch.
+    if exists (
+        select 1
+        from public.subscriptions s
+        where s.tenant_id = p_tenant_id
+    ) then
+        raise exception
+            'tenant already has a subscription; use change_subscription_plan';
+    end if;
+
+    insert into public.subscriptions (
+        tenant_id,
+        plan_id,
+        tier,
+        status
+    )
+    values (
+        p_tenant_id,
+        v_plan.id,
+        v_plan.tier,
+        p_status::public.subscription_status
+    )
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.created',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
+end;
+$$;
+
+
+-- Every tenant gets its subscription when it is created.
+-- The default plan must already exist (seed it before the first tenant).
+create or replace function public.provision_default_subscription()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+begin
+
+    select *
+    into v_plan
+    from public.product_plans
+    where is_default = true
+      and is_active = true
+    limit 1;
+
+    if not found then
+        raise exception
+            'cannot provision tenant subscription: no active default product plan exists';
+    end if;
+
+    insert into public.subscriptions (
+        tenant_id,
+        plan_id,
+        tier,
+        status
+    )
+    values (
+        new.id,
+        v_plan.id,
+        v_plan.tier,
+        'active'
+    );
+
+    return new;
+
+end;
+$$;
+
+
+drop trigger if exists trg_tenants_provision_default_subscription
+on public.tenants;
+
+create trigger trg_tenants_provision_default_subscription
+after insert on public.tenants
+for each row
+execute function public.provision_default_subscription();
+
+
+-- -----------------------------------------------------
+-- Plan change
+-- -----------------------------------------------------
+
+create or replace function public.subscription_change_plan(
+    p_subscription_id uuid,
+    p_plan_id uuid
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception 'active product plan not found';
+    end if;
+
+    select *
+    into v_subscription
+    from public.subscriptions s
+    where s.id = p_subscription_id
+      and s.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    -- tier follows the plan (trigger).
+    update public.subscriptions
+    set plan_id = v_plan.id
+    where id = v_subscription.id
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.plan_changed',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
+end;
+$$;
+
+
+-- -----------------------------------------------------
+-- Cancellation per end of month
+-- -----------------------------------------------------
+--
+-- The subscription stays 'active' (features and invoicing continue)
+-- until cancel_effective_at; then the job sets 'cancelled'.
+-- There is no mid-month cancellation.
+--
+-- Invoices are NOT touched here: 012 reacts to the state change
+-- (it cancels draft invoices past the end date and refuses to bill
+-- beyond it).
+-- -----------------------------------------------------
+
+create or replace function public.subscription_cancel(
+    p_reason text default null
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+    v_effective timestamptz;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_sub
+    from public.subscriptions s
+    where s.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.status not in ('active', 'trial', 'past_due') then
+        raise exception
+            'only an active, trial or past_due subscription can be cancelled (status: %)',
+            v_sub.status;
+    end if;
+
+    if v_sub.cancel_requested_at is not null then
+        raise exception
+            'cancellation was already requested (effective %)',
+            v_sub.cancel_effective_at;
+    end if;
+
+    -- First instant of next month in the billing time zone.
+    v_effective := (
+        date_trunc('month', timezone(platform.billing_timezone(), now()))
+        + interval '1 month'
+    ) at time zone platform.billing_timezone();
+
+    update public.subscriptions
+    set
+        cancel_requested_at = now(),
+        cancel_effective_at = v_effective,
+        cancel_reason = nullif(btrim(coalesce(p_reason, '')), '')
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    perform platform.log_audit(
+        'subscription.cancellation_requested',
+        'subscription',
+        v_sub.id,
+        jsonb_build_object('effective_at', v_effective)
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+create or replace function public.subscription_undo_cancel()
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_sub
+    from public.subscriptions s
+    where s.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.cancel_requested_at is null
+       or v_sub.cancel_effective_at <= now() then
+        raise exception 'there is no pending cancellation to undo';
+    end if;
+
+    update public.subscriptions
+    set
+        cancel_requested_at = null,
+        cancel_effective_at = null,
+        cancel_reason = null
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    perform platform.log_audit(
+        'subscription.cancellation_undone',
+        'subscription',
+        v_sub.id
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+-- Hourly job (027): the end-of-month moment has passed.
+create or replace function platform.expire_cancelled_subscriptions()
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_n int;
+begin
+
+    update public.subscriptions s
+    set status = 'cancelled'
+    where s.cancel_effective_at is not null
+      and s.cancel_effective_at <= now()
+      and s.status in ('active', 'trial', 'past_due');
+
+    get diagnostics v_n = row_count;
+
+    return v_n;
+
+end;
+$$;
+
+
+-- Subscriptions that may be billed for a service period: the
+-- single list the invoice generator must use.
+create or replace function platform.billable_subscriptions(
+    p_period_start date,
+    p_period_end date
+)
+returns setof public.subscriptions
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+    select s.*
+    from public.subscriptions s
+    where s.status in ('active', 'past_due')
+      and (
+          s.cancel_effective_at is null
+          or p_period_end < (
+              s.cancel_effective_at at time zone platform.billing_timezone()
+          )::date
+      );
+$$;
+
+
+-- -----------------------------------------------------
+-- Internal functions: no direct execution by API roles.
+-- -----------------------------------------------------
+
+revoke all on function public.subscription_plan_create(jsonb)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_plan_update(jsonb)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_plan_delete(uuid)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_create(uuid, uuid, text)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_change_plan(uuid, uuid)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_cancel(text)
+from public, anon, authenticated;
+
+revoke all on function public.subscription_undo_cancel()
+from public, anon, authenticated;
+
+revoke all on function platform.expire_cancelled_subscriptions()
+from public, anon, authenticated;
+
+revoke all on function platform.billable_subscriptions(date, date)
+from public, anon, authenticated;
+
+comment on table public.product_plans is
+    'Plan / subscription type (SSOT 002). Prices, entitlements and upsell rules belong to Commerce 012.';
+
+comment on column public.subscriptions.plan_id is
+    'Plan of this subscription instance (SSOT 002). Price of the plan is owned by Commerce 012.';
+
+comment on column public.subscriptions.cancel_effective_at is
+    'First instant of the month after the cancellation request (platform.billing_timezone()). Status becomes cancelled then.';
+
+comment on function platform.expire_cancelled_subscriptions() is
+    'Sets status cancelled once cancel_effective_at has passed. Called hourly by the cron engine (027).';
+
+comment on function platform.billable_subscriptions(date, date) is
+    'Subscriptions that may be invoiced for the period; excludes periods beyond cancel_effective_at.';
+
+
+-- =====================================================
 -- 15. INTEGRATIONS API AND EXTENSIONS
 -- =====================================================
 --
@@ -2452,6 +3430,15 @@ for each row
 execute function platform.set_updated_at();
 
 
+drop trigger if exists trg_product_plans_updated_at
+on public.product_plans;
+
+create trigger trg_product_plans_updated_at
+before update on public.product_plans
+for each row
+execute function platform.set_updated_at();
+
+
 -- =====================================================
 -- 17. FINAL FUNCTION SECURITY ATTRIBUTES
 --
@@ -2591,14 +3578,19 @@ is
 --   - tenant ownership relationship
 --   - tenant access
 --   - tenant lifecycle
---   - tenant subscription existence
+--   - plan / subscription type (product_plans)
+--   - subscription instance: which plan a tenant has, status,
+--     term (current_period_*), trial expiry, end-of-month
+--     cancellation state and its expiry job
 --
 -- 012 Commerce remains responsible for:
 --
---   - catalog pricing
---   - subscription pricing
---   - discounts
---   - volume pricing
+--   - normal plan prices (plan_pricing)
+--   - discount policy (discount codes)
+--   - customer-account discount tiers (tenant-count based)
+--   - the applied-discount history (applied_discounts)
+--   - feature entitlements, upsell rules
+--   - invoices, billing, e-invoicing
 --   - effective price calculation
 -- =====================================================
 
@@ -2615,6 +3607,7 @@ is
 --   platform.set_updated_at(...)
 --   platform.log_audit(...)
 --   platform.is_platform_admin(...)
+--   public.is_platform_admin(...)
 --
 --   public.edge_require_admin(...)
 --   public.edge_require_manager(...)
@@ -2654,7 +3647,11 @@ is
 
 insert into platform.schema_migrations ( migration_name, version, rollback_available)
 values ( '002_core_saas', 'REV1', false)
-on conflict (migration_name) do nothing;
+on conflict (migration_name)
+do update
+set
+    version = excluded.version,
+    rollback_available = excluded.rollback_available;
 
 
 -- =====================================================

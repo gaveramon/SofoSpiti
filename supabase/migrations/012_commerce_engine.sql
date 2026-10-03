@@ -1,66 +1,48 @@
 -- =====================================================
--- REV2 GREENFIELD BASELINE
+-- REV3 GREENFIELD BASELINE
 -- 012_COMMERCE_ENGINE.SQL
 -- =====================================================
 -- COMMERCE DOMAIN
--- 012 OWNS:
---   - subscription product plans
---   - plan pricing
---   - feature entitlements
---   - subscription <-> plan relationship
---   - subscription cancellation per end of month
---   - upsell rules
---   - billing customers (fiscal identity used on invoices)
---   - invoices (incl. credit notes)
---   - invoice lines
---   - discount codes
---   - discount redemptions
---   - Epsilon e-invoicing outbox, immutable invoice snapshots
---     and plan -> Epsilon item / myDATA classification mapping
+--
+-- SSOT SPLIT 002 <-> 012 (REV3)
+--
+--   002 CORE SaaS owns (identity and state, never a price):
+--     - customer accounts and tenants
+--     - plan / subscription type            (product_plans)
+--     - subscription instance               (subscriptions: plan,
+--       status, term, trial expiry, end-of-month cancellation
+--       state and its expiry job)
+--     - subscription provisioning and plan changes
+--
+--   012 COMMERCE owns (everything that has a price):
+--     - normal plan prices                  (plan_pricing)
+--     - discount policy                     (discount_codes)
+--     - customer-account discount tiers     (customer_account_discount_tiers:
+--       1 tenant = 0 %, 2 = x %, 3+ = y %)
+--     - applied discounts, historical snapshot (applied_discounts)
+--     - feature entitlements, upsell rules
+--     - billing customers, invoices, invoice lines
+--     - Epsilon e-invoicing outbox, immutable invoice snapshots
+--       and plan -> Epsilon item / myDATA classification mapping
+--
+--   012 reads 002 (plan, subscription, tenant count) and reacts to
+--   it with triggers (for example: cancelling draft invoices when a
+--   cancellation date is set). 012 never writes public.product_plans
+--   or public.subscriptions; it calls the 002 functions
+--   subscription_plan_*, subscription_create, subscription_change_plan,
+--   subscription_cancel, subscription_undo_cancel and
+--   platform.expire_cancelled_subscriptions / expire_trial_subscriptions
+--   / billable_subscriptions.
+--
 -- 012 DOES NOT OWN:
---   - tenants / customer identity
---   - customer accounts
+--   - tenants / customer identity / customer accounts      (002)
+--   - plans and subscription state                          (002)
+--   - CRM companies and contacts                            (003)
 --   - physical product catalog
---   - device bundles / BOM
---   - logistics
---   - fulfilment
---   - warehouses
---   - inventory / stock
---   - stock movements
---   - payment execution
---   - payment provider credentials
---   - payment webhooks
--- OWNERSHIP:
---   002 CORE SaaS
---       subscriptions baseline
---             │
---             ↓
---   012 COMMERCE
---       plans
---       pricing
---       entitlements
---       discounts
---       invoices
---   003 CUSTOMER / CRM
---       customer accounts
---       customer-account discounts
---             │
---             ↓
---       012 applies commercial effect
---   010 DEVICE / BOM
---             │
---             ↓
---   011 LOGISTICS
---       fulfilment
---       warehouses
---       shipping
---   018 INVENTORY
---       stock
---       reservations
---       movements
---   000 PLATFORM EXECUTION
---       payment execution
---       payment provider webhooks
+--   - device bundles / BOM                                  (010)
+--   - logistics, fulfilment, warehouses                     (011)
+--   - inventory / stock / stock movements                   (018)
+--   - payment execution, provider credentials, webhooks     (000)
 --
 -- BILLING / E-INVOICING
 --   Supabase (012) decides WHAT is invoiced: billing customer,
@@ -84,6 +66,24 @@ if to_regclass('public.subscriptions') is null then
         '012 requires public.subscriptions from the core SaaS layer';
 end if;
 
+if to_regclass('public.product_plans') is null then
+    raise exception
+        '012 requires public.product_plans from the core SaaS layer (002 REV2)';
+end if;
+
+if to_regclass('public.customer_accounts') is null then
+    raise exception
+        '012 requires public.customer_accounts from the core SaaS layer';
+end if;
+
+if to_regprocedure('public.subscription_change_plan(uuid,uuid)') is null
+   or to_regprocedure('public.subscription_cancel(text)') is null
+   or to_regprocedure('platform.billing_timezone()') is null
+   or to_regprocedure('platform.expire_trial_subscriptions()') is null then
+    raise exception
+        '012 requires the subscription lifecycle functions from 002 REV2 (section 14C)';
+end if;
+
 if to_regclass('platform.schema_migrations') is null then
     raise exception
         '012 requires platform.schema_migrations';
@@ -98,36 +98,14 @@ $$;
 
 
 -- =====================================================
--- 1. SUBSCRIPTION PRODUCT PLANS
+-- 1. SUBSCRIPTION PRODUCT PLANS  (OWNED BY 002)
 -- =====================================================
 --
--- Commercial subscription catalog.
---
--- IMPORTANT:
--- This is NOT a physical product catalog.
--- Physical hardware/product inventory belongs to 018.
+-- public.product_plans (plan / subscription type) is created and
+-- maintained by 002 (section 4B and 14C). 012 only references it:
+-- plan_pricing, feature_entitlements, upsell_rules, discount_codes
+-- and invoice_lines point at product_plans(id).
 -- =====================================================
-
-create table if not exists public.product_plans (
-    id uuid primary key default gen_random_uuid(),
-
-    name text not null,
-
-    description text,
-
-    tier subscription_tier not null,
-
-    is_active boolean not null default true,
-
-    is_default boolean not null default false,
-
-    created_at timestamptz not null default now(),
-
-    updated_at timestamptz not null default now(),
-
-    constraint chk_product_plans_name_nonempty
-        check (btrim(name) <> '')
-);
 
 
 -- =====================================================
@@ -155,18 +133,10 @@ create table if not exists public.plan_pricing (
 
     effective_from timestamptz not null default now(),
 
-    effective_until timestamptz,
-
     created_at timestamptz not null default now(),
 
     constraint uq_plan_pricing_effective
         unique (plan_id, currency, effective_from),
-
-    constraint chk_plan_pricing_period
-        check (
-            effective_until is null
-            or effective_until > effective_from
-        ),
 
     constraint chk_plan_pricing_currency
         check (
@@ -193,17 +163,6 @@ create table if not exists public.plan_pricing (
         )
 );
 
-alter table public.plan_pricing
-add constraint ex_plan_pricing_no_overlap
-exclude using gist (
-    plan_id with =,
-    currency with =,
-    tstzrange(
-        effective_from,
-        coalesce(effective_until, 'infinity'::timestamptz),
-        '[)'
-    ) with &&
-);
 
 -- =====================================================
 -- 3. FEATURE ENTITLEMENTS
@@ -265,56 +224,13 @@ create table if not exists public.upsell_rules (
 
 
 -- =====================================================
--- 5. SUBSCRIPTION -> PLAN RELATIONSHIP
+-- 5. SUBSCRIPTION -> PLAN RELATIONSHIP  (OWNED BY 002)
 -- =====================================================
 --
--- subscriptions belongs to the Core SaaS domain.
--- 012 adds the commercial plan relationship.
+-- subscriptions.plan_id, the cancellation columns and their
+-- constraints are part of the subscription instance and live in
+-- 002 (section 5). 012 reads them.
 -- =====================================================
-
-alter table public.subscriptions
-    add column if not exists plan_id uuid;
-
-
-do $$
-begin
-    alter table public.subscriptions
-        add constraint fk_subscriptions_plan
-        foreign key (plan_id)
-        references public.product_plans(id)
-        on delete restrict;
-exception
-    when duplicate_object then
-        null;
-end;
-$$;
-
-
--- Cancellation per end of month (see section 19A).
--- subscriptions has exactly one row per tenant (002).
-alter table public.subscriptions
-    add column if not exists cancel_requested_at timestamptz,
-    add column if not exists cancel_effective_at timestamptz,
-    add column if not exists cancel_reason text;
-
-
-do $$
-begin
-    alter table public.subscriptions
-        add constraint chk_subscriptions_cancellation
-        check (
-            (cancel_requested_at is null and cancel_effective_at is null)
-            or (
-                cancel_requested_at is not null
-                and cancel_effective_at is not null
-                and cancel_effective_at > cancel_requested_at
-            )
-        );
-exception
-    when duplicate_object then
-        null;
-end;
-$$;
 
 
 -- =====================================================
@@ -801,16 +717,219 @@ create table if not exists public.discount_redemptions (
 
 
 -- =====================================================
--- 10. NORMALIZE EXISTING COMMERCE CONSTRAINTS
+-- 8B. CUSTOMER-ACCOUNT DISCOUNT TIERS
+-- =====================================================
+--
+-- Discount POLICY based on the number of tenants with paid subscription
+--  a customer account has (002: customer_accounts -> tenants):
+--
+--   1 tenant   -> 0 %
+--   2 tenants  -> x %
+--   3+ tenants -> y %
+--
+-- A row means: "from min_tenants tenants onwards, discount_percent".
+-- The row with the highest min_tenants <= the tenant count wins.
+--
+-- customer_account_id null  -> global tiers (the default policy)
+-- customer_account_id set   -> tiers that replace the global ones
+--                              for that one customer account
+--
+-- This table is policy only. What was actually applied to an
+-- invoice is recorded in applied_discounts (9B).
+-- The tenant count itself is NOT stored: it is derived from
+-- 002 (tenants) when the discount is applied.
 -- =====================================================
 
-alter table public.product_plans
-    drop constraint if exists chk_product_plans_name_nonempty;
+create table if not exists public.customer_account_discount_tiers (
+    id uuid primary key default gen_random_uuid(),
 
-alter table public.product_plans
-    add constraint chk_product_plans_name_nonempty
-    check (btrim(name) <> '');
+    customer_account_id uuid
+        references public.customer_accounts(id)
+        on delete cascade,
 
+    min_tenants integer not null,
+
+    discount_percent numeric(5,2) not null,
+
+    label text,
+
+    effective_from timestamptz not null default now(),
+
+    effective_to timestamptz,
+
+    is_active boolean not null default true,
+
+    created_at timestamptz not null default now(),
+
+    updated_at timestamptz not null default now(),
+
+    constraint chk_ca_discount_tiers_min_tenants
+        check (min_tenants >= 1),
+
+    constraint chk_ca_discount_tiers_percent
+        check (discount_percent >= 0 and discount_percent <= 100),
+
+    constraint chk_ca_discount_tiers_validity
+        check (effective_to is null or effective_to > effective_from)
+);
+
+
+-- One tier per scope / threshold / start date.
+create unique index if not exists uq_ca_discount_tiers_scope
+on public.customer_account_discount_tiers (
+    coalesce(customer_account_id, '00000000-0000-0000-0000-000000000000'::uuid),
+    min_tenants,
+    effective_from
+);
+
+create index if not exists idx_ca_discount_tiers_account
+on public.customer_account_discount_tiers (customer_account_id)
+where customer_account_id is not null;
+
+
+-- =====================================================
+-- 9B. APPLIED DISCOUNTS (HISTORICAL SNAPSHOT)
+-- =====================================================
+--
+-- Insert-only record of every discount that was actually applied
+-- to an invoice (and so to a subscription's billing), whatever its
+-- source:
+--
+--   discount_code          -> a discount code (also counted in
+--                             discount_redemptions)
+--   customer_account_tier  -> the tenant-count tier (8B)
+--
+-- Policy changes later (a tier percentage, a code value) never
+-- change history: the percentage, the base amount, the tenant
+-- count and the policy as it was are copied into the row.
+--
+-- One discount per invoice. 002 stores no discounts; this table
+-- is the only place where the applied discount is kept.
+-- =====================================================
+
+create table if not exists public.applied_discounts (
+    id uuid primary key default gen_random_uuid(),
+
+    source text not null,
+
+    tenant_id uuid not null
+        references public.tenants(id),
+
+    -- Snapshot of the owning customer account at that moment.
+    customer_account_id uuid not null
+        references public.customer_accounts(id),
+
+    subscription_id uuid
+        references public.subscriptions(id)
+        on delete restrict,
+
+    invoice_id uuid
+        references public.invoices(id)
+        on delete restrict,
+
+    discount_code_id uuid
+        references public.discount_codes(id)
+        on delete restrict,
+
+    tier_id uuid
+        references public.customer_account_discount_tiers(id)
+        on delete restrict,
+
+    discount_type text not null,
+
+    discount_value numeric(12,2) not null,
+
+    base_amount numeric(12,2) not null,
+
+    amount_applied numeric(12,2) not null,
+
+    currency text not null,
+
+    -- Tier source: tenants of the customer account at that moment.
+    tenant_count integer,
+
+    -- Policy as it was (tier label / threshold / scope, code, ...).
+    policy_snapshot jsonb not null default '{}'::jsonb,
+
+    applied_by uuid,
+
+    applied_at timestamptz not null default now(),
+
+    constraint chk_applied_discounts_source
+        check (source in ('discount_code', 'customer_account_tier')),
+
+    constraint chk_applied_discounts_type
+        check (discount_type in ('percentage', 'fixed_amount')),
+
+    constraint chk_applied_discounts_amounts
+        check (
+            discount_value >= 0
+            and base_amount >= 0
+            and amount_applied >= 0
+        ),
+
+    constraint chk_applied_discounts_currency
+        check (char_length(currency) = 3 and currency = upper(currency)),
+
+    constraint chk_applied_discounts_target
+        check (invoice_id is not null or subscription_id is not null),
+
+    constraint chk_applied_discounts_source_ref
+        check (
+            (
+                source = 'discount_code'
+                and discount_code_id is not null
+                and tier_id is null
+            )
+            or (
+                source = 'customer_account_tier'
+                and tier_id is not null
+                and discount_code_id is null
+                and tenant_count is not null
+            )
+        )
+);
+
+
+-- One discount per invoice.
+create unique index if not exists uq_applied_discounts_invoice
+on public.applied_discounts (invoice_id)
+where invoice_id is not null;
+
+create index if not exists idx_applied_discounts_tenant
+on public.applied_discounts (tenant_id, applied_at desc);
+
+create index if not exists idx_applied_discounts_subscription
+on public.applied_discounts (subscription_id)
+where subscription_id is not null;
+
+create index if not exists idx_applied_discounts_account
+on public.applied_discounts (customer_account_id);
+
+
+-- History is never edited or removed.
+create or replace function platform.deny_mutation()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+    raise exception '% on % is not allowed (immutable)', tg_op, tg_table_name;
+end;
+$$;
+
+
+drop trigger if exists trg_applied_discounts_immutable
+on public.applied_discounts;
+
+create trigger trg_applied_discounts_immutable
+before update or delete on public.applied_discounts
+for each row execute function platform.deny_mutation();
+
+
+-- =====================================================
+-- 10. NORMALIZE EXISTING COMMERCE CONSTRAINTS
+-- =====================================================
 
 alter table public.plan_pricing
     drop constraint if exists chk_plan_pricing_currency;
@@ -854,15 +973,6 @@ set
 -- 12. UNIQUE / PERFORMANCE INDEXES
 -- =====================================================
 
-create unique index if not exists uq_product_plans_name_ci
-on public.product_plans (lower(name));
-
-
-create unique index if not exists uq_product_plans_default
-on public.product_plans (is_default)
-where is_default = true;
-
-
 create index if not exists idx_plan_pricing_plan_effective
 on public.plan_pricing (
     plan_id,
@@ -883,8 +993,7 @@ create index if not exists idx_upsell_rules_plan
 on public.upsell_rules (recommended_plan_id);
 
 
-create index if not exists idx_subscriptions_plan
-on public.subscriptions (plan_id);
+-- idx_subscriptions_plan and the product_plans indexes: 002.
 
 
 create unique index if not exists uq_billing_customers_default
@@ -1000,147 +1109,20 @@ where invoice_id is not null;
 
 
 -- =====================================================
--- 13. SUBSCRIPTION PLAN REQUIRED
+-- 13-19. PLAN / SUBSCRIPTION INVARIANTS AND LIFECYCLE  (OWNED BY 002)
 -- =====================================================
 --
--- Active subscription states require a plan.
--- =====================================================
-
-create or replace function public.enforce_subscription_plan_required()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-begin
-
-    -- subscription_status enum: trial (not 'trialing').
-    if new.status in (
-        'active',
-        'trial',
-        'past_due'
-    )
-    and new.plan_id is null then
-
-        raise exception
-            'subscription plan_id is required for status %',
-            new.status;
-
-    end if;
-
-    return new;
-
-end;
-$$;
-
-
--- =====================================================
--- 14. SYNC SUBSCRIPTION TIER FROM PLAN
--- =====================================================
-
-create or replace function public.sync_subscription_tier_from_plan()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-declare
-    v_tier public.subscription_tier;
-begin
-
-    if new.plan_id is null then
-        return new;
-    end if;
-
-    select pp.tier
-    into v_tier
-    from public.product_plans pp
-    where pp.id = new.plan_id;
-
-    if not found then
-        raise exception
-            'subscription plan % not found',
-            new.plan_id;
-    end if;
-
-    new.tier := v_tier;
-
-    return new;
-
-end;
-$$;
-
-
--- =====================================================
--- 15. PREVENT SUBSCRIPTION TIER DRIFT
--- =====================================================
-
-create or replace function public.prevent_subscription_tier_drift()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-declare
-    v_tier public.subscription_tier;
-begin
-
-    if new.plan_id is null then
-        return new;
-    end if;
-
-    select pp.tier
-    into v_tier
-    from public.product_plans pp
-    where pp.id = new.plan_id;
-
-    if not found then
-        raise exception
-            'subscription plan % not found',
-            new.plan_id;
-    end if;
-
-    if new.tier <> v_tier then
-        raise exception
-            'subscription tier must match product plan tier';
-    end if;
-
-    return new;
-
-end;
-$$;
-
-
--- =====================================================
--- 16. PREVENT PRODUCT PLAN TIER DRIFT
--- =====================================================
+-- Moved to 002 (section 14C), because they change the
+-- subscription instance, not a price:
 --
--- Once a plan is used by subscriptions, its tier becomes
--- immutable. Create a new plan instead of changing the
--- commercial tier of an existing plan.
+--   plan required for active states, tier follows the plan,
+--   tier drift guard, plan tier immutability
+--   subscription_change_plan, subscription_create
+--   provision_default_subscription (+ tenant trigger)
+--   subscription_cancel, subscription_undo_cancel
+--   platform.expire_cancelled_subscriptions
+--   platform.billing_timezone
 -- =====================================================
-
-create or replace function public.prevent_product_plan_tier_change()
-returns trigger
-language plpgsql
-set search_path = ''
-as $$
-begin
-
-    if new.tier is distinct from old.tier
-       and exists (
-            select 1
-            from public.subscriptions s
-            where s.plan_id = old.id
-       )
-    then
-
-        raise exception
-            'product plan tier cannot change after the plan has been used by subscriptions';
-
-    end if;
-
-    return new;
-
-end;
-$$;
 
 
 -- =====================================================
@@ -1179,352 +1161,6 @@ $$;
 
 
 -- =====================================================
--- 18. COMMERCE CHANGE SUBSCRIPTION PLAN
--- =====================================================
-
-create or replace function public.commerce_change_subscription_plan(
-    p_subscription_id uuid,
-    p_plan_id uuid
-)
-returns public.subscriptions
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_tid uuid;
-    v_plan public.product_plans%rowtype;
-    v_subscription public.subscriptions%rowtype;
-begin
-
-    v_tid := platform.current_tenant_id();
-
-    if v_tid is null then
-        raise exception 'no active tenant';
-    end if;
-
-    select *
-    into v_plan
-    from public.product_plans pp
-    where pp.id = p_plan_id
-      and pp.is_active = true;
-
-    if not found then
-        raise exception
-            'active product plan not found';
-    end if;
-
-    select *
-    into v_subscription
-    from public.subscriptions s
-    where s.id = p_subscription_id
-      and s.tenant_id = v_tid
-    for update;
-
-    if not found then
-        raise exception
-            'subscription not found';
-    end if;
-
-    update public.subscriptions
-    set
-        plan_id = v_plan.id
-    where id = v_subscription.id
-    returning *
-    into v_subscription;
-
-    perform platform.log_audit(
-        'subscription.plan_changed',
-        'subscription',
-        v_subscription.id,
-        jsonb_build_object(
-            'plan_id', v_plan.id,
-            'tier', v_plan.tier
-        )
-    );
-
-    return v_subscription;
-
-end;
-$$;
-
-
--- =====================================================
--- 19. COMMERCE CREATE SUBSCRIPTION
--- =====================================================
-
-create or replace function public.commerce_create_subscription(
-    p_tenant_id uuid,
-    p_plan_id uuid,
-    p_status text default 'active'
-)
-returns public.subscriptions
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_plan public.product_plans%rowtype;
-    v_subscription public.subscriptions%rowtype;
-begin
-
-    if not public.is_platform_admin()
-       and platform.current_tenant_id() is distinct from p_tenant_id then
-
-        raise exception
-            'tenant context mismatch';
-
-    end if;
-
-    select *
-    into v_plan
-    from public.product_plans pp
-    where pp.id = p_plan_id
-      and pp.is_active = true;
-
-    if not found then
-        raise exception
-            'active product plan not found';
-    end if;
-
-    -- 002: exactly one subscription per tenant (provisioned when the
-    -- tenant is created). Use change_subscription_plan to switch.
-    if exists (
-        select 1
-        from public.subscriptions s
-        where s.tenant_id = p_tenant_id
-    ) then
-        raise exception
-            'tenant already has a subscription; use change_subscription_plan';
-    end if;
-
-    insert into public.subscriptions (
-        tenant_id,
-        plan_id,
-        tier,
-        status
-    )
-    values (
-        p_tenant_id,
-        v_plan.id,
-        v_plan.tier,
-        p_status::public.subscription_status
-    )
-    returning *
-    into v_subscription;
-
-    perform platform.log_audit(
-        'subscription.created',
-        'subscription',
-        v_subscription.id,
-        jsonb_build_object(
-            'plan_id', v_plan.id,
-            'tier', v_plan.tier
-        )
-    );
-
-    return v_subscription;
-
-end;
-$$;
-
-
--- =====================================================
--- 19A. SUBSCRIPTION CANCELLATION (END OF MONTH)
--- =====================================================
---
--- Cancelling is only possible per end of the month: the
--- subscription stays 'active' (features and invoicing continue)
--- until cancel_effective_at, when the daily job
--- platform.expire_cancelled_subscriptions() sets 'cancelled'.
--- There is no mid-month cancellation.
---
--- Billing stops at cancel_effective_at; this is enforced in the
--- database (section 19B). Epsilon is not involved: it has no
--- subscription concept.
---
--- The month boundary is evaluated in platform.billing_timezone().
--- =====================================================
-
-create or replace function platform.billing_timezone()
-returns text
-language sql
-immutable
-set search_path = ''
-as $$
-    select 'Europe/Athens'::text;
-$$;
-
-
-create or replace function public.commerce_cancel_subscription(
-    p_reason text default null
-)
-returns public.subscriptions
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_tid uuid;
-    v_sub public.subscriptions%rowtype;
-    v_effective timestamptz;
-    v_effective_date date;
-    v_drafts int;
-begin
-
-    v_tid := platform.current_tenant_id();
-
-    if v_tid is null then
-        raise exception 'no active tenant';
-    end if;
-
-    select *
-    into v_sub
-    from public.subscriptions s
-    where s.tenant_id = v_tid
-    for update;
-
-    if not found then
-        raise exception 'subscription not found';
-    end if;
-
-    if v_sub.status not in ('active', 'trial', 'past_due') then
-        raise exception
-            'only an active, trial or past_due subscription can be cancelled (status: %)',
-            v_sub.status;
-    end if;
-
-    if v_sub.cancel_requested_at is not null then
-        raise exception
-            'cancellation was already requested (effective %)',
-            v_sub.cancel_effective_at;
-    end if;
-
-    -- First instant of next month in the billing time zone.
-    v_effective := (
-        date_trunc('month', timezone(platform.billing_timezone(), now()))
-        + interval '1 month'
-    ) at time zone platform.billing_timezone();
-
-    update public.subscriptions
-    set
-        cancel_requested_at = now(),
-        cancel_effective_at = v_effective,
-        cancel_reason = nullif(btrim(coalesce(p_reason, '')), '')
-    where id = v_sub.id
-    returning *
-    into v_sub;
-
-    -- Draft invoices that were already generated for periods after the
-    -- end date are cancelled (issued invoices are never touched).
-    v_effective_date := (
-        v_effective at time zone platform.billing_timezone()
-    )::date;
-
-    update public.invoices i
-    set status = 'cancelled'
-    where i.subscription_id = v_sub.id
-      and i.status = 'draft'
-      and i.document_type = 'invoice'
-      and i.period_end >= v_effective_date;
-
-    get diagnostics v_drafts = row_count;
-
-    perform platform.log_audit(
-        'subscription.cancellation_requested',
-        'subscription',
-        v_sub.id,
-        jsonb_build_object(
-            'effective_at', v_effective,
-            'cancelled_draft_invoices', v_drafts
-        )
-    );
-
-    return v_sub;
-
-end;
-$$;
-
-
-create or replace function public.commerce_undo_cancel_subscription()
-returns public.subscriptions
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_tid uuid;
-    v_sub public.subscriptions%rowtype;
-begin
-
-    v_tid := platform.current_tenant_id();
-
-    if v_tid is null then
-        raise exception 'no active tenant';
-    end if;
-
-    select *
-    into v_sub
-    from public.subscriptions s
-    where s.tenant_id = v_tid
-    for update;
-
-    if not found then
-        raise exception 'subscription not found';
-    end if;
-
-    if v_sub.cancel_requested_at is null
-       or v_sub.cancel_effective_at <= now() then
-        raise exception 'there is no pending cancellation to undo';
-    end if;
-
-    update public.subscriptions
-    set
-        cancel_requested_at = null,
-        cancel_effective_at = null,
-        cancel_reason = null
-    where id = v_sub.id
-    returning *
-    into v_sub;
-
-    perform platform.log_audit(
-        'subscription.cancellation_undone',
-        'subscription',
-        v_sub.id
-    );
-
-    return v_sub;
-
-end;
-$$;
-
-
--- Daily job (schedule outside this migration).
-create or replace function platform.expire_cancelled_subscriptions()
-returns int
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_n int;
-begin
-
-    update public.subscriptions s
-    set status = 'cancelled'
-    where s.cancel_effective_at is not null
-      and s.cancel_effective_at <= now()
-      and s.status in ('active', 'trial', 'past_due');
-
-    get diagnostics v_n = row_count;
-
-    return v_n;
-
-end;
-$$;
-
-
--- =====================================================
 -- 19B. NO BILLING AFTER THE CANCELLATION DATE
 -- =====================================================
 --
@@ -1535,8 +1171,8 @@ $$;
 --   2. the same check is repeated when an invoice is frozen for
 --      Epsilon (platform.epsilon_enqueue_invoice), because a
 --      draft may have been generated before the cancellation.
---   3. platform.billable_subscriptions() is the single list the
---      generator should use.
+--   3. platform.billable_subscriptions() (002) is the single list
+--      the generator should use.
 -- Credit notes are never blocked.
 -- =====================================================
 
@@ -1595,27 +1231,8 @@ for each row
 execute function public.enforce_invoice_subscription_term();
 
 
--- Subscriptions the generator may bill for a given service period.
-create or replace function platform.billable_subscriptions(
-    p_period_start date,
-    p_period_end date
-)
-returns setof public.subscriptions
-language sql
-stable
-security definer
-set search_path = ''
-as $$
-    select s.*
-    from public.subscriptions s
-    where s.status in ('active', 'past_due')
-      and (
-          s.cancel_effective_at is null
-          or p_period_end < (
-              s.cancel_effective_at at time zone platform.billing_timezone()
-          )::date
-      );
-$$;
+-- The list of subscriptions the generator may bill
+-- (platform.billable_subscriptions) is owned by 002.
 
 
 -- =====================================================
@@ -1654,42 +1271,13 @@ $$;
 
 
 -- =====================================================
--- 19D. TRIAL EXPIRY
+-- 19D. TRIAL EXPIRY  (OWNED BY 002)
 -- =====================================================
 --
--- Hourly job (schedule outside this migration): a subscription in
--- status 'trial' whose current_period_end has passed becomes
--- 'trial_expired'. The end of the trial is current_period_end
--- (002 has no separate trial column).
---
--- A trial without current_period_end never expires: whoever
--- creates a trial subscription must set it.
--- Converting a trial to a paid subscription (status 'active')
--- before the end date is done elsewhere and is not touched here.
+-- platform.expire_trial_subscriptions() is defined in 002
+-- (section 014B) and returns (subscriptions_expired, seconds_elapsed).
+-- The cron engine (027) calls it.
 -- =====================================================
-
--- create or replace function platform.expire_trial_subscriptions()
--- returns int
--- language plpgsql
--- security definer
--- set search_path = ''
--- as $$
--- declare
---     v_n int;
--- begin
-
---     update public.subscriptions s
---     set status = 'trial_expired'
---     where s.status = 'trial'
---       and s.current_period_end is not null
---       and s.current_period_end <= now();
-
---     get diagnostics v_n = row_count;
-
---     return v_n;
-
--- end;
--- $$;
 
 
 -- =====================================================
@@ -1817,19 +1405,23 @@ $$;
 
 
 -- =====================================================
--- 22. APPLY DISCOUNT TO INVOICE
+-- 22. DISCOUNT DISTRIBUTION OVER THE INVOICE LINES (SHARED)
 -- =====================================================
 --
--- Draft invoices only. The discount is distributed pro rata
--- over the invoice lines (rounding remainder on the last line)
--- and VAT is recomputed per line, so that lines and invoice
--- totals stay consistent for the Epsilon/myDATA submission.
--- Only one discount per invoice.
+-- The single place where a discount amount is booked on a draft
+-- invoice, for every discount source (code or customer-account
+-- tier). The discount is distributed pro rata over the invoice
+-- lines (rounding remainder on the last line) and VAT is
+-- recomputed per line, so that lines and invoice totals stay
+-- consistent for the Epsilon/myDATA submission.
+--
+-- Only one discount per invoice. Draft invoices only.
+-- Internal: no tenant check; callers validate access.
 -- =====================================================
 
-create or replace function public.commerce_apply_discount_to_invoice(
+create or replace function platform.invoice_distribute_discount(
     p_invoice_id uuid,
-    p_code text
+    p_amount numeric
 )
 returns public.invoices
 language plpgsql
@@ -1837,25 +1429,15 @@ security definer
 set search_path = ''
 as $$
 declare
-    v_tid uuid;
     v_invoice public.invoices%rowtype;
-    v_subscription_plan uuid;
-    v_discount public.discount_codes%rowtype;
-    v_amount numeric(12,2);
+    v_amount numeric(12,2) := round(p_amount, 2);
     v_new_tax numeric(12,2);
 begin
-
-    v_tid := platform.current_tenant_id();
-
-    if v_tid is null then
-        raise exception 'no active tenant';
-    end if;
 
     select *
     into v_invoice
     from public.invoices i
     where i.id = p_invoice_id
-      and i.tenant_id = v_tid
     for update;
 
     if not found then
@@ -1880,6 +1462,11 @@ begin
     if v_invoice.discount_amount > 0
        or exists (
             select 1
+            from public.applied_discounts ad
+            where ad.invoice_id = v_invoice.id
+       )
+       or exists (
+            select 1
             from public.discount_redemptions r
             where r.invoice_id = v_invoice.id
        ) then
@@ -1887,43 +1474,12 @@ begin
             'a discount was already applied to this invoice';
     end if;
 
-    if v_invoice.subscription_id is not null then
-
-        select s.plan_id
-        into v_subscription_plan
-        from public.subscriptions s
-        where s.id = v_invoice.subscription_id
-          and s.tenant_id = v_tid;
-
+    if v_amount is null or v_amount <= 0 then
+        raise exception 'discount amount must be positive';
     end if;
 
-    v_discount := public.commerce_find_usable_discount_code(
-        p_code,
-        v_subscription_plan
-    );
-
-    if v_discount.id is null then
-        raise exception
-            'usable discount code not found';
-    end if;
-
-    if v_discount.currency is not null
-       and v_discount.currency <> v_invoice.currency then
-
-        raise exception
-            'discount currency does not match invoice currency';
-
-    end if;
-
-    v_amount := public.commerce_compute_discount_amount(
-        v_discount.discount_type,
-        v_discount.value,
-        v_invoice.subtotal
-    );
-
-    if v_amount <= 0 then
-        raise exception
-            'discount code does not reduce this invoice';
+    if v_amount > v_invoice.subtotal then
+        raise exception 'discount exceeds the invoice subtotal';
     end if;
 
     if exists (
@@ -2019,6 +1575,109 @@ begin
     returning *
     into v_invoice;
 
+    return v_invoice;
+
+end;
+$$;
+
+
+-- =====================================================
+-- 22A. APPLY A DISCOUNT CODE TO AN INVOICE
+-- =====================================================
+--
+-- Tenant-scoped. Validates the code, books the discount through
+-- platform.invoice_distribute_discount, counts the redemption and
+-- writes the applied-discount snapshot (9B).
+-- =====================================================
+
+create or replace function public.commerce_apply_discount_to_invoice(
+    p_invoice_id uuid,
+    p_code text
+)
+returns public.invoices
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_invoice public.invoices%rowtype;
+    v_subscription_plan uuid;
+    v_account uuid;
+    v_discount public.discount_codes%rowtype;
+    v_amount numeric(12,2);
+    v_base numeric(12,2);
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    select *
+    into v_invoice
+    from public.invoices i
+    where i.id = p_invoice_id
+      and i.tenant_id = v_tid
+    for update;
+
+    if not found then
+        raise exception 'invoice not found';
+    end if;
+
+    if v_invoice.subscription_id is not null then
+
+        select s.plan_id
+        into v_subscription_plan
+        from public.subscriptions s
+        where s.id = v_invoice.subscription_id
+          and s.tenant_id = v_tid;
+
+    end if;
+
+    v_discount := public.commerce_find_usable_discount_code(
+        p_code,
+        v_subscription_plan
+    );
+
+    if v_discount.id is null then
+        raise exception
+            'usable discount code not found';
+    end if;
+
+    if v_discount.currency is not null
+       and v_discount.currency <> v_invoice.currency then
+
+        raise exception
+            'discount currency does not match invoice currency';
+
+    end if;
+
+    v_base := v_invoice.subtotal;
+
+    v_amount := public.commerce_compute_discount_amount(
+        v_discount.discount_type,
+        v_discount.value,
+        v_base
+    );
+
+    if v_amount <= 0 then
+        raise exception
+            'discount code does not reduce this invoice';
+    end if;
+
+    -- Validates draft / not locked / no earlier discount.
+    v_invoice := platform.invoice_distribute_discount(
+        v_invoice.id,
+        v_amount
+    );
+
+    select t.customer_account_id
+    into v_account
+    from public.tenants t
+    where t.id = v_tid;
+
     insert into public.discount_redemptions (
         discount_code_id,
         tenant_id,
@@ -2034,6 +1693,42 @@ begin
         v_amount
     );
 
+    insert into public.applied_discounts (
+        source,
+        tenant_id,
+        customer_account_id,
+        subscription_id,
+        invoice_id,
+        discount_code_id,
+        discount_type,
+        discount_value,
+        base_amount,
+        amount_applied,
+        currency,
+        policy_snapshot,
+        applied_by
+    )
+    values (
+        'discount_code',
+        v_tid,
+        v_account,
+        v_invoice.subscription_id,
+        v_invoice.id,
+        v_discount.id,
+        v_discount.discount_type,
+        v_discount.value,
+        v_base,
+        v_amount,
+        v_invoice.currency,
+        jsonb_build_object(
+            'code', v_discount.code,
+            'applies_to_plan_id', v_discount.applies_to_plan_id,
+            'valid_from', v_discount.valid_from,
+            'valid_until', v_discount.valid_until
+        ),
+        (select auth.uid())
+    );
+
     update public.discount_codes
     set
         redeemed_count = redeemed_count + 1
@@ -2044,6 +1739,7 @@ begin
         'invoice',
         v_invoice.id,
         jsonb_build_object(
+            'source', 'discount_code',
             'discount_code_id', v_discount.id,
             'amount_applied', v_amount
         )
@@ -2053,6 +1749,354 @@ begin
 
 end;
 $$;
+
+
+-- =====================================================
+-- 22B. CUSTOMER-ACCOUNT TIER DISCOUNT
+-- =====================================================
+--
+-- Which tier applies to a customer account right now:
+--
+--   tenant count = PAYING tenants of the account: tenant status
+--                  'active' with a subscription in status active or
+--                  past_due (002: tenants -> subscriptions)
+--   tiers        = active, within their validity window,
+--                  min_tenants <= tenant count
+--   scope        = the account's own tiers if it has any,
+--                  otherwise the global tiers
+--   winner       = highest min_tenants, then latest effective_from
+--
+-- No tier (or 0 %) means no discount. Internal function.
+-- =====================================================
+
+create or replace function platform.resolve_account_discount(
+    p_customer_account_id uuid,
+    p_at timestamptz default now()
+)
+returns table (
+    customer_account_id uuid,
+    tenant_count integer,
+    tier_id uuid,
+    min_tenants integer,
+    discount_percent numeric,
+    label text,
+    account_specific boolean,
+    effective_from timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+    v_count integer;
+    v_specific boolean;
+begin
+
+    -- Only paying tenants count: an active tenant with a subscription
+    -- in a billable status (same rule as platform.billable_subscriptions).
+    -- A tenant without a subscription, or with a trial / cancelled /
+    -- suspended / expired one, is not counted.
+    select count(*)::integer
+    into v_count
+    from public.tenants t
+    join public.subscriptions s
+      on s.tenant_id = t.id
+    where t.customer_account_id = p_customer_account_id
+      and t.status::text = 'active'
+      and s.status in ('active', 'past_due');
+
+    select exists (
+        select 1
+        from public.customer_account_discount_tiers d
+        where d.customer_account_id = p_customer_account_id
+          and d.is_active
+          and d.effective_from <= p_at
+          and (d.effective_to is null or d.effective_to > p_at)
+    )
+    into v_specific;
+
+    return query
+    select
+        p_customer_account_id,
+        v_count,
+        d.id,
+        d.min_tenants,
+        d.discount_percent,
+        d.label,
+        (d.customer_account_id is not null),
+        d.effective_from
+    from public.customer_account_discount_tiers d
+    where d.is_active
+      and d.effective_from <= p_at
+      and (d.effective_to is null or d.effective_to > p_at)
+      and d.min_tenants <= v_count
+      and (
+          d.customer_account_id = p_customer_account_id
+          or (d.customer_account_id is null and not v_specific)
+      )
+    order by d.min_tenants desc, d.effective_from desc
+    limit 1;
+
+    -- No tier matched: still report the tenant count.
+    if not found then
+        return query
+        select
+            p_customer_account_id,
+            v_count,
+            null::uuid,
+            null::integer,
+            0::numeric,
+            null::text,
+            v_specific,
+            null::timestamptz;
+    end if;
+
+end;
+$$;
+
+
+-- Applies the tier discount of the invoice's customer account to a
+-- draft invoice and records the snapshot. Idempotent: returns the
+-- invoice unchanged when there is nothing to apply (no tier, 0 %,
+-- or the invoice already carries a discount). Used by the invoice
+-- generator (no tenant context) and by the tenant wrapper below.
+create or replace function platform.apply_account_tier_discount(
+    p_invoice_id uuid
+)
+returns public.invoices
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_invoice public.invoices%rowtype;
+    v_account uuid;
+    v_tier record;
+    v_amount numeric(12,2);
+begin
+
+    select *
+    into v_invoice
+    from public.invoices i
+    where i.id = p_invoice_id
+    for update;
+
+    if not found then
+        raise exception 'invoice not found';
+    end if;
+
+    if v_invoice.status <> 'draft'
+       or v_invoice.document_type <> 'invoice'
+       or v_invoice.locked_at is not null then
+        raise exception
+            'tier discounts can only be applied to draft invoices';
+    end if;
+
+    -- One discount per invoice: an existing one (code or tier) wins.
+    if v_invoice.discount_amount > 0
+       or exists (
+            select 1
+            from public.applied_discounts ad
+            where ad.invoice_id = v_invoice.id
+       ) then
+        return v_invoice;
+    end if;
+
+    select t.customer_account_id
+    into v_account
+    from public.tenants t
+    where t.id = v_invoice.tenant_id;
+
+    select *
+    into v_tier
+    from platform.resolve_account_discount(v_account, now());
+
+    if v_tier.tier_id is null or v_tier.discount_percent <= 0 then
+        return v_invoice;
+    end if;
+
+    v_amount := public.commerce_compute_discount_amount(
+        'percentage',
+        v_tier.discount_percent,
+        v_invoice.subtotal
+    );
+
+    if v_amount <= 0 then
+        return v_invoice;
+    end if;
+
+    v_invoice := platform.invoice_distribute_discount(
+        v_invoice.id,
+        v_amount
+    );
+
+    insert into public.applied_discounts (
+        source,
+        tenant_id,
+        customer_account_id,
+        subscription_id,
+        invoice_id,
+        tier_id,
+        discount_type,
+        discount_value,
+        base_amount,
+        amount_applied,
+        currency,
+        tenant_count,
+        policy_snapshot,
+        applied_by
+    )
+    values (
+        'customer_account_tier',
+        v_invoice.tenant_id,
+        v_account,
+        v_invoice.subscription_id,
+        v_invoice.id,
+        v_tier.tier_id,
+        'percentage',
+        v_tier.discount_percent,
+        v_invoice.subtotal,
+        v_amount,
+        v_invoice.currency,
+        v_tier.tenant_count,
+        jsonb_build_object(
+            'label', v_tier.label,
+            'min_tenants', v_tier.min_tenants,
+            'account_specific', v_tier.account_specific,
+            'tier_effective_from', v_tier.effective_from
+        ),
+        (select auth.uid())
+    );
+
+    perform platform.log_audit(
+        'invoice.discount_applied',
+        'invoice',
+        v_invoice.id,
+        jsonb_build_object(
+            'source', 'customer_account_tier',
+            'tier_id', v_tier.tier_id,
+            'tenant_count', v_tier.tenant_count,
+            'discount_percent', v_tier.discount_percent,
+            'amount_applied', v_amount
+        )
+    );
+
+    return v_invoice;
+
+end;
+$$;
+
+
+-- Tenant-scoped wrapper (portal).
+create or replace function public.commerce_apply_account_discount_to_invoice(
+    p_invoice_id uuid
+)
+returns public.invoices
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+begin
+
+    v_tid := platform.current_tenant_id();
+
+    if v_tid is null then
+        raise exception 'no active tenant';
+    end if;
+
+    if not exists (
+        select 1
+        from public.invoices i
+        where i.id = p_invoice_id
+          and i.tenant_id = v_tid
+    ) then
+        raise exception 'invoice not found';
+    end if;
+
+    return platform.apply_account_tier_discount(p_invoice_id);
+
+end;
+$$;
+
+
+-- =====================================================
+-- 22C. CANCELLATION -> DRAFT INVOICES
+-- =====================================================
+--
+-- 002 owns the cancellation state of a subscription. When
+-- cancel_effective_at is set, draft invoices that were already
+-- generated for periods on or after that date are cancelled.
+-- Issued invoices are never touched.
+-- =====================================================
+
+create or replace function public.cancel_draft_invoices_after_cancellation()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_effective_date date;
+    v_n int;
+begin
+
+    if new.cancel_effective_at is null
+       or new.cancel_effective_at is not distinct from old.cancel_effective_at then
+        return new;
+    end if;
+
+    v_effective_date := (
+        new.cancel_effective_at at time zone platform.billing_timezone()
+    )::date;
+
+    update public.invoices i
+    set status = 'cancelled'
+    where i.subscription_id = new.id
+      and i.status = 'draft'
+      and i.document_type = 'invoice'
+      and i.period_end >= v_effective_date;
+
+    get diagnostics v_n = row_count;
+
+    if v_n > 0 then
+        perform platform.log_audit(
+            'subscription.draft_invoices_cancelled',
+            'subscription',
+            new.id,
+            jsonb_build_object('count', v_n)
+        );
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+drop trigger if exists trg_subscriptions_cancel_draft_invoices
+on public.subscriptions;
+
+create trigger trg_subscriptions_cancel_draft_invoices
+after update of cancel_effective_at
+on public.subscriptions
+for each row
+execute function public.cancel_draft_invoices_after_cancellation();
+
+
+revoke all on function platform.invoice_distribute_discount(uuid, numeric)
+from public, anon, authenticated;
+
+revoke all on function platform.resolve_account_discount(uuid, timestamptz)
+from public, anon, authenticated;
+
+revoke all on function platform.apply_account_tier_discount(uuid)
+from public, anon, authenticated;
+
+revoke all on function public.cancel_draft_invoices_after_cancellation()
+from public, anon, authenticated;
 
 
 -- =====================================================
@@ -2211,53 +2255,8 @@ begin
 
         when 'create_product_plan' then
 
-            if (select auth.uid()) is null then
-                raise exception 'authentication required';
-            end if;
-
-            if not public.is_platform_admin() then
-                raise exception 'platform admin role required';
-            end if;
-
-            insert into public.product_plans (
-                name,
-                description,
-                tier,
-                is_active,
-                is_default
-            )
-            values (
-                btrim(p_payload->>'name'),
-                p_payload->>'description',
-                (p_payload->>'tier')::public.subscription_tier,
-                coalesce(
-                    (p_payload->>'is_active')::boolean,
-                    true
-                ),
-                coalesce(
-                    (p_payload->>'is_default')::boolean,
-                    false
-                )
-            )
-            returning *
-            into v_plan;
-
-            if v_plan.is_default then
-
-                update public.product_plans
-                set is_default = false
-                where id <> v_plan.id
-                  and is_default = true;
-
-            end if;
-
-            perform platform.log_audit(
-                'product_plan.created',
-                'product_plan',
-                v_plan.id
-            );
-
-            return to_jsonb(v_plan);
+            -- Plans belong to 002; role check inside the function.
+            return to_jsonb(public.subscription_plan_create(p_payload));
 
 
         -- =================================================
@@ -2267,72 +2266,7 @@ begin
 
         when 'update_product_plan' then
 
-            if (select auth.uid()) is null then
-                raise exception 'authentication required';
-            end if;
-
-            if not public.is_platform_admin() then
-                raise exception 'platform admin role required';
-            end if;
-
-            update public.product_plans pp
-            set
-                name = case
-                    when p_payload ? 'name'
-                        then btrim(p_payload->>'name')
-                    else pp.name
-                end,
-
-                description = case
-                    when p_payload ? 'description'
-                        then p_payload->>'description'
-                    else pp.description
-                end,
-
-                tier = case
-                    when p_payload ? 'tier'
-                        then (p_payload->>'tier')::public.subscription_tier
-                    else pp.tier
-                end,
-
-                is_active = case
-                    when p_payload ? 'is_active'
-                        then (p_payload->>'is_active')::boolean
-                    else pp.is_active
-                end,
-
-                is_default = case
-                    when p_payload ? 'is_default'
-                        then (p_payload->>'is_default')::boolean
-                    else pp.is_default
-                end
-
-            where pp.id = (p_payload->>'id')::uuid
-
-            returning *
-            into v_plan;
-
-            if not found then
-                raise exception 'product plan not found';
-            end if;
-
-            if v_plan.is_default then
-
-                update public.product_plans
-                set is_default = false
-                where id <> v_plan.id
-                  and is_default = true;
-
-            end if;
-
-            perform platform.log_audit(
-                'product_plan.updated',
-                'product_plan',
-                v_plan.id,
-                p_payload - 'id'
-            );
-
-            return to_jsonb(v_plan);
+            return to_jsonb(public.subscription_plan_update(p_payload));
 
 
         -- =================================================
@@ -2341,7 +2275,7 @@ begin
 
         when 'change_subscription_plan', 'change_plan' then
 
-            v_row := public.commerce_change_subscription_plan(
+            v_row := public.subscription_change_plan(
                 (p_payload->>'subscription_id')::uuid,
                 (p_payload->>'plan_id')::uuid
             );
@@ -3035,49 +2969,9 @@ begin
 
         when 'delete_product_plan' then
 
-            if (select auth.uid()) is null then
-                raise exception 'authentication required';
-            end if;
-
-            if not public.is_platform_admin() then
-                raise exception 'platform admin role required';
-            end if;
-
-            v_plan_id := (p_payload->>'id')::uuid;
-
-            if exists (select 1 from public.subscriptions s where s.plan_id = v_plan_id) then
-                raise exception 'plan is in use by subscriptions; deactivate it instead';
-            end if;
-
-            if exists (select 1 from public.invoice_lines il where il.product_plan_id = v_plan_id) then
-                raise exception 'plan is referenced by invoice lines; deactivate it instead';
-            end if;
-
-            if exists (select 1 from public.upsell_rules ur where ur.recommended_plan_id = v_plan_id) then
-                raise exception 'plan is used by upsell rules; remove those rules first';
-            end if;
-
-            if exists (select 1 from public.discount_codes dc where dc.applies_to_plan_id = v_plan_id) then
-                raise exception 'plan is used by discount codes; deactivate it instead';
-            end if;
-
-            delete from public.product_plans pp
-            where pp.id = v_plan_id
-            returning pp.id, pp.name
-            into v_row;
-
-            if not found then
-                raise exception 'product plan not found';
-            end if;
-
-            perform platform.log_audit(
-                'product_plan.deleted',
-                'product_plan',
-                v_row.id,
-                jsonb_build_object('name', v_row.name)
+            return public.subscription_plan_delete(
+                (p_payload->>'id')::uuid
             );
-
-            return jsonb_build_object('id', v_row.id, 'deleted', true);
 
 
         -- =================================================
@@ -3351,7 +3245,7 @@ begin
 
         when 'cancel_subscription' then
 
-            v_row := public.commerce_cancel_subscription(
+            v_row := public.subscription_cancel(
                 p_payload->>'reason'
             );
 
@@ -3360,7 +3254,7 @@ begin
 
         when 'undo_cancel_subscription' then
 
-            v_row := public.commerce_undo_cancel_subscription();
+            v_row := public.subscription_undo_cancel();
 
             return to_jsonb(v_row);
 
@@ -3835,6 +3729,274 @@ begin
             return jsonb_build_object('invoice_id', v_inv.id, 'status', 'queued');
 
 
+        -- =================================================
+        -- CUSTOMER-ACCOUNT DISCOUNT: TIERS (READ)
+        -- Tenant: global tiers + the tiers of its own account.
+        -- Platform admin with {"all": true}: every tier.
+        -- =================================================
+
+        when 'list_customer_account_discount_tiers' then
+
+            if public.is_platform_admin()
+               and coalesce((p_payload->>'all')::boolean, false) then
+
+                select coalesce(jsonb_agg(to_jsonb(d) order by d.customer_account_id nulls first, d.min_tenants, d.effective_from), '[]'::jsonb)
+                into v_result
+                from public.customer_account_discount_tiers d;
+
+                return v_result;
+
+            end if;
+
+            v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
+            select t.customer_account_id
+            into v_target
+            from public.tenants t
+            where t.id = v_tid;
+
+            select coalesce(jsonb_agg(to_jsonb(x) order by x.min_tenants), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    d.id,
+                    d.customer_account_id,
+                    d.min_tenants,
+                    d.discount_percent,
+                    d.label,
+                    d.effective_from,
+                    d.effective_to
+                from public.customer_account_discount_tiers d
+                where d.is_active
+                  and (
+                      d.customer_account_id is null
+                      or d.customer_account_id = v_target
+                  )
+            ) x;
+
+            return v_result;
+
+
+        -- =================================================
+        -- CUSTOMER-ACCOUNT DISCOUNT: WHAT APPLIES TO ME NOW
+        -- {customer_account_id, tenant_count, tier_id, min_tenants,
+        --  discount_percent, label, account_specific, effective_from}
+        -- =================================================
+
+        when 'get_customer_account_discount' then
+
+            v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
+            select t.customer_account_id
+            into v_target
+            from public.tenants t
+            where t.id = v_tid;
+
+            select to_jsonb(r)
+            into v_result
+            from platform.resolve_account_discount(v_target, now()) r;
+
+            return v_result;
+
+
+        -- =================================================
+        -- CUSTOMER-ACCOUNT DISCOUNT: TIER UPSERT (PLATFORM ADMIN)
+        -- Without "id": create. With "id": partial update.
+        -- customer_account_id null = global tier.
+        -- =================================================
+
+        when 'upsert_customer_account_discount_tier' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            if nullif(p_payload->>'id', '') is null then
+
+                insert into public.customer_account_discount_tiers (
+                    customer_account_id,
+                    min_tenants,
+                    discount_percent,
+                    label,
+                    effective_from,
+                    effective_to,
+                    is_active
+                )
+                values (
+                    nullif(p_payload->>'customer_account_id', '')::uuid,
+                    (p_payload->>'min_tenants')::integer,
+                    (p_payload->>'discount_percent')::numeric,
+                    nullif(btrim(coalesce(p_payload->>'label', '')), ''),
+                    coalesce(nullif(p_payload->>'effective_from', '')::timestamptz, now()),
+                    nullif(p_payload->>'effective_to', '')::timestamptz,
+                    coalesce((p_payload->>'is_active')::boolean, true)
+                )
+                returning id into v_target;
+
+            else
+
+                update public.customer_account_discount_tiers d
+                set
+                    customer_account_id = case
+                        when p_payload ? 'customer_account_id'
+                            then nullif(p_payload->>'customer_account_id', '')::uuid
+                        else d.customer_account_id
+                    end,
+                    min_tenants = case
+                        when p_payload ? 'min_tenants'
+                            then (p_payload->>'min_tenants')::integer
+                        else d.min_tenants
+                    end,
+                    discount_percent = case
+                        when p_payload ? 'discount_percent'
+                            then (p_payload->>'discount_percent')::numeric
+                        else d.discount_percent
+                    end,
+                    label = case
+                        when p_payload ? 'label'
+                            then nullif(btrim(coalesce(p_payload->>'label', '')), '')
+                        else d.label
+                    end,
+                    effective_from = case
+                        when p_payload ? 'effective_from'
+                            then (p_payload->>'effective_from')::timestamptz
+                        else d.effective_from
+                    end,
+                    effective_to = case
+                        when p_payload ? 'effective_to'
+                            then nullif(p_payload->>'effective_to', '')::timestamptz
+                        else d.effective_to
+                    end,
+                    is_active = case
+                        when p_payload ? 'is_active'
+                            then (p_payload->>'is_active')::boolean
+                        else d.is_active
+                    end
+                where d.id = (p_payload->>'id')::uuid
+                returning d.id into v_target;
+
+                if not found then
+                    raise exception 'discount tier not found';
+                end if;
+
+            end if;
+
+            perform platform.log_audit(
+                'customer_account_discount_tier.saved',
+                'customer_account_discount_tier',
+                v_target,
+                p_payload
+            );
+
+            select to_jsonb(d)
+            into v_result
+            from public.customer_account_discount_tiers d
+            where d.id = v_target;
+
+            return v_result;
+
+
+        when 'deactivate_customer_account_discount_tier' then
+
+            if (select auth.uid()) is null then
+                raise exception 'authentication required';
+            end if;
+
+            if not public.is_platform_admin() then
+                raise exception 'platform admin role required';
+            end if;
+
+            update public.customer_account_discount_tiers d
+            set is_active = false
+            where d.id = (p_payload->>'id')::uuid
+            returning d.id into v_target;
+
+            if not found then
+                raise exception 'discount tier not found';
+            end if;
+
+            perform platform.log_audit(
+                'customer_account_discount_tier.deactivated',
+                'customer_account_discount_tier',
+                v_target
+            );
+
+            return jsonb_build_object('id', v_target, 'is_active', false);
+
+
+        -- =================================================
+        -- CUSTOMER-ACCOUNT DISCOUNT: APPLY TO A DRAFT INVOICE
+        -- =================================================
+
+        when 'apply_account_discount_to_invoice' then
+
+            v_row := public.commerce_apply_account_discount_to_invoice(
+                (p_payload->>'invoice_id')::uuid
+            );
+
+            return to_jsonb(v_row);
+
+
+        -- =================================================
+        -- APPLIED DISCOUNTS (HISTORY, TENANT, READ ONLY)
+        -- =================================================
+
+        when 'list_applied_discounts' then
+
+            v_tid := platform.current_tenant_id();
+
+            if v_tid is null then
+                raise exception 'no active tenant';
+            end if;
+
+            v_limit := least(greatest(coalesce(nullif(p_payload->>'limit', '')::int, 50), 1), 200);
+            v_offset := greatest(coalesce(nullif(p_payload->>'offset', '')::int, 0), 0);
+
+            select coalesce(jsonb_agg(to_jsonb(t) order by t.applied_at desc), '[]'::jsonb)
+            into v_result
+            from (
+                select
+                    ad.id,
+                    ad.source,
+                    dc.code,
+                    ad.invoice_id,
+                    ad.subscription_id,
+                    ad.discount_type,
+                    ad.discount_value,
+                    ad.base_amount,
+                    ad.amount_applied,
+                    ad.currency,
+                    ad.tenant_count,
+                    ad.policy_snapshot,
+                    ad.applied_at
+                from public.applied_discounts ad
+                left join public.discount_codes dc
+                  on dc.id = ad.discount_code_id
+                where ad.tenant_id = v_tid
+                  and (
+                      nullif(p_payload->>'invoice_id', '') is null
+                      or ad.invoice_id = (p_payload->>'invoice_id')::uuid
+                  )
+                order by ad.applied_at desc
+                limit v_limit
+                offset v_offset
+            ) t;
+
+            return v_result;
+
+
         else
 
             raise exception
@@ -3903,105 +4065,27 @@ left join lateral (
 
 
 -- =====================================================
--- 25. DEFAULT SUBSCRIPTION PROVISIONING
+-- 25. DEFAULT SUBSCRIPTION PROVISIONING  (OWNED BY 002)
 -- =====================================================
 --
--- Called when a tenant is created.
---
--- The default commercial plan must already exist.
+-- provision_default_subscription and its tenant trigger are part
+-- of the subscription lifecycle in 002 (section 14C).
 -- =====================================================
-
-create or replace function public.provision_default_subscription()
-returns trigger
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_plan public.product_plans%rowtype;
-begin
-
-    select *
-    into v_plan
-    from public.product_plans
-    where is_default = true
-      and is_active = true
-    limit 1;
-
-    if not found then
-        raise exception
-            'cannot provision tenant subscription: no active default product plan exists';
-    end if;
-
-    insert into public.subscriptions (
-        tenant_id,
-        plan_id,
-        tier,
-        status
-    )
-    values (
-        new.id,
-        v_plan.id,
-        v_plan.tier,
-        'active'
-    );
-
-    return new;
-
-end;
-$$;
 
 
 -- =====================================================
 -- 26. TRIGGERS
 -- =====================================================
 
-drop trigger if exists trg_product_plans_updated_at
-on public.product_plans;
+-- Plan and subscription triggers: 002 (section 14C and 16).
 
-create trigger trg_product_plans_updated_at
-before update on public.product_plans
+drop trigger if exists trg_ca_discount_tiers_updated_at
+on public.customer_account_discount_tiers;
+
+create trigger trg_ca_discount_tiers_updated_at
+before update on public.customer_account_discount_tiers
 for each row
 execute function platform.set_updated_at();
-
-
-drop trigger if exists trg_product_plan_tier_immutable
-on public.product_plans;
-
-create trigger trg_product_plan_tier_immutable
-before update on public.product_plans
-for each row
-execute function public.prevent_product_plan_tier_change();
-
-
-drop trigger if exists trg_subscriptions_sync_tier_from_plan
-on public.subscriptions;
-
-create trigger trg_subscriptions_sync_tier_from_plan
-before insert or update of plan_id
-on public.subscriptions
-for each row
-execute function public.sync_subscription_tier_from_plan();
-
-
-drop trigger if exists trg_subscriptions_prevent_tier_drift
-on public.subscriptions;
-
-create trigger trg_subscriptions_prevent_tier_drift
-before insert or update
-on public.subscriptions
-for each row
-execute function public.prevent_subscription_tier_drift();
-
-
-drop trigger if exists trg_subscriptions_plan_required
-on public.subscriptions;
-
-create trigger trg_subscriptions_plan_required
-before insert or update
-on public.subscriptions
-for each row
-execute function public.enforce_subscription_plan_required();
 
 
 drop trigger if exists trg_billing_customers_updated_at
@@ -4039,23 +4123,6 @@ before insert or update
 on public.invoice_lines
 for each row
 execute function public.enforce_invoice_line_tenant();
-
-
--- =====================================================
--- 27. TENANT DEFAULT SUBSCRIPTION TRIGGER
--- =====================================================
---
--- This trigger is deliberately created only if the tenant
--- table does not already have an equivalent 012 trigger.
--- =====================================================
-
-drop trigger if exists trg_tenants_provision_default_subscription
-on public.tenants;
-
-create trigger trg_tenants_provision_default_subscription
-after insert on public.tenants
-for each row
-execute function public.provision_default_subscription();
 
 
 -- =====================================================
@@ -4873,9 +4940,6 @@ $$;
 -- 28. COMMENTS
 -- =====================================================
 
-comment on table public.product_plans is
-    'Commerce subscription plan catalog. Physical products and inventory are not owned here.';
-
 comment on table public.plan_pricing is
     'Historical and future commercial pricing for subscription plans.';
 
@@ -4884,9 +4948,6 @@ comment on table public.feature_entitlements is
 
 comment on table public.upsell_rules is
     'Commercial subscription upgrade recommendation rules.';
-
-comment on column public.subscriptions.plan_id is
-    'Commercial subscription plan reference owned by Commerce 012; subscription identity remains owned by Core SaaS 002.';
 
 comment on table public.billing_customers is
     'Fiscal billing identity a tenant is invoiced under. Epsilon matches customers on VAT number.';
@@ -4898,7 +4959,13 @@ comment on table public.invoice_lines is
     'Commercial invoice line items with VAT and myDATA classification. Immutable once the invoice is issued.';
 
 comment on table public.discount_codes is
-    'Commercial discount definitions. Customer-account discount ownership remains outside Commerce.';
+    'Discount code policy (Commerce 012).';
+
+comment on table public.customer_account_discount_tiers is
+    'Discount policy by number of tenants of a customer account (1 tenant = 0 %, 2 = x %, 3+ = y %). Null customer_account_id = global tiers. Tenant count is derived from 002.';
+
+comment on table public.applied_discounts is
+    'Insert-only history of discounts that were actually applied to invoices (code or customer-account tier), with percentage, base amount, tenant count and policy as they were.';
 
 comment on table public.discount_redemptions is
     'Immutable commercial record of discounts applied to invoices/subscriptions.';
@@ -4912,17 +4979,20 @@ comment on table public.invoice_snapshots is
 comment on table public.epsilon_submissions is
     'Epsilon e-invoicing outbox: API tracking, retries and idempotency keys.';
 
-comment on function public.commerce_change_subscription_plan(uuid, uuid) is
-    'Changes the commercial plan of a tenant subscription.';
-
 comment on function public.commerce_apply_discount_to_invoice(uuid, text) is
-    'Validates and applies a Commerce discount to a draft invoice, distributing it over the lines and recomputing VAT.';
+    'Validates and applies a discount code to a draft invoice, distributing it over the lines and recomputing VAT; writes the applied-discount snapshot.';
+
+comment on function platform.apply_account_tier_discount(uuid) is
+    'Applies the tenant-count tier discount of the invoice''s customer account to a draft invoice (idempotent) and writes the applied-discount snapshot.';
+
+comment on function platform.resolve_account_discount(uuid, timestamptz) is
+    'Resolves the tier that applies to a customer account: tenant count from 002 against customer_account_discount_tiers.';
 
 comment on function platform.epsilon_enqueue_invoice(uuid, text) is
     'Validates, freezes (snapshot + lock) and queues an invoice for Epsilon. Idempotent. Backend only.';
 
 comment on view public.v_subscription_overview is
-    'Read-only commerce view combining subscription, plan and currently effective pricing.';
+    'Read-only view combining the 002 subscription and plan with the currently effective 012 pricing.';
 
 
 -- =====================================================
@@ -4948,15 +5018,6 @@ to authenticated;
 
 
 revoke all
-on function public.commerce_change_subscription_plan(uuid, uuid)
-from public;
-
-grant execute
-on function public.commerce_change_subscription_plan(uuid, uuid)
-to authenticated;
-
-
-revoke all
 on function public.commerce_compute_discount_amount(text, numeric, numeric)
 from public;
 
@@ -4975,38 +5036,20 @@ to authenticated;
 
 
 revoke all
+on function public.commerce_apply_account_discount_to_invoice(uuid)
+from public;
+
+grant execute
+on function public.commerce_apply_account_discount_to_invoice(uuid)
+to authenticated;
+
+
+revoke all
 on function public.commerce_apply_discount_to_invoice(uuid, text)
 from public;
 
 grant execute
 on function public.commerce_apply_discount_to_invoice(uuid, text)
-to authenticated;
-
-
-revoke all
-on function public.commerce_cancel_subscription(text)
-from public;
-
-grant execute
-on function public.commerce_cancel_subscription(text)
-to authenticated;
-
-
-revoke all
-on function public.commerce_undo_cancel_subscription()
-from public;
-
-grant execute
-on function public.commerce_undo_cancel_subscription()
-to authenticated;
-
-
-revoke all
-on function public.commerce_create_subscription(uuid, uuid, text)
-from public;
-
-grant execute
-on function public.commerce_create_subscription(uuid, uuid, text)
 to authenticated;
 
 
@@ -5021,7 +5064,7 @@ insert into platform.schema_migrations (
 )
 values (
     '012_commerce_engine',
-    'REV2',
+    'REV1',
     false
 )
 on conflict (migration_name)
@@ -5036,9 +5079,10 @@ set
 --
 -- COMMERCE ONLY
 --
--- Logistics     -> 011
--- Device/BOM    -> 010
--- Inventory     -> 018
--- Customer/CRM  -> 003
--- Payment exec  -> 000
+-- Plans, subscription state, customer accounts -> 002
+-- CRM companies/contacts                       -> 003
+-- Device/BOM                                   -> 010
+-- Logistics                                    -> 011
+-- Inventory                                    -> 018
+-- Payment exec                                 -> 000
 -- =====================================================
