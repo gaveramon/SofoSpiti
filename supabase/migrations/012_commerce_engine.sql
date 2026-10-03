@@ -112,10 +112,15 @@ $$;
 -- 2. PLAN PRICING
 -- =====================================================
 --
--- Pricing history is retained through effective_from.
+-- Pricing history is retained: a price is valid from
+-- effective_from up to (not including) effective_until.
+-- effective_until null = open ended (the current price).
 --
 -- Multiple historical/future prices for the same plan and
--- currency are therefore allowed.
+-- currency are therefore allowed, but they must not overlap
+-- (trigger plan_pricing_maintain_history, section 12B).
+-- When a new open-ended price is added, the previous open-ended
+-- price is closed automatically at the new effective_from.
 -- =====================================================
 
 create table if not exists public.plan_pricing (
@@ -132,6 +137,8 @@ create table if not exists public.plan_pricing (
     yearly_price numeric(12,2),
 
     effective_from timestamptz not null default now(),
+
+    effective_until timestamptz,
 
     created_at timestamptz not null default now(),
 
@@ -160,8 +167,29 @@ create table if not exists public.plan_pricing (
         check (
             monthly_price is not null
             or yearly_price is not null
+        ),
+
+    constraint chk_plan_pricing_validity
+        check (
+            effective_until is null
+            or effective_until > effective_from
         )
 );
+
+
+-- Re-runnable on a database that already has the table.
+alter table public.plan_pricing
+    add column if not exists effective_until timestamptz;
+
+do $$
+begin
+    alter table public.plan_pricing
+        add constraint chk_plan_pricing_validity
+        check (effective_until is null or effective_until > effective_from);
+exception
+    when duplicate_object then null;
+end;
+$$;
 
 
 -- =====================================================
@@ -720,8 +748,8 @@ create table if not exists public.discount_redemptions (
 -- 8B. CUSTOMER-ACCOUNT DISCOUNT TIERS
 -- =====================================================
 --
--- Discount POLICY based on the number of tenants with paid subscription
---  a customer account has (002: customer_accounts -> tenants):
+-- Discount POLICY based on the number of tenants a customer
+-- account has (002: customer_accounts -> tenants):
 --
 --   1 tenant   -> 0 %
 --   2 tenants  -> x %
@@ -1106,6 +1134,112 @@ on public.discount_redemptions (
     invoice_id
 )
 where invoice_id is not null;
+
+
+-- =====================================================
+-- 12B. PLAN PRICING HISTORY
+-- =====================================================
+--
+-- Keeps the price history gap-free and overlap-free per plan
+-- and currency:
+--   insert (open ended)  -> the previous open-ended price is
+--                           closed at the new effective_from
+--   update of effective_from -> the previous price follows
+--   delete of a price    -> the price it had closed is reopened
+--   every change         -> periods of one plan/currency may not
+--                           overlap
+-- Which price is valid at moment t:
+--   effective_from <= t and (effective_until is null or t < effective_until)
+-- =====================================================
+
+create or replace function public.plan_pricing_maintain_history()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+
+    if tg_op = 'DELETE' then
+
+        update public.plan_pricing px
+        set effective_until = null
+        where px.plan_id = old.plan_id
+          and px.currency = old.currency
+          and px.effective_until = old.effective_from;
+
+        return old;
+
+    end if;
+
+    -- Changes made by this trigger to neighbouring rows.
+    if pg_trigger_depth() > 1 then
+        return new;
+    end if;
+
+    if tg_op = 'INSERT' and new.effective_until is null then
+
+        update public.plan_pricing px
+        set effective_until = new.effective_from
+        where px.plan_id = new.plan_id
+          and px.currency = new.currency
+          and px.effective_until is null
+          and px.effective_from < new.effective_from;
+
+    elsif tg_op = 'UPDATE'
+          and new.effective_from is distinct from old.effective_from then
+
+        update public.plan_pricing px
+        set effective_until = new.effective_from
+        where px.plan_id = old.plan_id
+          and px.currency = old.currency
+          and px.effective_until = old.effective_from
+          and px.id <> old.id;
+
+    end if;
+
+    if exists (
+        select 1
+        from public.plan_pricing px
+        where px.id <> new.id
+          and px.plan_id = new.plan_id
+          and px.currency = new.currency
+          and tstzrange(px.effective_from, px.effective_until)
+              && tstzrange(new.effective_from, new.effective_until)
+    ) then
+        raise exception
+            'plan pricing periods may not overlap (plan %, currency %)',
+            new.plan_id, new.currency;
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+drop trigger if exists trg_plan_pricing_history
+on public.plan_pricing;
+
+create trigger trg_plan_pricing_history
+before insert or update of plan_id, currency, effective_from, effective_until
+on public.plan_pricing
+for each row
+execute function public.plan_pricing_maintain_history();
+
+
+drop trigger if exists trg_plan_pricing_history_delete
+on public.plan_pricing;
+
+create trigger trg_plan_pricing_history_delete
+after delete
+on public.plan_pricing
+for each row
+execute function public.plan_pricing_maintain_history();
+
+
+revoke all on function public.plan_pricing_maintain_history()
+from public, anon, authenticated;
 
 
 -- =====================================================
@@ -2157,7 +2291,8 @@ begin
                                         'currency', px.currency,
                                         'monthly_price', px.monthly_price,
                                         'yearly_price', px.yearly_price,
-                                        'effective_from', px.effective_from
+                                        'effective_from', px.effective_from,
+                                        'effective_until', px.effective_until
                                     )
                                     order by px.effective_from desc
                                 )
@@ -2213,7 +2348,8 @@ begin
                                 'currency', px.currency,
                                 'monthly_price', px.monthly_price,
                                 'yearly_price', px.yearly_price,
-                                'effective_from', px.effective_from
+                                'effective_from', px.effective_from,
+                                'effective_until', px.effective_until
                             )
                             order by px.effective_from desc
                         )
@@ -2673,7 +2809,8 @@ begin
                     px.currency,
                     px.monthly_price,
                     px.yearly_price,
-                    px.effective_from
+                    px.effective_from,
+                    px.effective_until
                 from public.plan_pricing px
                 join public.product_plans pp
                   on pp.id = px.plan_id
@@ -2710,14 +2847,16 @@ begin
                 currency,
                 monthly_price,
                 yearly_price,
-                effective_from
+                effective_from,
+                effective_until
             )
             values (
                 (p_payload->>'plan_id')::uuid,
                 upper(btrim(coalesce(p_payload->>'currency', 'EUR'))),
                 nullif(p_payload->>'monthly_price', '')::numeric,
                 nullif(p_payload->>'yearly_price', '')::numeric,
-                coalesce(nullif(p_payload->>'effective_from', '')::timestamptz, now())
+                coalesce(nullif(p_payload->>'effective_from', '')::timestamptz, now()),
+                nullif(p_payload->>'effective_until', '')::timestamptz
             )
             returning *
             into v_row;
@@ -2768,6 +2907,12 @@ begin
                     when p_payload ? 'effective_from'
                         then (p_payload->>'effective_from')::timestamptz
                     else px.effective_from
+                end,
+
+                effective_until = case
+                    when p_payload ? 'effective_until'
+                        then nullif(p_payload->>'effective_until', '')::timestamptz
+                    else px.effective_until
                 end
 
             where px.id = (p_payload->>'id')::uuid
@@ -4038,7 +4183,9 @@ select
 
     pricing.yearly_price,
 
-    pricing.effective_from as pricing_effective_from
+    pricing.effective_from as pricing_effective_from,
+
+    pricing.effective_until as pricing_effective_until
 
 from public.subscriptions s
 
@@ -4050,12 +4197,14 @@ left join lateral (
         px.currency,
         px.monthly_price,
         px.yearly_price,
-        px.effective_from
+        px.effective_from,
+        px.effective_until
 
     from public.plan_pricing px
 
     where px.plan_id = s.plan_id
       and px.effective_from <= now()
+      and (px.effective_until is null or px.effective_until > now())
 
     order by px.effective_from desc
 
@@ -5064,7 +5213,7 @@ insert into platform.schema_migrations (
 )
 values (
     '012_commerce_engine',
-    'REV1',
+    'REV3',
     false
 )
 on conflict (migration_name)
