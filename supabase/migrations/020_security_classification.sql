@@ -1764,6 +1764,32 @@ values
 
     (
         'public',
+        'customer_account_discount_tiers',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Discount policy by number of tenants per customer account (global or account-specific tiers). Platform admins maintain tiers by RPC only; tenants read the tier that applies to them through commerce API/RPC contracts.'
+    ),
+
+    (
+        'public',
+        'applied_discounts',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Insert-only history of discounts actually applied to invoices (code or customer-account tier). Portal reads through commerce API/RPC contracts; writes only by commerce functions.'
+    ),
+
+    (
+        'public',
         'billing_item_mappings',
         'backend',
         'none',

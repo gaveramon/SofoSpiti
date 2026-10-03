@@ -46,7 +46,7 @@
 -- IMPORTANT
 -- ---------
 --
--- 020 owns:
+-- 021 owns:
 --   - RLS
 --   - FORCE RLS
 --   - SECURITY DEFINER hardening
@@ -2117,6 +2117,44 @@ with seed (
         'billing_customers',
         'system',
         'Internal server-side system context (invoice generator, Epsilon gateway) maintains billing customers and the Epsilon customer code.'
+    ),
+
+    (
+        'public',
+        'customer_account_discount_tiers',
+        'portal_user',
+        'Portal users read the discount tier that applies to their customer account through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'customer_account_discount_tiers',
+        'platform_admin',
+        'Platform administrators maintain customer-account discount tiers.'
+    ),
+    (
+        'public',
+        'customer_account_discount_tiers',
+        'system',
+        'Invoice generator reads tiers to apply the customer-account discount.'
+    ),
+
+    (
+        'public',
+        'applied_discounts',
+        'portal_user',
+        'Portal users read the history of discounts applied to their invoices through approved commerce API/RPC contracts.'
+    ),
+    (
+        'public',
+        'applied_discounts',
+        'platform_admin',
+        'Platform administrators review applied discounts when investigating invoices.'
+    ),
+    (
+        'public',
+        'applied_discounts',
+        'system',
+        'Invoice generator and commerce functions write the applied-discount snapshot.'
     ),
 
     (

@@ -60,7 +60,7 @@ begin
        or to_regprocedure('platform.mark_overdue_invoices()') is null
        or to_regprocedure('platform.expire_trial_subscriptions()') is null then
         raise exception
-            '027 requires the platform job functions from 012 (sections 19A, 19C, 19D, 27A)';
+            '027 requires the platform job functions: expire_cancelled_subscriptions and expire_trial_subscriptions (002), mark_overdue_invoices and epsilon_flag_stuck (012)';
     end if;
 
     if to_regclass('platform.schema_migrations') is null then
@@ -97,7 +97,7 @@ insert into platform.scheduled_jobs (
 )
 values
 
-    -- Cancellations per end of month (012 section 19A).
+    -- Cancellations per end of month (002 section 14C).
     (
         'expire_cancelled_subscriptions',
         '0 * * * *',
@@ -170,7 +170,7 @@ values
     ),
 
     -- trial -> trial_expired when current_period_end has passed
-    -- (012 section 19D).
+    -- (002 section 014B).
     (
         'expire_trial_subscriptions',
         '15 * * * *',
@@ -390,7 +390,10 @@ begin
                 v_rows := platform.mark_overdue_invoices();
 
             when 'commerce.expire_trial_subscriptions' then
-                v_rows := platform.expire_trial_subscriptions();
+                -- 002 returns (subscriptions_expired, seconds_elapsed).
+                select t.subscriptions_expired::int
+                into v_rows
+                from platform.expire_trial_subscriptions() t;
 
             when 'platform.cleanup_job_executions' then
                 v_rows := platform.cleanup_job_executions(
