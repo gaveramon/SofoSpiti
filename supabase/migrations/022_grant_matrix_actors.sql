@@ -2361,6 +2361,73 @@ with seed (
     ),
 
     -- =================================================
+    -- 014 ONBOARDING ENGINE — INTERNAL PRECONFIG
+    -- =================================================
+
+    (
+        'public',
+        'onboarding_preconfig',
+        'portal_user',
+        'Portal access is mediated exclusively through the onboarding domain/API contract; no direct table access.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig',
+        'platform_admin',
+        'Platform administration is mediated exclusively through explicitly authorized onboarding administration RPCs; no direct table access.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig',
+        'system',
+        'Internal onboarding domain and controlled server-side operations require table access through SECURITY DEFINER domain functions.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig_transitions',
+        'portal_user',
+        'Portal access is mediated exclusively through the onboarding domain/API contract; transition history is read-only from the portal perspective.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig_transitions',
+        'platform_admin',
+        'Platform administration and audit access is mediated exclusively through explicitly authorized onboarding administration RPCs; no direct table access.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig_transitions',
+        'system',
+        'Internal onboarding domain functions require controlled access to append immutable preconfiguration transition history.'
+    ),
+
+    (
+        'public',
+        'onboarding_catalog_snapshots',
+        'portal_user',
+        'Portal access is mediated exclusively through the onboarding domain/API contract; catalog snapshots are immutable historical records.'
+    ),
+
+    (
+        'public',
+        'onboarding_catalog_snapshots',
+        'platform_admin',
+        'Platform administration and support access is mediated exclusively through explicitly authorized onboarding administration RPCs; no direct table access.'
+    ),
+
+    (
+        'public',
+        'onboarding_catalog_snapshots',
+        'system',
+        'Internal onboarding domain functions require controlled access to create and read immutable catalog snapshots.'
+    ),
+
+    -- =================================================
     -- 015 OPTIMIZATION
     -- =================================================
 

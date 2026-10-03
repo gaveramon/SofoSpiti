@@ -1992,6 +1992,49 @@ values
     ),
 
     -- =================================================
+    -- 014 ONBOARDING ENGINE — INTERNAL PRECONFIG
+    -- =================================================
+
+    (
+        'public',
+        'onboarding_preconfig',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Tenant-scoped internal preconfiguration status for onboarding sessions. Portal access exclusively through approved onboarding API/RPC contracts; no direct authenticated table access. RLS and FORCE RLS are required.'
+    ),
+
+    (
+        'public',
+        'onboarding_preconfig_transitions',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Immutable tenant-scoped history of internal preconfiguration status transitions. Portal read access exclusively through approved onboarding API/RPC contracts; writes only through controlled onboarding domain functions. RLS and FORCE RLS are required.'
+    ),
+
+    (
+        'public',
+        'onboarding_catalog_snapshots',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Immutable tenant-scoped snapshot of the catalog configuration used for an onboarding session. Portal read access exclusively through approved onboarding API/RPC contracts; no direct authenticated table access. RLS and FORCE RLS are required.'
+    ),
+
+    -- =================================================
     -- 015 OPTIMIZATION ENGINE
     -- =================================================
 

@@ -428,7 +428,7 @@ begin
         order by c.table_name
     loop
         raise warning
-            '023 bootstrap: public.% has tenant_id but RLS is disabled or has no policies',
+            '024 bootstrap: public.% has tenant_id but RLS is disabled or has no policies',
             v_row.table_name;
     end loop;
 end $$;

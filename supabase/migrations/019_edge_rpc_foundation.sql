@@ -621,11 +621,26 @@ language plpgsql
 security definer
 set search_path = ''
 as $$
+declare
+    v_subscription_id uuid;
 begin
     perform public.edge_require_admin();
 
-    return public.commerce_change_subscription_plan(
-        p_plan_id
+    -- 002: exactly one subscription per tenant.
+    select s.id
+    into v_subscription_id
+    from public.subscriptions s
+    where s.tenant_id = platform.current_tenant_id();
+
+    if v_subscription_id is null then
+        raise exception 'no subscription for the active tenant';
+    end if;
+
+    return to_jsonb(
+        public.subscription_change_plan(
+            v_subscription_id,
+            p_plan_id
+        )
     );
 end;
 $$;
@@ -710,12 +725,33 @@ set search_path = ''
 as $$
 declare
     v_row jsonb;
+    v_plan_tier public.subscription_tier;
 begin
     perform public.edge_require_admin();
 
-    v_row := public.commerce_create_subscription(
-        p_plan_id,
-        p_tier
+    -- The tier is derived from the plan; a given tier must agree.
+    if p_tier is not null then
+
+        select pp.tier
+        into v_plan_tier
+        from public.product_plans pp
+        where pp.id = p_plan_id;
+
+        if found and v_plan_tier <> p_tier then
+            raise exception 'tier does not match the plan tier';
+        end if;
+
+    end if;
+
+    -- Self-service creation starts as 'pending'. Note: a tenant already
+    -- has its subscription from tenant provisioning (unique per tenant),
+    -- so this normally raises; use change_subscription_plan instead.
+    v_row := to_jsonb(
+        public.subscription_create(
+            platform.current_tenant_id(),
+            p_plan_id,
+            'pending'
+        )
     );
 
     perform public.insert_event(
@@ -1260,10 +1296,35 @@ begin
         when
             'create_upsell_rule',
             'update_upsell_rule',
-            'delete_upsell_rule',
-            'change_plan'
+            'delete_upsell_rule'
         then
             perform public.edge_require_manager();
+
+        -- Customer-account discount tiers (012 section 8B): policy is
+        -- maintained by platform admins; the tenant reads what applies
+        -- to it and the applied-discount history.
+        when
+            'list_customer_account_discount_tiers',
+            'upsert_customer_account_discount_tier',
+            'deactivate_customer_account_discount_tier'
+        then
+            perform public.edge_require_platform_admin();
+
+        when
+            'get_customer_account_discount',
+            'apply_account_discount_to_invoice',
+            'list_applied_discounts'
+        then
+            perform public.edge_require_manager();
+
+        -- Billing-impacting subscription changes: tenant admin.
+        when
+            'change_plan',
+            'change_subscription_plan',
+            'cancel_subscription',
+            'undo_cancel_subscription'
+        then
+            perform public.edge_require_admin();
 
         when
             'list_discount_codes',
@@ -1284,7 +1345,7 @@ begin
         then
             perform public.edge_require_manager();
 
-        -- Epsilon e-invoicing administration (012 section 16).
+        -- Epsilon e-invoicing administration (012 section 27A).
         -- Tables are backend-only; platform admins manage them by RPC only.
         when
             'list_billing_item_mappings',
@@ -2335,12 +2396,12 @@ $$;
 -- 8. MIGRATION REGISTRATION
 -- =====================================================
 --
--- 017 EDGE RPC FOUNDATION
+-- 019 EDGE RPC FOUNDATION
 --
 -- Security/API foundation only.
 --
--- RLS belongs to 020.
--- Grants/revokes belong to 022.
+-- RLS belongs to 021.
+-- Grants/revokes belong to 023.
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name,version,rollback_available)

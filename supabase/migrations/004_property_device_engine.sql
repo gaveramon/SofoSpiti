@@ -22,8 +22,8 @@
 --   004 does NOT contain provider-specific integration logic.
 --
 -- SECURITY BOUNDARY:
---   020 = security hardening
---   022 = EXECUTE/API grant boundary
+--   021 = security hardening
+--   023 = EXECUTE/API grant boundary
 --
 -- PUBLIC API:
 --   public.devices_api(text,jsonb)
@@ -33,7 +33,7 @@
 --
 -- IMPORTANT:
 --   devices_domain remains an internal SECURITY DEFINER domain function.
---   devices_api is the authenticated-facing API contract expected by 022.
+--   devices_api is the authenticated-facing API contract expected by 023.
 --
 -- AUDIT:
 --   platform.log_audit() is owned by the Platform/Audit layer 000.
@@ -506,7 +506,7 @@ $$;
 --
 -- INTERNAL DOMAIN FUNCTION.
 --
--- 022 deliberately revokes authenticated EXECUTE
+-- 023 deliberately revokes authenticated EXECUTE
 -- from *_domain functions.
 --
 -- public.devices_api() below is the approved external
@@ -1941,7 +1941,7 @@ $$;
 -- =====================================================
 -- 15. APPROVED PUBLIC DEVICE API BOUNDARY
 --
--- 022 grants authenticated EXECUTE to this function.
+-- 023 grants authenticated EXECUTE to this function.
 --
 -- devices_domain remains internal.
 --
@@ -1971,7 +1971,7 @@ comment on function public.devices_api(text, jsonb) is
 
 
 comment on function public.devices_domain(text, jsonb) is
-    'Internal Property & Device domain function. Not an authenticated API surface. EXECUTE boundary controlled by 022.';
+    'Internal Property & Device domain function. Not an authenticated API surface. EXECUTE boundary controlled by 023.';
 
 
 -- =====================================================
