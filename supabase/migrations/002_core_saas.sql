@@ -265,7 +265,7 @@ create table if not exists public.service_accounts (
 
 
 -- =====================================================
--- 4B. PRODUCT PLANS (PLAN / SUBSCRIPTION TYPE)
+-- 5. PRODUCT PLANS (PLAN / SUBSCRIPTION TYPE)
 -- =====================================================
 --
 -- A plan is the TYPE of subscription a tenant can have:
@@ -300,133 +300,6 @@ create table if not exists public.product_plans (
         check (btrim(name) <> '')
 );
 
-
--- =====================================================
--- 5. SUBSCRIPTIONS (SUBSCRIPTION INSTANCE)
--- =====================================================
---
--- Subscription ownership remains tenant-based.
---
--- Customer-account ownership is deliberately NOT duplicated
--- here.
---
--- The relationship is:
---
---   customer_account
---       |
---   tenant
---       |
---   subscription  --> product_plans (which plan)
---
--- A subscription row is the INSTANCE: which plan the tenant has,
--- its status, its term (current_period_*) and its cancellation
--- state.
---
--- Commerce can aggregate all subscriptions belonging to the same
--- customer account without making the subscription itself
--- responsible for customer ownership.
---
---   Customer A
---       Tenant 1 -> Pro
---       Tenant 2 -> Pro
---       Tenant 3 -> Pro
---
--- 002 does NOT calculate or store prices or discounts.
--- The discount that was actually applied is recorded by
--- Commerce (012: applied_discounts).
---
--- Cancellation is per end of month only:
---   cancel_requested_at  when the customer asked
---   cancel_effective_at  first instant of the next month
---                        (platform.billing_timezone())
---   status stays 'active' until the end-of-month job
---   platform.expire_cancelled_subscriptions() sets 'cancelled'.
--- =====================================================
-
-create table if not exists public.subscriptions (
-    id uuid primary key default gen_random_uuid(),
-
-    tenant_id uuid not null
-        references public.tenants(id)
-        on delete cascade,
-
-    plan_id uuid
-        references public.product_plans(id)
-        on delete restrict,
-
-    tier public.subscription_tier not null,
-
-    status public.subscription_status not null default 'trial',
-
-    current_period_start timestamptz,
-
-    current_period_end timestamptz,
-
-    cancel_requested_at timestamptz,
-
-    cancel_effective_at timestamptz,
-
-    cancel_reason text,
-
-    created_at timestamptz not null default now(),
-
-    updated_at timestamptz not null default now(),
-
-    -- The current 002 domain model exposes exactly one
-    -- subscription for a tenant.
-    --
-    -- Without this constraint, get_subscription() and
-    -- update_subscription() could operate on multiple rows,
-    -- which would violate the SSOT model.
-    unique (tenant_id),
-
-    constraint chk_subscriptions_cancellation
-        check (
-            (cancel_requested_at is null and cancel_effective_at is null)
-            or (
-                cancel_requested_at is not null
-                and cancel_effective_at is not null
-                and cancel_effective_at > cancel_requested_at
-            )
-        )
-);
-
-
--- Re-runnable on a database that already has the pre-REV23 table.
-alter table public.subscriptions
-    add column if not exists plan_id uuid,
-    add column if not exists cancel_requested_at timestamptz,
-    add column if not exists cancel_effective_at timestamptz,
-    add column if not exists cancel_reason text;
-
-do $$
-begin
-    alter table public.subscriptions
-        add constraint fk_subscriptions_plan
-        foreign key (plan_id)
-        references public.product_plans(id)
-        on delete restrict;
-exception
-    when duplicate_object then null;
-end;
-$$;
-
-do $$
-begin
-    alter table public.subscriptions
-        add constraint chk_subscriptions_cancellation
-        check (
-            (cancel_requested_at is null and cancel_effective_at is null)
-            or (
-                cancel_requested_at is not null
-                and cancel_effective_at is not null
-                and cancel_effective_at > cancel_requested_at
-            )
-        );
-exception
-    when duplicate_object then null;
-end;
-$$;
 
 
 -- =====================================================
@@ -3399,36 +3272,25 @@ before update on public.customer_accounts
 for each row
 execute function platform.set_updated_at();
 
-
 create trigger trg_tenants_updated_at
 before update on public.tenants
 for each row
 execute function platform.set_updated_at();
-
 
 create trigger trg_memberships_updated_at
 before update on public.tenant_memberships
 for each row
 execute function platform.set_updated_at();
 
-
 create trigger trg_tenant_bootstrap_owner
 after insert on public.tenants
 for each row
 execute function public.handle_new_tenant();
 
-
 create trigger trg_memberships_owner_invariant
 before update or delete on public.tenant_memberships
 for each row
 execute function public.enforce_tenant_owner_invariant();
-
-
-create trigger trg_subscriptions_updated_at
-before update on public.subscriptions
-for each row
-execute function platform.set_updated_at();
-
 
 drop trigger if exists trg_product_plans_updated_at
 on public.product_plans;
@@ -3437,7 +3299,6 @@ create trigger trg_product_plans_updated_at
 before update on public.product_plans
 for each row
 execute function platform.set_updated_at();
-
 
 -- =====================================================
 -- 17. FINAL FUNCTION SECURITY ATTRIBUTES

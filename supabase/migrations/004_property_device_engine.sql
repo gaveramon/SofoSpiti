@@ -61,9 +61,70 @@ create table if not exists public.properties (
 
     created_at timestamptz default now(),
 
-    updated_at timestamptz default now()
+    updated_at timestamptz default now(),
+
+    -- Supports composite FK from subscriptions:
+    -- property_id + tenant_id must always resolve to
+    -- the same property/tenant combination.
+    unique (id, tenant_id)
 );
 
+
+-- =====================================================
+-- 1A. SUBSCRIPTIONS
+--
+-- One subscription = one property.
+--
+-- tenant_id remains the tenant/security boundary.
+-- property_id identifies the actual Airbnb/building
+-- for which the subscription is purchased.
+--
+-- Customer-account ownership is NOT duplicated here.
+-- It is derived through:
+--
+--   subscription
+--       ↓
+--   property
+--       ↓
+--   tenant
+--       ↓
+--   customer_account
+--
+-- Commerce/012 determines pricing and discounts.
+-- 004 owns the property subscription relationship because
+-- the subscription has a direct dependency on properties.
+-- =====================================================
+
+create table if not exists public.subscriptions (
+    id uuid primary key default gen_random_uuid(),
+
+    tenant_id uuid not null
+        references public.tenants(id)
+        on delete cascade,
+
+    property_id uuid not null,
+
+    tier public.subscription_tier not null,
+
+    status public.subscription_status not null default 'trial',
+
+    current_period_start timestamptz,
+
+    current_period_end timestamptz,
+
+    created_at timestamptz not null default now(),
+
+    updated_at timestamptz not null default now(),
+
+    -- A property can have exactly one subscription.
+    unique (property_id),
+
+    -- Prevent a subscription from linking a property
+    -- belonging to another tenant.
+    foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete cascade
+);
 
 -- =====================================================
 -- 2. ROOMS (LOGICAL STRUCTURE INSIDE PROPERTY)
@@ -195,6 +256,12 @@ create table if not exists public.device_configurations (
 -- =====================================================
 -- 7. INDEXES
 -- =====================================================
+
+create index if not exists idx_subscriptions_tenant
+on public.subscriptions (tenant_id);
+
+create index if not exists idx_subscriptions_tenant_property
+on public.subscriptions (tenant_id, property_id);
 
 create index if not exists idx_properties_tenant
 on public.properties (tenant_id);
@@ -2228,10 +2295,185 @@ begin
 end;
 $$;
 
+-- -----------------------------------------------------
+-- 9b. Subscription functions
+-- -----------------------------------------------------
+
+-- Active subscription states require a plan.
+create or replace function public.enforce_subscription_plan_required()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+
+    -- subscription_status enum: trial (not 'trialing').
+    if new.status in ('active', 'trial', 'past_due')
+       and new.plan_id is null then
+
+        raise exception
+            'subscription plan_id is required for status %',
+            new.status;
+
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+-- The tier follows the plan.
+create or replace function public.sync_subscription_tier_from_plan()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_tier public.subscription_tier;
+begin
+
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    new.tier := v_tier;
+
+    return new;
+
+end;
+$$;
+
+
+create or replace function public.prevent_subscription_tier_drift()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_tier public.subscription_tier;
+begin
+
+    if new.plan_id is null then
+        return new;
+    end if;
+
+    select pp.tier
+    into v_tier
+    from public.product_plans pp
+    where pp.id = new.plan_id;
+
+    if not found then
+        raise exception
+            'subscription plan % not found',
+            new.plan_id;
+    end if;
+
+    if new.tier <> v_tier then
+        raise exception
+            'subscription tier must match product plan tier';
+    end if;
+
+    return new;
+
+end;
+$$;
+
+
+-- Once a plan is used by subscriptions its tier is immutable.
+-- Create a new plan instead.
+create or replace function public.prevent_product_plan_tier_change()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+
+    if new.tier is distinct from old.tier
+       and exists (
+            select 1
+            from public.subscriptions s
+            where s.plan_id = old.id
+       )
+    then
+
+        raise exception
+            'product plan tier cannot change after the plan has been used by subscriptions';
+
+    end if;
+
+    return new;
+
+end;
+$$;
+
 
 -- =====================================================
 -- 20. TRIGGERS
 -- =====================================================
+
+drop trigger if exists trg_subscriptions_updated_at
+on public.subscriptions;
+
+create trigger trg_subscriptions_updated_at
+before update on public.subscriptions
+for each row
+execute function platform.set_updated_at();
+
+drop trigger if exists trg_product_plan_tier_immutable
+on public.product_plans;
+
+create trigger trg_product_plan_tier_immutable
+before update on public.product_plans
+for each row
+execute function public.prevent_product_plan_tier_change();
+
+drop trigger if exists trg_subscriptions_sync_tier_from_plan
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_prevent_tier_drift
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_plan_required
+on public.subscriptions;
+
+drop trigger if exists trg_subscriptions_01_sync_tier_from_plan
+on public.subscriptions;
+
+create trigger trg_subscriptions_01_sync_tier_from_plan
+before insert or update of plan_id
+on public.subscriptions
+for each row
+execute function public.sync_subscription_tier_from_plan();
+
+drop trigger if exists trg_subscriptions_02_prevent_tier_drift
+on public.subscriptions;
+
+create trigger trg_subscriptions_02_prevent_tier_drift
+before insert or update
+on public.subscriptions
+for each row
+execute function public.prevent_subscription_tier_drift();
+
+drop trigger if exists trg_subscriptions_03_plan_required
+on public.subscriptions;
+
+create trigger trg_subscriptions_03_plan_required
+before insert or update
+on public.subscriptions
+for each row
+execute function public.enforce_subscription_plan_required();
 
 drop trigger if exists trg_properties_updated_at
 on public.properties;

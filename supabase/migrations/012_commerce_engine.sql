@@ -63,7 +63,7 @@ end if;
 
 if to_regclass('public.subscriptions') is null then
     raise exception
-        '012 requires public.subscriptions from the core SaaS layer';
+        '012 requires public.subscriptions from the Property & Device Engine (004)';
 end if;
 
 if to_regclass('public.product_plans') is null then
