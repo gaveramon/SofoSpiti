@@ -2218,6 +2218,14 @@ $$;
 -- =====================================================
 -- 7.17 PRECONFIG API
 -- =====================================================
+--
+-- Vervang in 019 sectie 7.17 de functie public.preconfig_api().
+-- Wijziging: publish_device_bundle, publish_onboarding_blueprint en
+-- publish_preconfig_template zijn toegevoegd aan de platform-admin
+-- allowlist. De operaties bestonden al in preconfig_domain (010),
+-- maar werden door deze wrapper als "unknown operation" geweigerd.
+-- Zonder publish kan 014 geen catalog snapshot maken.
+-- =====================================================
 
 create or replace function public.preconfig_api(
     p_op text,
@@ -2250,18 +2258,21 @@ begin
             'create_device_bundle',
             'update_device_bundle',
             'delete_device_bundle',
+            'publish_device_bundle',
             'create_bundle_device',
             'update_bundle_device',
             'delete_bundle_device',
             'create_onboarding_blueprint',
             'update_onboarding_blueprint',
             'delete_onboarding_blueprint',
+            'publish_onboarding_blueprint',
             'create_blueprint_step',
             'update_blueprint_step',
             'delete_blueprint_step',
             'create_preconfig_template',
             'update_preconfig_template',
             'delete_preconfig_template',
+            'publish_preconfig_template',
             'create_preconfig_device_map',
             'update_preconfig_device_map',
             'delete_preconfig_device_map'
@@ -2280,7 +2291,6 @@ begin
     );
 end;
 $$;
-
 
 -- =====================================================
 -- 7.18 API / BACKEND BOUNDARY

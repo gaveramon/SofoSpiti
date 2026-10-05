@@ -60,7 +60,7 @@ begin
        or to_regprocedure('platform.mark_overdue_invoices()') is null
        or to_regprocedure('platform.expire_trial_subscriptions()') is null then
         raise exception
-            '027 requires the platform job functions: expire_cancelled_subscriptions and expire_trial_subscriptions (002), mark_overdue_invoices and epsilon_flag_stuck (012)';
+            '027 requires the platform job functions from 012 (sections 19A, 19C, 19D, 27A)';
     end if;
 
     if to_regclass('platform.schema_migrations') is null then
@@ -97,11 +97,11 @@ insert into platform.scheduled_jobs (
 )
 values
 
-    -- Cancellations per end of month (002 section 14C).
+    -- Cancellations per end of month (012 section 19A).
     (
         'expire_cancelled_subscriptions',
         '0 * * * *',
-        'commerce.expire_cancelled_subscriptions',
+        'public.expire_cancelled_subscriptions',
         true,
         '{}'::jsonb
     ),
@@ -110,7 +110,7 @@ values
     (
         'epsilon_flag_stuck',
         '*/5 * * * *',
-        'commerce.epsilon_flag_stuck',
+        'public.epsilon_flag_stuck',
         true,
         '{"stuck_minutes": 10}'::jsonb
     ),
@@ -145,7 +145,7 @@ values
     (
         'mark_overdue_invoices',
         '30 2 * * *',
-        'commerce.mark_overdue_invoices',
+        'public.mark_overdue_invoices',
         true,
         '{}'::jsonb
     ),
@@ -164,17 +164,17 @@ values
     (
         'generate_monthly_invoices',
         '0 3 1 * *',
-        'commerce.generate_monthly_invoices',
+        'public.generate_monthly_invoices',
         false,
         '{"note": "generator not implemented"}'::jsonb
     ),
 
     -- trial -> trial_expired when current_period_end has passed
-    -- (002 section 014B).
+    -- (012 section 19D).
     (
         'expire_trial_subscriptions',
         '15 * * * *',
-        'commerce.expire_trial_subscriptions',
+        'public.expire_trial_subscriptions',
         true,
         '{}'::jsonb
     )
@@ -375,10 +375,10 @@ begin
 
         case v_job.handler
 
-            when 'commerce.expire_cancelled_subscriptions' then
+            when 'public.expire_cancelled_subscriptions' then
                 v_rows := platform.expire_cancelled_subscriptions();
 
-            when 'commerce.epsilon_flag_stuck' then
+            when 'public.epsilon_flag_stuck' then
                 v_rows := platform.epsilon_flag_stuck(
                     coalesce(
                         nullif(v_job.metadata->>'stuck_minutes', '')::int,
@@ -386,14 +386,11 @@ begin
                     )
                 );
 
-            when 'commerce.mark_overdue_invoices' then
+            when 'public.mark_overdue_invoices' then
                 v_rows := platform.mark_overdue_invoices();
 
-            when 'commerce.expire_trial_subscriptions' then
-                -- 002 returns (subscriptions_expired, seconds_elapsed).
-                select t.subscriptions_expired::int
-                into v_rows
-                from platform.expire_trial_subscriptions() t;
+            when 'public.expire_trial_subscriptions' then
+                v_rows := platform.expire_trial_subscriptions();
 
             when 'platform.cleanup_job_executions' then
                 v_rows := platform.cleanup_job_executions(

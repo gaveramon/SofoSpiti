@@ -523,8 +523,7 @@ begin
     into v_order
     from public.fulfilment_orders fo
     where fo.id = p_fulfilment_order_id
-      and fo.tenant_id = v_tid
-      and fo.deleted_at is null;
+      and fo.tenant_id = v_tid;
 
     if not found then
         raise exception 'fulfilment order not found';

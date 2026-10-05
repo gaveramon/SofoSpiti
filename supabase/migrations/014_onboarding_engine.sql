@@ -2335,29 +2335,29 @@ begin
 
     when 'get_preconfig' then
 
-        select jsonb_build_object(
-            'preconfig', (
-                select to_jsonb(op)
-                from public.onboarding_preconfig op
-                where op.session_id = v_session_id
-                  and op.tenant_id = v_tid
-            ),
-            'transitions', coalesce((
-                select jsonb_agg(
-                    to_jsonb(t)
-                    order by t.created_at desc, t.id desc
-                )
-                from public.onboarding_preconfig_transitions t
-                join public.onboarding_preconfig op
-                    on op.id = t.preconfig_id
-                where op.session_id = v_session_id
-                  and t.tenant_id = v_tid
-            ), '[]'::jsonb)
-        )
-        into v_result
-        where v_session_id =
-            (p_payload->>'session_id')::uuid;
+    v_session_id :=
+        (p_payload->>'session_id')::uuid;
 
+    select jsonb_build_object(
+        'preconfig', (
+            select to_jsonb(op)
+            from public.onboarding_preconfig op
+            where op.session_id = v_session_id
+              and op.tenant_id = v_tid
+        ),
+        'transitions', coalesce((
+            select jsonb_agg(
+                to_jsonb(t)
+                order by t.created_at desc, t.id desc
+            )
+            from public.onboarding_preconfig_transitions t
+            join public.onboarding_preconfig op
+                on op.id = t.preconfig_id
+            where op.session_id = v_session_id
+              and t.tenant_id = v_tid
+        ), '[]'::jsonb)
+    )
+    into v_result;
 
     -- -------------------------------------------------
     -- PRECONFIG TRANSITION

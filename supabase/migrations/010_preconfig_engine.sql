@@ -590,6 +590,27 @@ comment on column public.onboarding_blueprints.is_published is
 -- =====================================================
 -- 8. IMMUTABILITY AND SYSTEM RECORD PROTECTION
 -- =====================================================
+--
+-- Wijzigingen t.o.v. REV3:
+--  1. Child-pad: geen EXECUTE ... INTO + "if not found" meer.
+--     EXECUTE zet FOUND niet, FOUND is aan het begin van elke
+--     functieaanroep false => alle child-writes faalden met
+--     "Catalog parent not found". Nu statische SELECT INTO.
+--  2. Child-DELETE door ON DELETE CASCADE: is de parent al weg,
+--     dan wordt de delete toegestaan (draft-parent verwijderen
+--     met kinderen werkt nu).
+--  3. is_system blokkeert kinderen niet meer zolang de parent
+--     nog een draft is. Daardoor kan een system-bundle/-blueprint/
+--     -template via de RPC's of seed-SQL gewoon gevuld worden en
+--     daarna gepubliceerd. Na publish zijn kinderen onwijzigbaar.
+--     is_system blijft beschermen tegen: delete van de parent en
+--     terugzetten naar false.
+--
+-- Seed-volgorde voor system-records:
+--   insert parent (is_system = true, draft)
+--   insert kinderen
+--   update ... set is_published = true   (apart, zonder andere wijziging)
+-- =====================================================
 
 create or replace function public.preconfig_guard_catalog_mutation()
 returns trigger
@@ -599,11 +620,10 @@ as $$
 declare
     v_old jsonb;
     v_new jsonb;
-    v_parent_id uuid;
-    v_parent_is_system boolean;
-    v_parent_is_published boolean;
-    v_parent_table text;
+    v_row jsonb;
     v_fk_column text;
+    v_parent_id uuid;
+    v_parent_published boolean;
 begin
 
     -- =================================================
@@ -615,10 +635,6 @@ begin
         'onboarding_blueprints',
         'preconfig_templates'
     ) then
-
-        -- ---------------------------------------------
-        -- INSERT
-        -- ---------------------------------------------
 
         if tg_op = 'INSERT' then
 
@@ -634,24 +650,14 @@ begin
         v_old := to_jsonb(old);
 
 
-        -- ---------------------------------------------
-        -- DELETE
-        -- ---------------------------------------------
-
         if tg_op = 'DELETE' then
 
-            if coalesce(
-                (v_old->>'is_system')::boolean,
-                false
-            ) then
+            if coalesce((v_old->>'is_system')::boolean, false) then
                 raise exception
                     'System catalog records cannot be deleted';
             end if;
 
-            if coalesce(
-                (v_old->>'is_published')::boolean,
-                false
-            ) then
+            if coalesce((v_old->>'is_published')::boolean, false) then
                 raise exception
                     'Published catalog records cannot be deleted';
             end if;
@@ -660,32 +666,19 @@ begin
         end if;
 
 
-        -- ---------------------------------------------
-        -- UPDATE
-        -- ---------------------------------------------
-
         v_new := to_jsonb(new);
 
 
         -- System flag is one-way.
-        if coalesce(
-               (v_old->>'is_system')::boolean,
-               false
-           )
-           and not coalesce(
-               (v_new->>'is_system')::boolean,
-               false
-           ) then
+        if coalesce((v_old->>'is_system')::boolean, false)
+           and not coalesce((v_new->>'is_system')::boolean, false) then
 
             raise exception
                 'is_system cannot be changed from true to false';
         end if;
 
 
-        -- ---------------------------------------------
         -- Logical identity is immutable.
-        -- ---------------------------------------------
-
         if tg_table_name = 'device_bundles'
            and (
                v_old->>'code' is distinct from v_new->>'code'
@@ -716,21 +709,12 @@ begin
         end if;
 
 
-        -- ---------------------------------------------
-        -- Published records are immutable except
-        -- is_active and updated_at.
-        -- ---------------------------------------------
+        -- Published records: only is_active and updated_at may change.
+        if coalesce((v_old->>'is_published')::boolean, false) then
 
-        if coalesce(
-               (v_old->>'is_published')::boolean,
-               false
-           ) then
-
-            if (
-                v_old - 'is_active' - 'updated_at'
-            ) is distinct from (
-                v_new - 'is_active' - 'updated_at'
-            ) then
+            if (v_old - 'is_active' - 'updated_at')
+               is distinct from
+               (v_new - 'is_active' - 'updated_at') then
 
                 raise exception
                     'Published catalog records are immutable; create a new version';
@@ -739,24 +723,13 @@ begin
         end if;
 
 
-        -- ---------------------------------------------
         -- Publishing must not change content.
-        -- ---------------------------------------------
+        if not coalesce((v_old->>'is_published')::boolean, false)
+           and coalesce((v_new->>'is_published')::boolean, false) then
 
-        if not coalesce(
-               (v_old->>'is_published')::boolean,
-               false
-           )
-           and coalesce(
-               (v_new->>'is_published')::boolean,
-               false
-           ) then
-
-            if (
-                v_old - 'is_published' - 'updated_at'
-            ) is distinct from (
-                v_new - 'is_published' - 'updated_at'
-            ) then
+            if (v_old - 'is_published' - 'updated_at')
+               is distinct from
+               (v_new - 'is_published' - 'updated_at') then
 
                 raise exception
                     'Publish a draft without changing its content in the same update';
@@ -765,18 +738,9 @@ begin
         end if;
 
 
-        -- ---------------------------------------------
         -- Published state is one-way.
-        -- ---------------------------------------------
-
-        if coalesce(
-               (v_old->>'is_published')::boolean,
-               false
-           )
-           and not coalesce(
-               (v_new->>'is_published')::boolean,
-               false
-           ) then
+        if coalesce((v_old->>'is_published')::boolean, false)
+           and not coalesce((v_new->>'is_published')::boolean, false) then
 
             raise exception
                 'Published catalog records cannot be unpublished';
@@ -788,86 +752,78 @@ begin
 
 
     -- =================================================
-    -- Child records inherit restrictions from parent.
+    -- Child records inherit restrictions from the parent
     -- =================================================
 
     case tg_table_name
-
         when 'bundle_devices' then
-            v_parent_table := 'public.device_bundles';
             v_fk_column := 'bundle_id';
-
         when 'onboarding_blueprint_steps' then
-            v_parent_table := 'public.onboarding_blueprints';
             v_fk_column := 'blueprint_id';
-
         when 'preconfig_device_map' then
-            v_parent_table := 'public.preconfig_templates';
             v_fk_column := 'template_id';
-
         else
             raise exception
                 'Unsupported preconfig table: %',
                 tg_table_name;
-
     end case;
 
 
-    -- Determine parent ID.
-
     if tg_op = 'DELETE' then
-
-        v_parent_id :=
-            (to_jsonb(old)->>v_fk_column)::uuid;
-
+        v_row := to_jsonb(old);
     else
-
-        v_parent_id :=
-            (to_jsonb(new)->>v_fk_column)::uuid;
-
+        v_row := to_jsonb(new);
     end if;
+
+    v_parent_id := (v_row->>v_fk_column)::uuid;
 
 
     -- A child cannot be moved to another parent.
-
     if tg_op = 'UPDATE'
-       and (
-           to_jsonb(old)->>v_fk_column
+       and to_jsonb(old)->>v_fk_column
            is distinct from
-           to_jsonb(new)->>v_fk_column
-       ) then
+           to_jsonb(new)->>v_fk_column then
 
         raise exception
             'Moving catalog child records between parents is not allowed';
-
     end if;
 
 
-    execute format(
-        'select is_system, is_published
-           from %s
-          where id = $1',
-        v_parent_table
-    )
-    into
-        v_parent_is_system,
-        v_parent_is_published
-    using v_parent_id;
+    -- Static parent lookup. SELECT INTO sets FOUND (EXECUTE does not).
+    case tg_table_name
+        when 'bundle_devices' then
+            select db.is_published
+            into v_parent_published
+            from public.device_bundles db
+            where db.id = v_parent_id;
+
+        when 'onboarding_blueprint_steps' then
+            select ob.is_published
+            into v_parent_published
+            from public.onboarding_blueprints ob
+            where ob.id = v_parent_id;
+
+        when 'preconfig_device_map' then
+            select pt.is_published
+            into v_parent_published
+            from public.preconfig_templates pt
+            where pt.id = v_parent_id;
+    end case;
 
 
     if not found then
+
+        -- ON DELETE CASCADE: the draft parent is already gone.
+        if tg_op = 'DELETE' then
+            return old;
+        end if;
+
         raise exception
             'Catalog parent not found';
     end if;
 
 
-    if coalesce(v_parent_is_system, false) then
-        raise exception
-            'Children of system catalog records cannot be changed';
-    end if;
-
-
-    if coalesce(v_parent_is_published, false) then
+    if coalesce(v_parent_published, false) then
         raise exception
             'Children of published catalog records are immutable';
     end if;
@@ -877,11 +833,9 @@ begin
         return old;
     end if;
 
-
     return new;
 end;
 $$;
-
 
 -- =====================================================
 -- Parent protection triggers

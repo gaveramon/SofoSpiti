@@ -535,10 +535,14 @@ as $$
 declare
     v_device record;
     v_property_tenant uuid;
+    v_device_property_id uuid;
 begin
+    -- -------------------------------------------------
+    -- 1. DEVICE MUST EXIST AND BE A LOCK CATEGORY
+    -- -------------------------------------------------
+
     select
         d.tenant_id,
-        d.property_id,
         dc.is_lock
     into v_device
     from public.devices d
@@ -551,8 +555,14 @@ begin
     end if;
 
     if not v_device.is_lock then
-        raise exception 'lock_devices requires device category with is_lock';
+        raise exception
+            'lock_devices requires device category with is_lock';
     end if;
+
+
+    -- -------------------------------------------------
+    -- 2. PROPERTY MUST EXIST
+    -- -------------------------------------------------
 
     select p.tenant_id
     into v_property_tenant
@@ -563,16 +573,43 @@ begin
         raise exception 'property not found';
     end if;
 
+
+    -- -------------------------------------------------
+    -- 3. DEVICE AND PROPERTY MUST BELONG TO SAME TENANT
+    -- -------------------------------------------------
+
     if v_device.tenant_id <> v_property_tenant then
-        raise exception 'lock device and property must belong to the same tenant';
-    end if;
-
-    if v_device.property_id is distinct from new.property_id then
         raise exception
-            'lock device and property must match';
+            'lock device and property must belong to the same tenant';
     end if;
 
-    new.tenant_id := v_property_tenant;
+
+    -- -------------------------------------------------
+    -- 4. DEVICE MUST BE ASSIGNED TO A ROOM
+    --    WITHIN THE SAME PROPERTY
+    -- -------------------------------------------------
+
+    select r.property_id
+    into v_device_property_id
+    from public.device_assignments da
+    join public.rooms r
+        on r.id = da.room_id
+    where da.device_id = new.device_id;
+
+    if not found then
+        raise exception
+            'lock device must be assigned to a room within a property';
+    end if;
+
+    if v_device_property_id <> new.property_id then
+        raise exception
+            'lock device must belong to the lock property through its room assignment';
+    end if;
+
+
+    -- -------------------------------------------------
+    -- 5. DEVICE MUST HAVE A PROVIDER MAPPING
+    -- -------------------------------------------------
 
     if not exists (
         select 1
@@ -582,6 +619,13 @@ begin
         raise exception
             'lock device must have a provider mapping in device_integration_map';
     end if;
+
+
+    -- -------------------------------------------------
+    -- 6. TENANT IS DERIVED FROM THE PROPERTY
+    -- -------------------------------------------------
+
+    new.tenant_id := v_property_tenant;
 
     return new;
 end;
