@@ -2,6 +2,17 @@
 -- REV1 GREENFIELD BASELINE
 -- 000_SUPABASE_PLATFORM.SQL
 -- =====================================================
+--
+-- CRON NOTE
+-- ---------
+-- 000 owns the scheduler TABLES and the worker FUNCTIONS only:
+--   platform.scheduled_jobs, platform.job_executions,
+--   platform.log_job_execution(), platform.run_platform_cron_tick(),
+--   platform.run_platform_daily_maintenance(), platform.process_*_batch()
+--
+-- 000 does NOT schedule anything in pg_cron. The one and only
+-- scheduling route is 024 (platform.run_job + sync_cron_schedules).
+-- =====================================================
 
 
 -- =====================================================
@@ -17,15 +28,17 @@ create extension if not exists btree_gist;
 create extension if not exists pg_stat_statements;
 CREATE SCHEMA IF NOT EXISTS extensions;
 
-DROP EXTENSION IF EXISTS pg_partman CASCADE;
-
+-- pg_partman is consumed by 007 (create_parent) and run by the
+-- 024 scheduler (job 'partman_maintenance'). Never DROP it here:
+-- DROP EXTENSION ... CASCADE would wipe partman.part_config
+-- (the partition + retention configuration written by 007).
 CREATE SCHEMA IF NOT EXISTS partman;
 
 CREATE EXTENSION IF NOT EXISTS pg_partman
     WITH SCHEMA partman;
 
-create extension if not exists pg_cron
-with schema pg_catalog;
+-- pg_cron is created once, further down (section "01 REQUIRED
+-- EXTENSIONS"), inside a block that tolerates it being unavailable.
 
 -- Supabase ecosystem extensions (wired in Part 5 cron workers + Part 11 stubs)
 create extension if not exists pg_net;
@@ -344,7 +357,7 @@ create table if not exists platform.internal_events (
     tenant_id uuid,
 
     source text not null, -- system module identifier
-    
+
     event_type text not null,
 
     correlation_id uuid,
@@ -360,6 +373,8 @@ create table if not exists platform.internal_events (
 
 -- =====================================================
 -- 3. SCHEDULED JOB REGISTRY (CONTROL PLANE ONLY)
+-- Rows are seeded and scheduled by 024. job_name is the
+-- registry key (see uq_scheduled_jobs_job_name below).
 -- =====================================================
 
 create table if not exists platform.scheduled_jobs (
@@ -753,7 +768,7 @@ create table if not exists platform.queue_processor_logs (
 
 
 -- =====================================================
--- 00? SECURITY CONTROL PLANE REGISTRY - 
+-- 00? SECURITY CONTROL PLANE REGISTRY -
 -- preparing table for RLs
 -- =====================================================
 --
@@ -809,7 +824,7 @@ create table if not exists platform.security_table_registry (
     portal_access text not null,
 
     platform_admin_access boolean not null default false,
-   
+
     direct_authenticated_access boolean not null default false,
 
     rls_required boolean not null default true,
@@ -1201,6 +1216,7 @@ create table if not exists platform.webhook_provider_tenant_map (
 
 -- =====================================================
 -- 01 REQUIRED EXTENSIONS (SUPABASE SAFE)
+-- The single place where pg_cron is created.
 -- =====================================================
 
 do $$
@@ -1221,7 +1237,7 @@ begin
 exception
     when duplicate_object then null;
     when others then
-        raise notice 'pg_cron extension not available; skipping';
+        raise notice 'pg_cron extension not available; skipping (024 sync_cron_schedules returns -1 until it is enabled)';
 end $$;
 
 
@@ -1554,7 +1570,7 @@ REV19 EXECUTION RULES FINAL:
 2. All retries MUST use exponential backoff
 3. All failures after max_retries MUST go to DLQ
 4. device_id references public.devices (FK added in 004)
-5. Execution watchdog MUST run periodically (cron in 020)
+5. Execution watchdog MUST run periodically (scheduled by 024 via platform.run_job)
 6. Workers MUST use SKIP LOCKED model
 7. No silent failures allowed in any subsystem
 8. Integration layer MUST support retry + delay
@@ -1645,6 +1661,11 @@ on platform.node_heartbeats (node_id, recorded_at);
 
 create index if not exists idx_scheduled_jobs_next_run
 on platform.scheduled_jobs (is_active, next_run);
+
+-- Registry key: one row per job. Required by the 024 seeds
+-- (ON CONFLICT (job_name)) and by 008's registry row.
+create unique index if not exists uq_scheduled_jobs_job_name
+on platform.scheduled_jobs (job_name);
 
 create index if not exists idx_job_executions_job
 on platform.job_executions (job_id, started_at);
@@ -2422,60 +2443,10 @@ select platform.ensure_log_partitions(2);
 
 
 -- =====================================================
--- 4. pg_cron JOB WIRING (idempotent; re-callable via ensure_pg_cron_jobs)
+-- (removed) platform.ensure_pg_cron_jobs()
+-- Scheduling now lives in ONE place: 024 (platform.run_job +
+-- platform.sync_cron_schedules). 000 does not touch pg_cron.
 -- =====================================================
-
-create or replace function platform.ensure_pg_cron_jobs()
-returns boolean
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    v_job record;
-begin
-    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-        begin
-            create extension pg_cron with schema pg_catalog;
-        exception
-            when duplicate_object then null;
-            when others then
-                raise warning '020 bootstrap: pg_cron extension unavailable — invoke platform.run_platform_cron_tick() and platform.run_platform_daily_maintenance() externally, or call platform.ensure_pg_cron_jobs() after enabling pg_cron';
-                return false;
-        end;
-    end if;
-
-    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-        raise warning '020 bootstrap: pg_cron extension missing — invoke platform.run_platform_cron_tick() and platform.run_platform_daily_maintenance() externally, or call platform.ensure_pg_cron_jobs() after enabling pg_cron';
-        return false;
-    end if;
-
-    grant usage on schema cron to postgres;
-    grant all privileges on all tables in schema cron to postgres;
-
-    for v_job in
-        select jobid
-        from cron.job
-        where jobname in ('platform-cron-tick', 'platform-daily-maintenance')
-    loop
-        perform cron.unschedule(v_job.jobid);
-    end loop;
-
-    perform cron.schedule(
-        'platform-cron-tick',
-        '* * * * *',
-        $cmd$select platform.run_platform_cron_tick();$cmd$
-    );
-
-    perform cron.schedule(
-        'platform-daily-maintenance',
-        '15 2 * * *',
-        $cmd$select platform.run_platform_daily_maintenance();$cmd$
-    );
-
-    return true;
-end;
-$$;
 
 
 
@@ -3775,6 +3746,22 @@ $$;
 
 
 
+-- =====================================================
+-- INTEGRATION QUEUE: RETRY BOOKKEEPING
+--
+-- Only touches items the dispatcher has already marked
+-- 'failed': increments retry_count and either schedules the
+-- next attempt (status 'retrying' + backoff) or moves the item
+-- to the dead-letter archive.
+--
+-- It must NOT touch 'pending' / 'retrying' items. The previous
+-- version pushed every pending item into the future before it
+-- was ever dispatched (next_retry_at = now() + backoff, then
+-- fetch_integration_queue_batch required next_retry_at <= now()
+-- in the same transaction), so nothing was ever delivered and
+-- every item ended in 'dead_letter' after max_retries runs.
+-- =====================================================
+
 create or replace function platform.process_integration_queue()
 returns int
 language plpgsql
@@ -3788,9 +3775,8 @@ begin
     for v_item in
         select id, tenant_id, integration_type, event_type, payload, retry_count, max_retries, last_error
         from platform.integration_queue
-        where status in ('pending', 'failed', 'retrying')
-          and (next_retry_at is null or next_retry_at <= now())
-        order by next_retry_at nulls first, created_at
+        where status = 'failed'
+        order by created_at
         limit 50
         for update skip locked
     loop
@@ -3830,6 +3816,8 @@ $$;
 -- platform: thin batch processors (000 execution SSOT)
 -- -----------------------------------------------------
 
+-- Order matters: dispatch due items first, then run the retry
+-- bookkeeping for the ones that just failed.
 create or replace function platform.process_integration_queue_batch(
     p_limit int default 50
 )
@@ -3845,8 +3833,6 @@ declare
     v_failed int := 0;
     v_url text;
 begin
-    perform platform.process_integration_queue();
-
     for v_item in select * from platform.fetch_integration_queue_batch(p_limit)
     loop
         v_processed := v_processed + 1;
@@ -3874,6 +3860,8 @@ begin
         end;
     end loop;
 
+    perform platform.process_integration_queue();
+
     return jsonb_build_object(
         'processed', v_processed,
         'succeeded', v_succeeded,
@@ -3881,7 +3869,6 @@ begin
     );
 end;
 $$;
-
 
 
 create or replace function platform.process_notification_batch(
@@ -4080,7 +4067,7 @@ $$;
 
 -- =====================================================
 -- 10. CRON WORKERS (RETRY + MAINTENANCE ORCHESTRATION)
--- pg_cron schedule wired in 020_platform_bootstrap.sql
+-- Scheduled by 024 (platform.run_job / sync_cron_schedules)
 -- =====================================================
 
 create or replace function platform.process_retry_tasks()
@@ -4481,7 +4468,11 @@ $$;
 
 
 -- -----------------------------------------------------
--- platform: cron tick — watchdog only (queue batch owned by Edge jobs)
+-- platform: cron tick — execution watchdog only
+-- Run by the 024 job 'platform-cron-tick' via platform.run_job(),
+-- which already provides the overlap lock and the
+-- platform.job_executions log. Queue workers are separate
+-- jobs in the 024 registry.
 -- -----------------------------------------------------
 
 create or replace function platform.run_platform_cron_tick()
@@ -4491,63 +4482,38 @@ security definer
 set search_path = ''
 as $$
 declare
-    v_lock_key bigint := 190014001;
     v_started timestamptz := clock_timestamp();
     v_elapsed_ms int;
 begin
-    if not pg_try_advisory_lock(v_lock_key) then
-        return;
-    end if;
+    perform platform.bind_operation_context_type_column();
+    perform platform.execution_watchdog();
 
-    begin
-        perform platform.bind_operation_context_type_column();
-        perform platform.execution_watchdog();
+    v_elapsed_ms := (extract(epoch from (clock_timestamp() - v_started)) * 1000)::int;
 
-        v_elapsed_ms := (extract(epoch from (clock_timestamp() - v_started)) * 1000)::int;
-
-        perform platform.record_queue_metrics(
-            'platform_cron_tick',
-            0,
-            0,
-            v_elapsed_ms,
-            'ok'
-        );
-    exception
-        when others then
-            perform pg_advisory_unlock(v_lock_key);
-            raise;
-    end;
-
-    perform pg_advisory_unlock(v_lock_key);
+    perform platform.record_queue_metrics(
+        'platform_cron_tick',
+        0,
+        0,
+        v_elapsed_ms,
+        'ok'
+    );
 end;
 $$;
 
 
 
+-- Run by the 024 job 'platform-daily-maintenance' via
+-- platform.run_job(), which writes the job_executions row.
 create or replace function platform.run_platform_daily_maintenance()
 returns void
 language plpgsql
 security definer
 set search_path = ''
 as $$
-declare
-    v_started timestamptz := clock_timestamp();
-    v_elapsed_ms int;
 begin
     perform platform.ensure_log_partitions(3);
     perform platform.purge_expired_logs();
     perform platform.sync_service_activation_state();
-
-    v_elapsed_ms := (extract(epoch from (clock_timestamp() - v_started)) * 1000)::int;
-
-    perform platform.log_job_execution(
-        null,
-        'success',
-        v_elapsed_ms,
-        null,
-        gen_random_uuid(),
-        1
-    );
 end;
 $$;
 

@@ -11,6 +11,7 @@
 -- - NO permission mutation
 -- - NO RLS mutation
 -- - NO function replacement
+-- - NO scheduler mutation (verification only)
 --
 -- Depends on:
 --
@@ -38,7 +39,7 @@
 -- 021_security_hardening.sql
 -- 022_grant_matrix_actors.sql
 -- 023_grant_matrix.sql
--- 024_platform_bootstrap.sql
+-- 024_platform_bootstrap.sql   (includes the scheduler, formerly 027)
 --
 -- Auditor mapping:
 --
@@ -77,10 +78,6 @@ declare
     missing_count int;
     missing_migrations text;
 begin
-
-    -- -------------------------------------------------
-    -- Determine missing required migrations
-    -- -------------------------------------------------
 
     select
         count(*)::int,
@@ -129,15 +126,7 @@ begin
         where m.migration_name = required.migration_name
     );
 
-    -- -------------------------------------------------
-    -- Normalize result
-    -- -------------------------------------------------
-
     missing_count := coalesce(missing_count, 0);
-
-    -- -------------------------------------------------
-    -- Fail with exact missing migrations
-    -- -------------------------------------------------
 
     if missing_count > 0 then
 
@@ -148,13 +137,9 @@ begin
 
     end if;
 
-    -- -------------------------------------------------
-    -- Success
-    -- -------------------------------------------------
-
     raise notice
         'Production finalize: all % required module migrations are registered',
-        24;
+        25;
 
 end
 $$;
@@ -195,9 +180,6 @@ end $$;
 -- =====================================================
 -- 3. VERIFY SECURITY DEFINER HARDENING
 -- SECURITY EXECUTION BOUNDARY
---
--- Reference:
--- 018b_security_hardening.sql
 --
 -- Rule:
 -- SECURITY DEFINER functions must have empty search_path
@@ -247,24 +229,15 @@ end $$;
 -- ROW-LEVEL SECURITY BOUNDARY
 -- =====================================================
 --
--- Reference:
---   018_edge_rpc_foundation.sql
---   019_security_classification.sql
---   020_security_hardening.sql
---
 -- Validation:
 --   Every active public table registered with
 --   rls_required = true must have RLS enabled.
 --
 -- IMPORTANT:
 --   This section validates RLS enablement only.
---
 --   force_rls_required is validated separately.
---
 --   RLS is CREATED / CONFIGURED by the security
---   hardening migration (020).
---
---   This migration only validates the final state.
+--   hardening migration (021).
 -- =====================================================
 
 do $$
@@ -272,11 +245,6 @@ declare
     v_count int;
     v_tables text;
 begin
-
-    -- -------------------------------------------------
-    -- Find registered public tables that require RLS
-    -- but do not have RLS enabled.
-    -- -------------------------------------------------
 
     select
         count(*)::int,
@@ -310,10 +278,6 @@ begin
       and c.relkind = 'r'
       and coalesce(c.relrowsecurity, false) = false;
 
-    -- -------------------------------------------------
-    -- Fail with exact violating tables
-    -- -------------------------------------------------
-
     if v_count > 0 then
 
         raise exception
@@ -322,10 +286,6 @@ begin
             E'\n' || v_tables;
 
     end if;
-
-    -- -------------------------------------------------
-    -- Success
-    -- -------------------------------------------------
 
     raise notice
         'RLS validation passed: all active public tables requiring RLS have RLS enabled';
@@ -339,24 +299,12 @@ $$;
 -- PERMISSION BOUNDARY
 -- =====================================================
 --
--- Reference:
---   022_grant_matrix.sql
---
 -- Security rule:
 --   Anonymous users (anon) must not have EXECUTE
 --   privileges on application-owned functions or
 --   procedures.
 --
--- IMPORTANT:
---   PostgreSQL extension functions are excluded from
---   this validation. Extensions may legitimately expose
---   functions in the public schema with PUBLIC EXECUTE.
---
---   Application routines remain subject to the
---   deny-by-default security model.
---
--- This validation reports the exact application-owned
--- routines that violate the rule.
+-- Extension-owned routines are excluded (pg_depend deptype 'e').
 -- =====================================================
 
 do $$
@@ -364,14 +312,6 @@ declare
     v_count int;
     v_routines text;
 begin
-
-    -- -------------------------------------------------
-    -- Find application-owned routines with effective
-    -- anon EXECUTE.
-    --
-    -- Extension-owned routines are excluded through
-    -- pg_depend with deptype = 'e'.
-    -- -------------------------------------------------
 
     select
         count(*)::int,
@@ -405,10 +345,6 @@ begin
     )
       and p.prokind in ('f', 'p')
 
-      -- ---------------------------------------------
-      -- Exclude PostgreSQL extension-owned routines.
-      -- ---------------------------------------------
-
       and not exists (
           select 1
           from pg_depend d
@@ -417,19 +353,11 @@ begin
             and d.deptype = 'e'
       )
 
-      -- ---------------------------------------------
-      -- Check effective anon EXECUTE.
-      -- ---------------------------------------------
-
       and has_function_privilege(
             'anon',
             p.oid,
             'EXECUTE'
           );
-
-    -- -------------------------------------------------
-    -- Fail with exact violating routines
-    -- -------------------------------------------------
 
     if v_count > 0 then
 
@@ -439,10 +367,6 @@ begin
             E'\n' || v_routines;
 
     end if;
-
-    -- -------------------------------------------------
-    -- Success
-    -- -------------------------------------------------
 
     raise notice
         'Grant matrix validation passed: no application-owned routines grant anon EXECUTE';
@@ -522,16 +446,15 @@ end $$;
 
 -- =====================================================
 -- 7B. VERIFY NO DIRECT AUTHENTICATED TABLE ACCESS
--- RPC-ONLY BOUNDARY (audit fix — closes the 023 gap)
+-- RPC-ONLY BOUNDARY
 -- =====================================================
 --
 -- platform.security_table_registry enforces
 -- direct_authenticated_access = false for every registered
 -- table via a hard CHECK CONSTRAINT. This section verifies
 -- that the *runtime* grants and policies actually respect
--- that promise, since section 4 above only checked that
--- RLS was enabled, not that it was effectively deny-all.
---
+-- that promise, since section 4 only checks that RLS is
+-- enabled, not that it is effectively deny-all.
 -- =====================================================
 
 do $$
@@ -542,10 +465,8 @@ declare
     v_policy_list text;
 begin
 
-    -- ---------------------------------------------------
     -- (a) No table-level GRANT to `authenticated` on any
     --     registered table.
-    -- ---------------------------------------------------
 
     select
         count(*)::int,
@@ -567,12 +488,8 @@ begin
             v_priv_count, v_priv_list;
     end if;
 
-    -- ---------------------------------------------------
     -- (b) No RLS policy exists on any registered table
-    --     (deny-by-default via RLS + no policy is required;
-    --     policies are only added deliberately, per table,
-    --     outside this generic gate).
-    -- ---------------------------------------------------
+    --     (deny-by-default via RLS + no policy).
 
     select
         count(*)::int,
@@ -599,13 +516,114 @@ $$;
 
 -- =====================================================
 -- 8. VERIFY OPERATIONAL SCHEDULING
--- CRON INFRASTRUCTURE
+-- CRON INFRASTRUCTURE (VERIFICATION ONLY)
 --
 -- Reference:
--- 023_platform_bootstrap.sql
+-- 024_platform_bootstrap.sql section 4 (scheduler)
+-- =====================================================
+--
+-- Checks (no mutation):
+--   (a) scheduler functions exist
+--   (b) every platform.scheduled_jobs row marked active has
+--       exactly one pg_cron entry 'job:<job_name>'
+--   (c) no pg_cron entry 'job:%' exists without an active row
+--   (d) the legacy entries 'platform-cron-tick' and
+--       'platform-daily-maintenance' are gone
+--
+-- Without pg_cron (local development) only (a) is enforced
+-- and a warning is raised. To repair drift:
+--   select platform.sync_cron_schedules();
 -- =====================================================
 
-select platform.ensure_pg_cron_jobs();
+do $$
+declare
+    v_sig text;
+    v_count int;
+    v_list text;
+begin
+
+    -- (a) scheduler functions
+
+    foreach v_sig in array array[
+        'platform.run_job(text)',
+        'platform.sync_cron_schedules()',
+        'platform.invoke_edge_function(text,jsonb,text)',
+        'platform.cleanup_job_executions(integer)'
+    ]
+    loop
+        if to_regprocedure(v_sig) is null then
+            raise exception
+                'Scheduler validation failed: % is missing (024)', v_sig;
+        end if;
+    end loop;
+
+    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+        raise warning
+            'Scheduler validation: pg_cron is not installed; cron entries could not be verified. Enable pg_cron and run platform.sync_cron_schedules().';
+        return;
+    end if;
+
+    -- (b) active registry rows without a cron entry
+
+    select
+        count(*)::int,
+        string_agg(sj.job_name, ', ' order by sj.job_name)
+    into v_count, v_list
+    from platform.scheduled_jobs sj
+    where coalesce(sj.is_active, false)
+      and not exists (
+          select 1
+          from cron.job c
+          where c.jobname = 'job:' || sj.job_name
+      );
+
+    if v_count > 0 then
+        raise exception
+            'Scheduler validation failed: % active job(s) are not scheduled in pg_cron: % (run platform.sync_cron_schedules())',
+            v_count, v_list;
+    end if;
+
+    -- (c) cron entries without an active registry row
+
+    select
+        count(*)::int,
+        string_agg(c.jobname, ', ' order by c.jobname)
+    into v_count, v_list
+    from cron.job c
+    where c.jobname like 'job:%'
+      and not exists (
+          select 1
+          from platform.scheduled_jobs sj
+          where 'job:' || sj.job_name = c.jobname
+            and coalesce(sj.is_active, false)
+      );
+
+    if v_count > 0 then
+        raise exception
+            'Scheduler validation failed: % stale pg_cron entr(ies) without an active registry row: % (run platform.sync_cron_schedules())',
+            v_count, v_list;
+    end if;
+
+    -- (d) legacy entries
+
+    select
+        count(*)::int,
+        string_agg(c.jobname, ', ' order by c.jobname)
+    into v_count, v_list
+    from cron.job c
+    where c.jobname in ('platform-cron-tick', 'platform-daily-maintenance');
+
+    if v_count > 0 then
+        raise exception
+            'Scheduler validation failed: legacy pg_cron entries still present: % (run platform.sync_cron_schedules())',
+            v_list;
+    end if;
+
+    raise notice
+        'Scheduler validation passed: every active registry job is scheduled as job:<job_name>';
+
+end
+$$;
 
 
 -- =====================================================
