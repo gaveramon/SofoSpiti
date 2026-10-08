@@ -20,7 +20,7 @@
 -- 1. PIPELINES
 -- =====================================================
 
-create table if not exists crm_pipelines (
+create table if not exists public.crm_pipelines (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -45,7 +45,7 @@ create table if not exists crm_pipelines (
 -- 2. PIPELINE STAGES
 -- =====================================================
 
-create table if not exists crm_pipeline_stages (
+create table if not exists public.crm_pipeline_stages (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -87,7 +87,7 @@ create table if not exists crm_pipeline_stages (
 -- 3. CAMPAIGNS
 -- =====================================================
 
-create table if not exists crm_campaigns (
+create table if not exists public.crm_campaigns (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -128,7 +128,7 @@ create table if not exists crm_campaigns (
 -- 4. TAGS
 -- =====================================================
 
-create table if not exists crm_tags (
+create table if not exists public.crm_tags (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -147,7 +147,7 @@ create table if not exists crm_tags (
 -- 5. COMPANIES
 -- =====================================================
 
-create table if not exists crm_companies (
+create table if not exists public.crm_companies (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -175,7 +175,7 @@ create table if not exists crm_companies (
 -- 6. CONTACTS
 -- =====================================================
 
-create table if not exists crm_contacts (
+create table if not exists public.crm_contacts (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -261,7 +261,7 @@ create table if not exists public.crm_company_tenants (
 -- 8. LEADS
 -- =====================================================
 
-create table if not exists crm_leads (
+create table if not exists public.crm_leads (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -321,7 +321,7 @@ create table if not exists crm_leads (
 -- 9. CONTACT ↔ COMPANY (M:N WITH ROLES)
 -- =====================================================
 
-create table if not exists crm_contact_company (
+create table if not exists public.crm_contact_company (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -367,7 +367,7 @@ create table if not exists public.crm_contact_tenants (
 -- 11. OPPORTUNITIES
 -- =====================================================
 
-create table if not exists crm_opportunities (
+create table if not exists public.crm_opportunities (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -420,7 +420,7 @@ create table if not exists crm_opportunities (
 -- 12. TASKS
 -- =====================================================
 
-create table if not exists crm_tasks (
+create table if not exists public.crm_tasks (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -453,7 +453,7 @@ create table if not exists crm_tasks (
 -- 13. INTERACTIONS (APPEND-ONLY)
 -- =====================================================
 
-create table if not exists crm_interactions (
+create table if not exists public.crm_interactions (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -493,7 +493,7 @@ create table if not exists crm_interactions (
 -- 14. NOTES
 -- =====================================================
 
-create table if not exists crm_notes (
+create table if not exists public.crm_notes (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -522,7 +522,7 @@ create table if not exists crm_notes (
 -- 15. TAG ASSIGNMENTS
 -- =====================================================
 
-create table if not exists crm_tag_assignments (
+create table if not exists public.crm_tag_assignments (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -545,7 +545,7 @@ create table if not exists crm_tag_assignments (
 -- 16. LISTS
 -- =====================================================
 
-create table if not exists crm_lists (
+create table if not exists public.crm_lists (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -574,7 +574,7 @@ create table if not exists crm_lists (
 -- 17. LIST MEMBERS
 -- =====================================================
 
-create table if not exists crm_list_members (
+create table if not exists public.crm_list_members (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -595,7 +595,7 @@ create table if not exists crm_list_members (
 -- 18. CUSTOM FIELDS
 -- =====================================================
 
-create table if not exists crm_custom_fields (
+create table if not exists public.crm_custom_fields (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -632,7 +632,7 @@ create table if not exists crm_custom_fields (
 -- 19. CUSTOM FIELD VALUES
 -- =====================================================
 
-create table if not exists crm_custom_field_values (
+create table if not exists public.crm_custom_field_values (
     id uuid primary key default gen_random_uuid(),
 
     tenant_id uuid not null,
@@ -672,7 +672,7 @@ create table if not exists crm_custom_field_values (
 );
 
 -- ==========================
---  Indexes
+-- 20. Indexes
 -- ==========================
 
 create index if not exists idx_crm_pipelines_tenant_created
@@ -883,7 +883,7 @@ create index if not exists idx_crm_custom_field_values_tenant_created
 on crm_custom_field_values (tenant_id, created_at desc);
 
 -- =====================================================
--- 20. TENANT FKs (DEFERRED PATTERN)
+-- 21. TENANT FKs (DEFERRED PATTERN)
 -- =====================================================
 
 do $$
@@ -1149,6 +1149,10 @@ left join public.crm_companies co on co.id = o.company_id
 left join public.crm_contacts ct on ct.id = o.contact_id
 where o.deleted_at is null;
 
+-- =====================================================
+-- 22. CRM DOMAIN
+-- =====================================================
+
 create or replace function public.crm_domain(
     p_op text,
     p_payload jsonb default '{}'::jsonb
@@ -1218,7 +1222,6 @@ begin
         insert into public.crm_pipelines (tenant_id, name, description, is_default, is_active)
         values (
             v_tid,
-            case when p_payload ? 'customer_account_id' and p_payload->>'customer_account_id' is not null then (p_payload->>'customer_account_id')::uuid else null end,
             p_payload->>'name',
             case when p_payload ? 'description' then p_payload->>'description' else null end,
             coalesce((p_payload->>'is_default')::boolean, false),
@@ -1780,6 +1783,155 @@ begin
     when 'delete_contact_company' then
         v_result := public.crm_soft_delete_row('public.crm_contact_company'::regclass, (p_payload->>'id')::uuid);
         perform platform.log_audit('crm_contact_company.deleted', 'crm_contact_company', (p_payload->>'id')::uuid);
+
+  -- =================================================
+    -- COMPANY ↔ TENANT
+    -- =================================================
+    --
+    -- tenant_id        = eigenaar van de linkrij (actieve tenant)
+    -- linked_tenant_id = de gekoppelde tenant (verplicht, betekenisloos zonder)
+    -- Alleen relationship_type is wijzigbaar; een andere koppeling = nieuwe rij.
+    -- De unique (company_id, linked_tenant_id) geldt ook voor soft-deleted
+    -- rijen; create heractiveert zo'n rij in plaats van een duplicate-key te geven.
+
+when 'list_company_tenants' then
+        v_tid := platform.current_tenant_id();
+        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at), '[]'::jsonb)
+        into v_result
+        from (
+            select
+                ct.id, ct.tenant_id, ct.company_id, ct.linked_tenant_id,
+                ct.relationship_type, ct.created_at, ct.deleted_at
+            from public.crm_company_tenants ct
+            where ct.tenant_id = v_tid
+              and ct.deleted_at is null
+              and (not p_payload ? 'company_id' or ct.company_id = (p_payload->>'company_id')::uuid)
+              and (not p_payload ? 'linked_tenant_id' or ct.linked_tenant_id = (p_payload->>'linked_tenant_id')::uuid)
+        ) t;
+ 
+    when 'create_company_tenant' then
+        v_tid := platform.current_tenant_id();
+        if p_payload->>'company_id' is null or p_payload->>'linked_tenant_id' is null then
+            raise exception 'company_id and linked_tenant_id are required';
+        end if;
+        if not exists (
+            select 1
+            from public.crm_companies co
+            where co.id = (p_payload->>'company_id')::uuid
+              and co.tenant_id = v_tid
+              and co.deleted_at is null
+        ) then
+            raise exception 'Company not found';
+        end if;
+        insert into public.crm_company_tenants (tenant_id, company_id, linked_tenant_id, relationship_type)
+        values (
+            v_tid,
+            (p_payload->>'company_id')::uuid,
+            (p_payload->>'linked_tenant_id')::uuid,
+            case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else null end
+        )
+        on conflict (company_id, linked_tenant_id) do update set
+            relationship_type = excluded.relationship_type,
+            deleted_at = null
+        where public.crm_company_tenants.deleted_at is not null
+        returning
+            id, tenant_id, company_id, linked_tenant_id,
+            relationship_type, created_at, deleted_at
+        into v_row;
+        if not found then raise exception 'Company tenant link already exists'; end if;
+        perform platform.log_audit('crm_company_tenant.created', 'crm_company_tenant', v_row.id);
+        v_result := to_jsonb(v_row);
+ 
+    when 'update_company_tenant' then
+        v_tid := platform.current_tenant_id();
+        update public.crm_company_tenants ct set
+            relationship_type = case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else ct.relationship_type end
+        where ct.id = (p_payload->>'id')::uuid
+          and ct.tenant_id = v_tid
+          and ct.deleted_at is null
+        returning
+            ct.id, ct.tenant_id, ct.company_id, ct.linked_tenant_id,
+            ct.relationship_type, ct.created_at, ct.deleted_at
+        into v_row;
+        if not found then raise exception 'Company tenant link not found'; end if;
+        perform platform.log_audit('crm_company_tenant.updated', 'crm_company_tenant', v_row.id, p_payload - 'id');
+        v_result := to_jsonb(v_row);
+ 
+    when 'delete_company_tenant' then
+        v_result := public.crm_soft_delete_row('public.crm_company_tenants'::regclass, (p_payload->>'id')::uuid);
+        perform platform.log_audit('crm_company_tenant.deleted', 'crm_company_tenant', (p_payload->>'id')::uuid);
+ 
+    -- =================================================
+    -- CONTACT ↔ TENANT
+    -- =================================================
+ 
+    when 'list_contact_tenants' then
+        v_tid := platform.current_tenant_id();
+        select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at), '[]'::jsonb)
+        into v_result
+        from (
+            select
+                ct.id, ct.tenant_id, ct.contact_id, ct.linked_tenant_id,
+                ct.relationship_type, ct.created_at, ct.deleted_at
+            from public.crm_contact_tenants ct
+            where ct.tenant_id = v_tid
+              and ct.deleted_at is null
+              and (not p_payload ? 'contact_id' or ct.contact_id = (p_payload->>'contact_id')::uuid)
+              and (not p_payload ? 'linked_tenant_id' or ct.linked_tenant_id = (p_payload->>'linked_tenant_id')::uuid)
+        ) t;
+ 
+    when 'create_contact_tenant' then
+        v_tid := platform.current_tenant_id();
+        if p_payload->>'contact_id' is null or p_payload->>'linked_tenant_id' is null then
+            raise exception 'contact_id and linked_tenant_id are required';
+        end if;
+        if not exists (
+            select 1
+            from public.crm_contacts c
+            where c.id = (p_payload->>'contact_id')::uuid
+              and c.tenant_id = v_tid
+              and c.deleted_at is null
+        ) then
+            raise exception 'Contact not found';
+        end if;
+        insert into public.crm_contact_tenants (tenant_id, contact_id, linked_tenant_id, relationship_type)
+        values (
+            v_tid,
+            (p_payload->>'contact_id')::uuid,
+            (p_payload->>'linked_tenant_id')::uuid,
+            case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else null end
+        )
+        on conflict (contact_id, linked_tenant_id) do update set
+            relationship_type = excluded.relationship_type,
+            deleted_at = null
+        where public.crm_contact_tenants.deleted_at is not null
+        returning
+            id, tenant_id, contact_id, linked_tenant_id,
+            relationship_type, created_at, deleted_at
+        into v_row;
+        if not found then raise exception 'Contact tenant link already exists'; end if;
+        perform platform.log_audit('crm_contact_tenant.created', 'crm_contact_tenant', v_row.id);
+        v_result := to_jsonb(v_row);
+ 
+    when 'update_contact_tenant' then
+        v_tid := platform.current_tenant_id();
+        update public.crm_contact_tenants ct set
+            relationship_type = case when p_payload ? 'relationship_type' then p_payload->>'relationship_type' else ct.relationship_type end
+        where ct.id = (p_payload->>'id')::uuid
+          and ct.tenant_id = v_tid
+          and ct.deleted_at is null
+        returning
+            ct.id, ct.tenant_id, ct.contact_id, ct.linked_tenant_id,
+            ct.relationship_type, ct.created_at, ct.deleted_at
+        into v_row;
+        if not found then raise exception 'Contact tenant link not found'; end if;
+        perform platform.log_audit('crm_contact_tenant.updated', 'crm_contact_tenant', v_row.id, p_payload - 'id');
+        v_result := to_jsonb(v_row);
+ 
+    when 'delete_contact_tenant' then
+        v_result := public.crm_soft_delete_row('public.crm_contact_tenants'::regclass, (p_payload->>'id')::uuid);
+        perform platform.log_audit('crm_contact_tenant.deleted', 'crm_contact_tenant', (p_payload->>'id')::uuid);
+ 
 
     -- =================================================
     -- OPPORTUNITIES
@@ -2368,7 +2520,7 @@ $$;
 
 
 -- -----------------------------------------------------
--- 003 CRM: whitelist soft-delete targets
+-- 23 CRM: whitelist soft-delete targets
 -- -----------------------------------------------------
 
 create or replace function public.crm_soft_delete_row(
@@ -2405,7 +2557,9 @@ begin
         'public.crm_tag_assignments',
         'public.crm_lists',
         'public.crm_list_members',
-        'public.crm_custom_fields'
+        'public.crm_custom_fields',
+        'public.crm_company_tenants',
+        'public.crm_contact_tenants/'
     ) then
         raise exception 'table not allowed for CRM soft delete';
     end if;
@@ -2827,7 +2981,7 @@ $$;
 
 
 -- =====================================================
--- 21. INTEGRITY TRIGGERS
+-- 24. INTEGRITY TRIGGERS
 -- =====================================================
 
 create or replace function public.enforce_crm_owner_membership()
