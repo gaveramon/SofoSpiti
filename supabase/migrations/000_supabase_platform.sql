@@ -768,7 +768,7 @@ create table if not exists platform.queue_processor_logs (
 
 
 -- =====================================================
--- 00? SECURITY CONTROL PLANE REGISTRY -
+-- 6 SECURITY CONTROL PLANE REGISTRY -
 -- preparing table for RLs
 -- =====================================================
 --

@@ -1205,11 +1205,55 @@ end $$;
 
 
 -- =====================================================
--- 10. MIGRATION REGISTRATION
+-- 10. CENTRALIZED COMMERCE FUNCTION PRIVILEGES
+-- =====================================================
+-- 012 defines commerce functions and triggers but does not manage
+-- EXECUTE grants. Internal helpers are denied to client roles here;
+-- authenticated clients use the approved public.commerce_api contract.
+-- The authenticated grant from the grant-matrix migration is retained.
+-- Keep all function grants/revokes centralized in 021/023.
+-- =====================================================
+
+revoke all on function public.commerce_api(text, jsonb)
+from public, anon;
+
+revoke all on function public.plan_pricing_maintain_history()
+from public, anon, authenticated;
+
+revoke all on function platform.invoice_distribute_discount(uuid, numeric)
+from public, anon, authenticated;
+
+revoke all on function platform.resolve_account_discount(uuid, timestamptz)
+from public, anon, authenticated;
+
+revoke all on function platform.apply_account_tier_discount(uuid)
+from public, anon, authenticated;
+
+revoke all on function public.cancel_draft_invoices_after_cancellation()
+from public, anon, authenticated;
+
+revoke all on function public.commerce_domain(text, jsonb)
+from public, anon, authenticated;
+
+revoke all on function public.commerce_compute_discount_amount(text, numeric, numeric)
+from public, anon, authenticated;
+
+revoke all on function public.commerce_find_usable_discount_code(text, uuid)
+from public, anon, authenticated;
+
+revoke all on function public.commerce_apply_account_discount_to_invoice(uuid)
+from public, anon, authenticated;
+
+revoke all on function public.commerce_apply_discount_to_invoice(uuid, text)
+from public, anon, authenticated;
+
+
+-- =====================================================
+-- 11. MIGRATION REGISTRATION
 -- =====================================================
 
 insert into platform.schema_migrations (migration_name, version, rollback_available)
-values ('024_platform_bootstrap', 'REV1', false)
+values ('024_platform_bootstrap', 'REV2', false)
 on conflict (migration_name) do nothing;
 
 

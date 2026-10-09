@@ -8,6 +8,8 @@
 --
 -- SSOT:
 --   properties
+--   product_plans (global catalogue)
+--   subscriptions (one optional instance per property)
 --   rooms
 --   devices
 --   device_assignments
@@ -22,8 +24,7 @@
 --   004 does NOT contain provider-specific integration logic.
 --
 -- SECURITY BOUNDARY:
---   021 = security hardening
---   023 = EXECUTE/API grant boundary
+--   022 and 024 = central security/grant boundaries; no grants or policies here
 --
 -- PUBLIC API:
 --   public.devices_api(text,jsonb)
@@ -147,8 +148,74 @@ comment on column public.property_memberships.role is
     'Property-level role. owner is automatically assigned to the customer_accounts.owner_user_id when a property is created.';
 
 
+-- Resource-level authorization helper. It does not replace the tenant resolver.
+create or replace function public.assert_property_access(p_property_id uuid)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+begin
+    if p_property_id is null then raise exception 'property_id is required'; end if;
+    if public.is_platform_admin() or coalesce(auth.role(), '') = 'service_role' then return; end if;
+    if (select auth.uid()) is null then raise exception 'authentication required'; end if;
+    if not exists (
+        select 1 from public.property_memberships pm
+        where pm.property_id = p_property_id
+          and pm.user_id = (select auth.uid())
+          and pm.is_active = true
+    ) then raise exception 'property access denied'; end if;
+end;
+$$;
+
+create or replace function public.assert_property_manager(p_property_id uuid)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+begin
+    if public.is_platform_admin() or coalesce(auth.role(), '') = 'service_role' then return; end if;
+    if (select auth.uid()) is null then raise exception 'authentication required'; end if;
+    if not exists (
+        select 1 from public.property_memberships pm
+        where pm.property_id = p_property_id
+          and pm.user_id = (select auth.uid())
+          and pm.is_active = true
+          and pm.role::text in ('owner', 'manager')
+    ) then raise exception 'property manager access required'; end if;
+end;
+$$;
+
+
 -- =====================================================
--- 1A. SUBSCRIPTIONS
+-- 1A. PRODUCT PLANS (GLOBAL SUBSCRIPTION CATALOGUE)
+-- =====================================================
+-- Plans are reusable catalogue definitions, not tenant- or property-owned
+-- records. Each subscription instance below attaches one plan to exactly
+-- one property. Pricing, entitlements and upsell rules remain in Commerce 012.
+-- =====================================================
+
+create table if not exists public.product_plans (
+    id uuid primary key default gen_random_uuid(),
+    name text not null,
+    description text,
+    tier public.subscription_tier not null,
+    is_active boolean not null default true,
+    is_default boolean not null default false,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint chk_product_plans_name_nonempty check (btrim(name) <> '')
+);
+
+create unique index if not exists uq_product_plans_name_ci
+    on public.product_plans (lower(name));
+
+-- At most one global default plan, used as a suggested/default plan in the purchase flow; it does not auto-subscribe a property.
+create unique index if not exists uq_product_plans_default
+    on public.product_plans (is_default) where is_default = true;
+
+comment on table public.product_plans is
+    'Global subscription plan catalogue SSOT (004). Plans are not tenant/property-owned; each property has its own subscription instance. Prices, entitlements and upsell rules belong to Commerce 012.';
+
+-- =====================================================
+-- 1B. PROPERTY-SCOPED SUBSCRIPTIONS
 --
 -- One subscription = one property.
 --
@@ -175,33 +242,50 @@ comment on column public.property_memberships.role is
 create table if not exists public.subscriptions (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null
-        references public.tenants(id)
-        on delete cascade,
-
+    -- tenant_id is a constrained denormalization for existing tenant-level
+    -- joins; property_id is the commercial/subscription scope.
+    tenant_id uuid not null references public.tenants(id) on delete cascade,
     property_id uuid not null,
+    plan_id uuid not null references public.product_plans(id) on delete restrict,
 
     tier public.subscription_tier not null,
-
     status public.subscription_status not null default 'trial',
-
     current_period_start timestamptz,
-
     current_period_end timestamptz,
-
+    cancel_requested_at timestamptz,
+    cancel_effective_at timestamptz,
+    cancel_reason text,
     created_at timestamptz not null default now(),
-
     updated_at timestamptz not null default now(),
 
-    -- A property can have exactly one subscription.
-    unique (property_id),
-
-    -- Prevent a subscription from linking a property
-    -- belonging to another tenant.
+    constraint uq_subscriptions_property unique (property_id),
+    constraint chk_subscription_period check (
+        current_period_end is null or current_period_start is null
+        or current_period_end >= current_period_start
+    ),
+    constraint chk_subscription_cancel_fields check (
+        (cancel_requested_at is null and cancel_effective_at is null)
+        or (cancel_requested_at is not null and cancel_effective_at is not null)
+    ),
     foreign key (property_id, tenant_id)
-        references public.properties(id, tenant_id)
-        on delete cascade
+        references public.properties(id, tenant_id) on delete cascade
 );
+
+
+create index if not exists idx_subscriptions_plan on public.subscriptions (plan_id);
+create index if not exists idx_subscriptions_cancel_effective
+    on public.subscriptions (cancel_effective_at) where cancel_effective_at is not null;
+create index if not exists idx_subscriptions_trial_end
+    on public.subscriptions (current_period_end) where status = 'trial';
+create index if not exists idx_subscriptions_tenant on public.subscriptions (tenant_id);
+create index if not exists idx_subscriptions_property_status on public.subscriptions (property_id, status);
+
+comment on table public.subscriptions is
+    'One subscription instance per property. tenant_id is constrained to the property and is retained only as a derived tenant-scope key; plan_id references the global plan catalogue.';
+comment on column public.subscriptions.plan_id is
+    'Global product plan selected for this property subscription. Plan pricing is owned by Commerce 012.';
+comment on column public.subscriptions.cancel_effective_at is
+    'First instant of the month after cancellation request in platform.billing_timezone(); status becomes cancelled after this instant.';
 
 -- =====================================================
 -- 2. ROOMS (LOGICAL STRUCTURE INSIDE PROPERTY)
@@ -338,12 +422,6 @@ create table if not exists public.device_configurations (
 -- =====================================================
 -- 7. INDEXES
 -- =====================================================
-
-create index if not exists idx_subscriptions_tenant
-on public.subscriptions (tenant_id);
-
-create index if not exists idx_subscriptions_tenant_property
-on public.subscriptions (tenant_id, property_id);
 
 create index if not exists idx_properties_tenant
 on public.properties (tenant_id);
@@ -614,7 +692,7 @@ select
     d.is_active,
     r.id as room_id,
     r.name as room_name,
-    r.property_id,
+    r.property_id as room_property_id,
     p.name as property_name,
     d.created_at
 from public.devices d
@@ -645,6 +723,7 @@ declare
     v_tid uuid;
     v_row record;
     v_existing uuid;
+    v_property_id uuid;
 begin
 
     perform public.edge_require_manager();
@@ -697,6 +776,11 @@ begin
     ) then
         raise exception 'Device and room must belong to the same property';
     end if;
+
+    select d.property_id into v_property_id
+    from public.devices d
+    where d.id = p_device_id;
+    perform public.assert_property_manager(v_property_id);
 
 
     -- -------------------------------------------------
@@ -788,6 +872,7 @@ declare
     v_row record;
     v_device_id uuid;
     v_previous_room_id uuid;
+    v_property_id uuid;
 begin
 
     p_payload := coalesce(
@@ -795,6 +880,72 @@ begin
         '{}'::jsonb
     );
 
+    -- Resource-level authorization. Tenant context remains an additional
+    -- boundary in the existing queries; property_memberships is the SSOT
+    -- for whether this user may access or manage the specific Airbnb.
+    case p_op
+        when 'get_property' then
+            perform public.assert_property_access((p_payload->>'id')::uuid);
+        when 'update_property', 'delete_property' then
+            perform public.assert_property_manager((p_payload->>'id')::uuid);
+
+        when 'list_rooms' then
+            if p_payload ? 'property_id' then
+                perform public.assert_property_access((p_payload->>'property_id')::uuid);
+            end if;
+        when 'get_room', 'update_room', 'delete_room' then
+            select r.property_id into v_property_id
+            from public.rooms r
+            where r.id = (p_payload->>'id')::uuid;
+            if v_property_id is null then raise exception 'Room not found'; end if;
+            if p_op = 'get_room' then
+                perform public.assert_property_access(v_property_id);
+            else
+                perform public.assert_property_manager(v_property_id);
+            end if;
+        when 'create_room' then
+            perform public.assert_property_manager((p_payload->>'property_id')::uuid);
+
+        when 'list_devices' then
+            -- The domain query prioritizes room_id when both filters are sent;
+            -- authorize that same resource first to prevent filter confusion.
+            if p_payload ? 'room_id' then
+                select r.property_id into v_property_id
+                from public.rooms r
+                where r.id = (p_payload->>'room_id')::uuid;
+                if v_property_id is null then raise exception 'Room not found'; end if;
+                perform public.assert_property_access(v_property_id);
+            elsif p_payload ? 'property_id' then
+                perform public.assert_property_access((p_payload->>'property_id')::uuid);
+            end if;
+        when 'get_device', 'update_device', 'delete_device', 'unassign_device',
+             'get_device_config', 'upsert_device_config',
+             'list_device_metrics', 'get_device_current_state' then
+            v_device_id := coalesce(
+                nullif(p_payload->>'id', '')::uuid,
+                nullif(p_payload->>'device_id', '')::uuid
+            );
+            select d.property_id into v_property_id
+            from public.devices d
+            where d.id = v_device_id;
+            if v_property_id is null then raise exception 'Device not found'; end if;
+            if p_op in ('update_device', 'delete_device', 'unassign_device', 'upsert_device_config') then
+                perform public.assert_property_manager(v_property_id);
+            else
+                perform public.assert_property_access(v_property_id);
+            end if;
+        when 'create_device' then
+            perform public.assert_property_manager((p_payload->>'property_id')::uuid);
+        when 'assign_device' then
+            v_device_id := (p_payload->>'device_id')::uuid;
+            select d.property_id into v_property_id
+            from public.devices d
+            where d.id = v_device_id;
+            if v_property_id is null then raise exception 'Device not found'; end if;
+            perform public.assert_property_manager(v_property_id);
+        else
+            null;
+    end case;
 
     case p_op
 
@@ -833,6 +984,16 @@ begin
                 p.updated_at
             from public.properties p
             where p.tenant_id = v_tid
+              and (
+                  public.is_platform_admin()
+                  or coalesce(auth.role(), '') = 'service_role'
+                  or exists (
+                      select 1 from public.property_memberships pm
+                      where pm.property_id = p.id
+                        and pm.user_id = (select auth.uid())
+                        and pm.is_active = true
+                  )
+              )
         ) t;
 
 
@@ -1102,6 +1263,16 @@ begin
                 join public.properties p
                   on p.id = r.property_id
                 where p.tenant_id = v_tid
+                  and (
+                      public.is_platform_admin()
+                      or coalesce(auth.role(), '') = 'service_role'
+                      or exists (
+                          select 1 from public.property_memberships pm
+                          where pm.property_id = p.id
+                            and pm.user_id = (select auth.uid())
+                            and pm.is_active = true
+                      )
+                  )
             ) t;
 
         end if;
@@ -1468,6 +1639,16 @@ begin
                     d.created_at
                 from public.devices d
                 where d.tenant_id = v_tid
+                  and (
+                      public.is_platform_admin()
+                      or coalesce(auth.role(), '') = 'service_role'
+                      or exists (
+                          select 1 from public.property_memberships pm
+                          where pm.property_id = d.property_id
+                            and pm.user_id = (select auth.uid())
+                            and pm.is_active = true
+                      )
+                  )
             ) t;
 
         end if;
@@ -2187,6 +2368,16 @@ begin
               on d.id = dcs.device_id
             where dcs.tenant_id = v_tid
               and (
+                  public.is_platform_admin()
+                  or coalesce(auth.role(), '') = 'service_role'
+                  or exists (
+                      select 1 from public.property_memberships pm
+                      where pm.property_id = d.property_id
+                        and pm.user_id = (select auth.uid())
+                        and pm.is_active = true
+                  )
+              )
+              and (
                   p_payload->>'category_code' is null
                   or d.category_code =
                       p_payload->>'category_code'
@@ -2216,9 +2407,9 @@ $$;
 --
 -- devices_domain remains internal.
 --
--- This wrapper intentionally preserves the existing
--- devices_domain contract and therefore does not break
--- existing internal callers.
+-- This wrapper preserves the existing devices_domain contract.
+-- Resource authorization is enforced inside the domain function using
+-- property_memberships; tenant scoping remains an additional boundary.
 -- =====================================================
 
 create or replace function public.devices_api(
@@ -2499,6 +2690,11 @@ begin
 end;
 $$;
 
+-- Billing calendar used by subscription cancellation and Commerce 012.
+create or replace function platform.billing_timezone()
+returns text language sql immutable set search_path = ''
+as $$ select 'Europe/Athens'::text; $$;
+
 -- -----------------------------------------------------
 -- 9b. Subscription functions
 -- -----------------------------------------------------
@@ -2622,10 +2818,586 @@ begin
 end;
 $$;
 
+-- =====================================================
+-- 014B. Trial expiry ending
+-- =====================================================
+-- Trial subscription expiry: move subscriptions from 
+-- 'trial' to 'trial_expired' when the trial period ends.
+--
+-- The trial period is inferred from:
+-- - current_period_end = the trial end date
+-- - status = 'trial'
+--
+-- A trial upgrade (change_plan to paid) leaves status as-is, so we
+-- never overwrite it.
+--
+-- This function is idempotent: re-running touches nothing.
+-- =====================================================
+
+create or replace function platform.expire_trial_subscriptions()
+returns table (
+    subscriptions_expired bigint,
+    seconds_elapsed numeric
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_start timestamptz;
+    v_rows bigint;
+begin
+    v_start := now();
+
+    update public.subscriptions
+    set status = 'trial_expired'::public.subscription_status,
+        updated_at = now()
+    where status = 'trial'
+      and current_period_end < now();
+
+    get diagnostics v_rows = row_count;
+
+    return query select
+        v_rows,
+        extract(epoch from (now() - v_start))::numeric;
+end;
+$$;
+
+comment on function platform.expire_trial_subscriptions() is
+    'Move subscriptions from "trial" to "trial_expired" when their trial period ends. Called by the daily maintenance job.';
+
+
+-- -----------------------------------------------------
+-- Plan administration (platform admin)
+-- -----------------------------------------------------
+
+create or replace function public.subscription_plan_create(
+    p_payload jsonb
+)
+returns public.product_plans
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+    v_default boolean;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    v_default := coalesce((p_payload->>'is_default')::boolean, false);
+
+    -- Only one default plan: release the old one first.
+    if v_default then
+        update public.product_plans
+        set is_default = false
+        where is_default = true;
+    end if;
+
+    insert into public.product_plans (
+        name,
+        description,
+        tier,
+        is_active,
+        is_default
+    )
+    values (
+        btrim(p_payload->>'name'),
+        p_payload->>'description',
+        (p_payload->>'tier')::public.subscription_tier,
+        coalesce((p_payload->>'is_active')::boolean, true),
+        v_default
+    )
+    returning *
+    into v_plan;
+
+    perform platform.log_audit(
+        'product_plan.created',
+        'product_plan',
+        v_plan.id
+    );
+
+    return v_plan;
+
+end;
+$$;
+
+
+create or replace function public.subscription_plan_update(
+    p_payload jsonb
+)
+returns public.product_plans
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_id uuid;
+    v_plan public.product_plans%rowtype;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    v_id := (p_payload->>'id')::uuid;
+
+    if p_payload ? 'is_default'
+       and coalesce((p_payload->>'is_default')::boolean, false) then
+
+        update public.product_plans
+        set is_default = false
+        where is_default = true
+          and id <> v_id;
+
+    end if;
+
+    update public.product_plans pp
+    set
+        name = case
+            when p_payload ? 'name' then btrim(p_payload->>'name')
+            else pp.name
+        end,
+
+        description = case
+            when p_payload ? 'description' then p_payload->>'description'
+            else pp.description
+        end,
+
+        tier = case
+            when p_payload ? 'tier'
+                then (p_payload->>'tier')::public.subscription_tier
+            else pp.tier
+        end,
+
+        is_active = case
+            when p_payload ? 'is_active'
+                then (p_payload->>'is_active')::boolean
+            else pp.is_active
+        end,
+
+        is_default = case
+            when p_payload ? 'is_default'
+                then (p_payload->>'is_default')::boolean
+            else pp.is_default
+        end
+
+    where pp.id = v_id
+    returning *
+    into v_plan;
+
+    if not found then
+        raise exception 'product plan not found';
+    end if;
+
+    perform platform.log_audit(
+        'product_plan.updated',
+        'product_plan',
+        v_plan.id,
+        p_payload - 'id'
+    );
+
+    return v_plan;
+
+end;
+$$;
+
+
+-- A plan that is still referenced anywhere (subscriptions here;
+-- invoice lines, upsell rules, discount codes in 012) cannot be
+-- deleted: the foreign keys are ON DELETE RESTRICT. Deactivate it.
+create or replace function public.subscription_plan_delete(
+    p_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_name text;
+begin
+
+    if (select auth.uid()) is null then
+        raise exception 'authentication required';
+    end if;
+
+    if not public.is_platform_admin() then
+        raise exception 'platform admin role required';
+    end if;
+
+    begin
+
+        delete from public.product_plans pp
+        where pp.id = p_id
+        returning pp.name
+        into v_name;
+
+    exception
+        when foreign_key_violation then
+            raise exception
+                'plan is still in use (subscriptions, invoice lines, upsell rules or discount codes); deactivate it instead';
+    end;
+
+    if not found then
+        raise exception 'product plan not found';
+    end if;
+
+    perform platform.log_audit(
+        'product_plan.deleted',
+        'product_plan',
+        p_id,
+        jsonb_build_object('name', v_name)
+    );
+
+    return jsonb_build_object('id', p_id, 'deleted', true);
+
+end;
+$$;
+
+
+-- -----------------------------------------------------
+-- Subscription creation and provisioning
+-- -----------------------------------------------------
+
+create or replace function public.subscription_create(
+    p_property_id uuid,
+    p_plan_id uuid,
+    p_status text default 'active'
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
+begin
+
+    perform public.assert_property_manager(p_property_id);
+
+    if not exists (select 1 from public.properties p where p.id = p_property_id) then
+        raise exception 'property not found';
+    end if;
+
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception 'active product plan not found';
+    end if;
+
+    -- Exactly one subscription per property.
+    if exists (select 1 from public.subscriptions s where s.property_id = p_property_id) then
+        raise exception 'property already has a subscription; use subscription_change_plan';
+    end if;
+
+    insert into public.subscriptions (
+        tenant_id, property_id, plan_id, tier, status
+    )
+    select p.tenant_id, p.id, v_plan.id, v_plan.tier, p_status::public.subscription_status
+    from public.properties p where p.id = p_property_id
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.created',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
+end;
+$$;
+
+
+-- Subscription is created explicitly when the customer purchases/activates
+-- a subscription. A property without a subscription remains a valid state.
+
+
+-- -----------------------------------------------------
+-- Plan change
+-- -----------------------------------------------------
+
+create or replace function public.subscription_change_plan(
+    p_subscription_id uuid,
+    p_plan_id uuid
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_plan public.product_plans%rowtype;
+    v_subscription public.subscriptions%rowtype;
+begin
+
+    select *
+    into v_plan
+    from public.product_plans pp
+    where pp.id = p_plan_id
+      and pp.is_active = true;
+
+    if not found then
+        raise exception 'active product plan not found';
+    end if;
+
+    select *
+    into v_subscription
+    from public.subscriptions s
+    where s.id = p_subscription_id
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    perform public.assert_property_manager(v_subscription.property_id);
+
+    -- tier follows the plan (trigger).
+    update public.subscriptions
+    set plan_id = v_plan.id
+    where id = v_subscription.id
+    returning *
+    into v_subscription;
+
+    perform platform.log_audit(
+        'subscription.plan_changed',
+        'subscription',
+        v_subscription.id,
+        jsonb_build_object(
+            'plan_id', v_plan.id,
+            'tier', v_plan.tier
+        )
+    );
+
+    return v_subscription;
+
+end;
+$$;
+
+
+-- -----------------------------------------------------
+-- Cancellation per end of month
+-- -----------------------------------------------------
+--
+-- The subscription stays 'active' (features and invoicing continue)
+-- until cancel_effective_at; then the job sets 'cancelled'.
+-- There is no mid-month cancellation.
+--
+-- Invoices are NOT touched here: 012 reacts to the state change
+-- (it cancels draft invoices past the end date and refuses to bill
+-- beyond it).
+-- -----------------------------------------------------
+
+create or replace function public.subscription_cancel(
+    p_property_id uuid,
+    p_reason text default null
+)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+    v_effective timestamptz;
+begin
+
+    perform public.assert_property_manager(p_property_id);
+
+    select * into v_sub
+    from public.subscriptions s
+    where s.property_id = p_property_id
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.status not in ('active', 'trial', 'past_due') then
+        raise exception
+            'only an active, trial or past_due subscription can be cancelled (status: %)',
+            v_sub.status;
+    end if;
+
+    if v_sub.cancel_requested_at is not null then
+        raise exception
+            'cancellation was already requested (effective %)',
+            v_sub.cancel_effective_at;
+    end if;
+
+    -- First instant of next month in the billing time zone.
+    v_effective := (
+        date_trunc('month', timezone(platform.billing_timezone(), now()))
+        + interval '1 month'
+    ) at time zone platform.billing_timezone();
+
+    update public.subscriptions
+    set
+        cancel_requested_at = now(),
+        cancel_effective_at = v_effective,
+        cancel_reason = nullif(btrim(coalesce(p_reason, '')), '')
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    perform platform.log_audit(
+        'subscription.cancellation_requested',
+        'subscription',
+        v_sub.id,
+        jsonb_build_object('effective_at', v_effective)
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+create or replace function public.subscription_undo_cancel(p_property_id uuid)
+returns public.subscriptions
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_tid uuid;
+    v_sub public.subscriptions%rowtype;
+begin
+
+    perform public.assert_property_manager(p_property_id);
+
+    select * into v_sub
+    from public.subscriptions s
+    where s.property_id = p_property_id
+    for update;
+
+    if not found then
+        raise exception 'subscription not found';
+    end if;
+
+    if v_sub.cancel_requested_at is null
+       or v_sub.cancel_effective_at <= now() then
+        raise exception 'there is no pending cancellation to undo';
+    end if;
+
+    update public.subscriptions
+    set
+        cancel_requested_at = null,
+        cancel_effective_at = null,
+        cancel_reason = null
+    where id = v_sub.id
+    returning *
+    into v_sub;
+
+    perform platform.log_audit(
+        'subscription.cancellation_undone',
+        'subscription',
+        v_sub.id
+    );
+
+    return v_sub;
+
+end;
+$$;
+
+
+-- Hourly job (027): the end-of-month moment has passed.
+create or replace function platform.expire_cancelled_subscriptions()
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_n int;
+begin
+
+    update public.subscriptions s
+    set status = 'cancelled'
+    where s.cancel_effective_at is not null
+      and s.cancel_effective_at <= now()
+      and s.status in ('active', 'trial', 'past_due');
+
+    get diagnostics v_n = row_count;
+
+    return v_n;
+
+end;
+$$;
+
+
+-- Subscriptions that may be billed for a service period: the
+-- single list the invoice generator must use.
+create or replace function platform.billable_subscriptions(
+    p_period_start date,
+    p_period_end date
+)
+returns setof public.subscriptions
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+    select s.*
+    from public.subscriptions s
+    where s.status in ('active', 'past_due')
+      and (
+          s.cancel_effective_at is null
+          or p_period_end < (
+              s.cancel_effective_at at time zone platform.billing_timezone()
+          )::date
+      );
+$$;
+
+
+comment on table public.product_plans is
+    'Global plan catalogue SSOT (004). Each property has its own subscription instance; prices, entitlements and upsell rules belong to Commerce 012.';
+
+comment on column public.subscriptions.plan_id is
+    'Global plan selected for this property subscription (SSOT 004). Price of the plan is owned by Commerce 012.';
+
+comment on column public.subscriptions.cancel_effective_at is
+    'First instant of the month after the cancellation request (platform.billing_timezone()). Status becomes cancelled then.';
+
+comment on function platform.expire_cancelled_subscriptions() is
+    'Sets status cancelled once cancel_effective_at has passed. Called hourly by the cron engine (027).';
+
+comment on function platform.billable_subscriptions(date, date) is
+    'Subscriptions that may be invoiced for the period; excludes periods beyond cancel_effective_at.';
+
+
 
 -- =====================================================
 -- 20. TRIGGERS
 -- =====================================================
+
+drop trigger if exists trg_product_plans_updated_at on public.product_plans;
+create trigger trg_product_plans_updated_at before update on public.product_plans for each row execute function platform.set_updated_at();
 
 drop trigger if exists trg_subscriptions_updated_at
 on public.subscriptions;

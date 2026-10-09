@@ -1,33 +1,33 @@
 -- =====================================================
--- REV3 GREENFIELD BASELINE
+-- REV2 GREENFIELD BASELINE
 -- 012_COMMERCE_ENGINE.SQL
 -- =====================================================
 -- COMMERCE DOMAIN
 --
 -- SSOT SPLIT 002 <-> 012 (REV3)
 --
---   004 Property & Device Engine owns:
---   - subscription instance
---   - property ↔ subscription relationship
---   - subscription lifecycle state
---   - subscription provisioning
---   - subscription plan changes
+--   002 CORE SaaS owns customer/tenant identity; 004 PROPERTY & DEVICE owns property subscription state (never a price):
+--     - customer accounts and tenants
+--     - global plan catalogue               (product_plans)
+--     - property-scoped subscription instances (subscriptions: property_id, plan_id,
+--       status, term, trial expiry and cancellation lifecycle)
+--     - subscription creation on explicit purchase and plan changes (004)
 --
 --   012 COMMERCE owns (everything that has a price):
 --     - normal plan prices                  (plan_pricing)
 --     - discount policy                     (discount_codes)
 --     - customer-account discount tiers     (customer_account_discount_tiers:
---       1 tenant = 0 %, 2 = x %, 3+ = y %)
+--       thresholds count billable properties, aggregated per customer account)
 --     - applied discounts, historical snapshot (applied_discounts)
 --     - feature entitlements, upsell rules
 --     - billing customers, invoices, invoice lines
 --     - Epsilon e-invoicing outbox, immutable invoice snapshots
 --       and plan -> Epsilon item / myDATA classification mapping
 --
---   012 reads 002 (plan, subscription, tenant count) and reacts to
+--   012 reads 002/004 (plan, property-linked subscription, property count) and reacts to
 --   it with triggers (for example: cancelling draft invoices when a
 --   cancellation date is set). 012 never writes public.product_plans
---   or public.subscriptions; it calls the 002 functions
+--   or public.subscriptions; it calls the 004 functions
 --   subscription_plan_*, subscription_create, subscription_change_plan,
 --   subscription_cancel, subscription_undo_cancel and
 --   platform.expire_cancelled_subscriptions / expire_trial_subscriptions
@@ -35,7 +35,7 @@
 --
 -- 012 DOES NOT OWN:
 --   - tenants / customer identity / customer accounts      (002)
---   - plans and subscription state                          (002)
+--   - global plans and property subscription state           (004)
 --   - CRM companies and contacts                            (003)
 --   - physical product catalog
 --   - device bundles / BOM                                  (010)
@@ -52,6 +52,10 @@
 -- =====================================================
 -- =====================================================
 -- 0. PRECONDITIONS
+--
+-- Ownership boundary: 004 creates public.subscriptions with property_id;
+-- 012 only validates that contract and adds commerce/pricing/billing logic.
+-- It must not create, move, or redefine public.subscriptions.
 -- =====================================================
 do $$
 begin
@@ -67,7 +71,7 @@ end if;
 
 if to_regclass('public.product_plans') is null then
     raise exception
-        '012 requires public.product_plans from the core SaaS layer (002 REV2)';
+        '012 requires public.product_plans from the Property & Device Engine (004)';
 end if;
 
 if to_regclass('public.customer_accounts') is null then
@@ -76,11 +80,11 @@ if to_regclass('public.customer_accounts') is null then
 end if;
 
 if to_regprocedure('public.subscription_change_plan(uuid,uuid)') is null
-   or to_regprocedure('public.subscription_cancel(text)') is null
+   or to_regprocedure('public.subscription_cancel(uuid,text)') is null
    or to_regprocedure('platform.billing_timezone()') is null
    or to_regprocedure('platform.expire_trial_subscriptions()') is null then
     raise exception
-        '012 requires the subscription lifecycle functions from 002 REV2 (section 14C)';
+        '012 requires the property-scoped subscription lifecycle functions from 004';
 end if;
 
 if to_regclass('platform.schema_migrations') is null then
@@ -92,16 +96,76 @@ if to_regclass('public.crm_companies') is null then
     raise exception
         '012 requires public.crm_companies from the CRM layer (003)';
 end if;
+
+-- Migration 004 owns public.subscriptions and must create it as
+-- property-scoped. 012 is commerce-only: it must never create or
+-- redefine the subscription instance table.
+if to_regclass('public.properties') is null
+   or not exists (
+       select 1
+       from information_schema.columns c
+       where c.table_schema = 'public'
+         and c.table_name = 'subscriptions'
+         and c.column_name = 'property_id'
+         and c.is_nullable = 'NO'
+   ) then
+    raise exception
+        '012 requires 004 property-scoped subscriptions: subscriptions.property_id must be NOT NULL';
+end if;
+
+-- Enforce the 004 contract expected by commerce: one subscription per
+-- property, and the property must belong to the same tenant as the row.
+if not exists (
+    select 1
+    from pg_constraint c
+    join pg_class t on t.oid = c.conrelid
+    join pg_namespace n on n.oid = t.relnamespace
+    where n.nspname = 'public'
+      and t.relname = 'subscriptions'
+      and c.contype = 'u'
+      and (
+          select array_agg(a.attname::text order by k.ord)
+          from unnest(c.conkey) with ordinality as k(attnum, ord)
+          join pg_attribute a on a.attrelid = t.oid and a.attnum = k.attnum
+      ) = array['property_id']::text[]
+) then
+    raise exception
+        '012 requires 004 contract: subscriptions must have UNIQUE (property_id)';
+end if;
+
+if not exists (
+    select 1
+    from pg_constraint c
+    join pg_class t on t.oid = c.conrelid
+    join pg_namespace n on n.oid = t.relnamespace
+    where n.nspname = 'public'
+      and t.relname = 'subscriptions'
+      and c.contype = 'f'
+      and (
+          select array_agg(a.attname::text order by k.ord)
+          from unnest(c.conkey) with ordinality as k(attnum, ord)
+          join pg_attribute a on a.attrelid = t.oid and a.attnum = k.attnum
+      ) = array['property_id','tenant_id']::text[]
+      and c.confrelid = 'public.properties'::regclass
+      and (
+          select array_agg(a.attname::text order by k.ord)
+          from unnest(c.confkey) with ordinality as k(attnum, ord)
+          join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum
+      ) = array['id','tenant_id']::text[]
+) then
+    raise exception
+        '012 requires 004 contract: subscriptions(property_id, tenant_id) must reference properties(id, tenant_id)';
+end if;
 end;
 $$;
 
 
 -- =====================================================
--- 1. SUBSCRIPTION PRODUCT PLANS  (OWNED BY 002)
+-- 1. SUBSCRIPTION PRODUCT PLANS (GLOBAL CATALOGUE, OWNED BY 004)
 -- =====================================================
 --
--- public.product_plans (plan / subscription type) is created and
--- maintained by 002 (section 4B and 14C). 012 only references it:
+-- public.product_plans is the global plan catalogue created and maintained
+-- by 004. Subscription instances are linked to properties in 004. 012 only references plans:
 -- plan_pricing, feature_entitlements, upsell_rules, discount_codes
 -- and invoice_lines point at product_plans(id).
 -- =====================================================
@@ -251,12 +315,11 @@ create table if not exists public.upsell_rules (
 
 
 -- =====================================================
--- 5. SUBSCRIPTION -> PLAN RELATIONSHIP  (OWNED BY 002)
+-- 5. SUBSCRIPTION -> PLAN RELATIONSHIP (PROPERTY-SCOPED, OWNED BY 004)
 -- =====================================================
 --
--- subscriptions.plan_id, the cancellation columns and their
--- constraints are part of the subscription instance and live in
--- 002 (section 5). 012 reads them.
+-- subscriptions.plan_id, cancellation columns and their constraints are
+-- part of the property-scoped subscription instance owned by 004. 012 reads them.
 -- =====================================================
 
 
@@ -747,15 +810,17 @@ create table if not exists public.discount_redemptions (
 -- 8B. CUSTOMER-ACCOUNT DISCOUNT TIERS
 -- =====================================================
 --
--- Discount POLICY based on the number of tenants a customer
--- account has (002: customer_accounts -> tenants):
+-- Discount POLICY is based on billable properties owned by the
+-- customer account, aggregated across all its tenants.
+-- A property counts once when its tenant is active and its one
+-- property-linked subscription is active or past_due.
 --
---   1 tenant   -> 0 %
---   2 tenants  -> x %
---   3+ tenants -> y %
---
--- A row means: "from min_tenants tenants onwards, discount_percent".
--- The row with the highest min_tenants <= the tenant count wins.
+-- LEGACY CONTRACT: min_tenants is retained as the database/API field
+-- name to avoid breaking existing callers; its threshold now means
+-- minimum billable properties, not tenants. The same applies to
+-- tenant_count in applied_discounts/resolver output: it snapshots
+-- the number of billable properties. New responses also expose
+-- min_properties/property_count aliases.
 --
 -- customer_account_id null  -> global tiers (the default policy)
 -- customer_account_id set   -> tiers that replace the global ones
@@ -763,8 +828,8 @@ create table if not exists public.discount_redemptions (
 --
 -- This table is policy only. What was actually applied to an
 -- invoice is recorded in applied_discounts (9B).
--- The tenant count itself is NOT stored: it is derived from
--- 002 (tenants) when the discount is applied.
+-- The property count is derived from 004 properties + subscriptions
+-- when the discount is applied; it is snapshotted in applied_discounts.
 -- =====================================================
 
 create table if not exists public.customer_account_discount_tiers (
@@ -824,11 +889,11 @@ where customer_account_id is not null;
 --
 --   discount_code          -> a discount code (also counted in
 --                             discount_redemptions)
---   customer_account_tier  -> the tenant-count tier (8B)
+--   customer_account_tier  -> the billable-property tier (8B)
 --
 -- Policy changes later (a tier percentage, a code value) never
--- change history: the percentage, the base amount, the tenant
--- count and the policy as it was are copied into the row.
+-- change history: the percentage, base amount, billable-property
+-- count and policy as it was are copied into the row.
 --
 -- One discount per invoice. 002 stores no discounts; this table
 -- is the only place where the applied discount is kept.
@@ -872,7 +937,8 @@ create table if not exists public.applied_discounts (
 
     currency text not null,
 
-    -- Tier source: tenants of the customer account at that moment.
+    -- Legacy field name: snapshots billable properties of the
+    -- customer account at the moment the discount was applied.
     tenant_count integer,
 
     -- Policy as it was (tier label / threshold / scope, code, ...).
@@ -1020,7 +1086,7 @@ create index if not exists idx_upsell_rules_plan
 on public.upsell_rules (recommended_plan_id);
 
 
--- idx_subscriptions_plan and the product_plans indexes: 002.
+-- Subscription and product-plan indexes are owned by 004.
 
 
 create unique index if not exists uq_billing_customers_default
@@ -1237,21 +1303,17 @@ for each row
 execute function public.plan_pricing_maintain_history();
 
 
-revoke all on function public.plan_pricing_maintain_history()
-from public, anon, authenticated;
-
 
 -- =====================================================
--- 13-19. PLAN / SUBSCRIPTION INVARIANTS AND LIFECYCLE  (OWNED BY 002)
+-- 13-19. PLAN / SUBSCRIPTION INVARIANTS AND LIFECYCLE (OWNED BY 004)
 -- =====================================================
 --
--- Moved to 002 (section 14C), because they change the
--- subscription instance, not a price:
+-- Defined in 004, because they change property subscription state, not a price:
 --
 --   plan required for active states, tier follows the plan,
 --   tier drift guard, plan tier immutability
 --   subscription_change_plan, subscription_create
---   provision_default_subscription (+ tenant trigger)
+--   subscription_create on explicit customer purchase (no auto-subscription trigger)
 --   subscription_cancel, subscription_undo_cancel
 --   platform.expire_cancelled_subscriptions
 --   platform.billing_timezone
@@ -1294,6 +1356,84 @@ $$;
 
 
 -- =====================================================
+-- 19A. INVOICE COMMERCIAL-SCOPE CONSISTENCY
+-- =====================================================
+-- An invoice, its subscription, billing customer and credited
+-- invoice must belong to the same tenant. For recurring charges,
+-- subscription_id resolves to one property because 004 enforces exactly
+-- one subscription per property. tenant_id is retained for invoice/customer
+-- grouping and consistency; the subscription commercial unit is property.
+-- =====================================================
+
+create or replace function public.enforce_invoice_commercial_scope()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+    v_related_tenant uuid;
+begin
+
+    if new.subscription_id is not null then
+        select s.tenant_id
+        into v_related_tenant
+        from public.subscriptions s
+        where s.id = new.subscription_id;
+
+        if not found then
+            raise exception 'subscription % not found', new.subscription_id;
+        end if;
+
+        if v_related_tenant <> new.tenant_id then
+            raise exception 'invoice tenant_id must match subscription tenant_id';
+        end if;
+    end if;
+
+    if new.billing_customer_id is not null then
+        select bc.tenant_id
+        into v_related_tenant
+        from public.billing_customers bc
+        where bc.id = new.billing_customer_id;
+
+        if not found then
+            raise exception 'billing customer % not found', new.billing_customer_id;
+        end if;
+
+        if v_related_tenant <> new.tenant_id then
+            raise exception 'invoice tenant_id must match billing customer tenant_id';
+        end if;
+    end if;
+
+    if new.credited_invoice_id is not null then
+        select i.tenant_id
+        into v_related_tenant
+        from public.invoices i
+        where i.id = new.credited_invoice_id;
+
+        if not found then
+            raise exception 'credited invoice % not found', new.credited_invoice_id;
+        end if;
+
+        if v_related_tenant <> new.tenant_id then
+            raise exception 'credit note tenant_id must match credited invoice tenant_id';
+        end if;
+    end if;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists trg_invoices_commercial_scope
+on public.invoices;
+
+create trigger trg_invoices_commercial_scope
+before insert or update of tenant_id, subscription_id, billing_customer_id, credited_invoice_id
+on public.invoices
+for each row
+execute function public.enforce_invoice_commercial_scope();
+
+
+-- =====================================================
 -- 19B. NO BILLING AFTER THE CANCELLATION DATE
 -- =====================================================
 --
@@ -1304,7 +1444,7 @@ $$;
 --   2. the same check is repeated when an invoice is frozen for
 --      Epsilon (platform.epsilon_enqueue_invoice), because a
 --      draft may have been generated before the cancellation.
---   3. platform.billable_subscriptions() (002) is the single list
+--   3. platform.billable_subscriptions() (004) is the single list
 --      the generator should use.
 -- Credit notes are never blocked.
 -- =====================================================
@@ -1364,8 +1504,8 @@ for each row
 execute function public.enforce_invoice_subscription_term();
 
 
--- The list of subscriptions the generator may bill
--- (platform.billable_subscriptions) is owned by 002.
+-- The list of property subscriptions the generator may bill
+-- (platform.billable_subscriptions) is owned by 004.
 
 
 -- =====================================================
@@ -1404,10 +1544,10 @@ $$;
 
 
 -- =====================================================
--- 19D. TRIAL EXPIRY  (OWNED BY 002)
+-- 19D. TRIAL EXPIRY (OWNED BY 004)
 -- =====================================================
 --
--- platform.expire_trial_subscriptions() is defined in 002
+-- platform.expire_trial_subscriptions() is defined in 004
 -- (section 014B) and returns (subscriptions_expired, seconds_elapsed).
 -- The cron engine (027) calls it.
 -- =====================================================
@@ -1890,16 +2030,17 @@ $$;
 --
 -- Which tier applies to a customer account right now:
 --
---   tenant count = PAYING tenants of the account: tenant status
---                  'active' with a subscription in status active or
---                  past_due (002: tenants -> subscriptions)
---   tiers        = active, within their validity window,
---                  min_tenants <= tenant count
+--   property count = PAYING properties across all tenants of the account:
+--                    active tenant + property subscription active/past_due
+--   tiers          = active, within their validity window, and the
+--                    legacy min_tenants threshold <= billable property count
 --   scope        = the account's own tiers if it has any,
 --                  otherwise the global tiers
 --   winner       = highest min_tenants, then latest effective_from
 --
--- No tier (or 0 %) means no discount. Internal function.
+-- No tier (or 0 %) means no discount. Internal function. Output fields
+-- tenant_count/min_tenants are retained for compatibility and represent
+-- property_count/min_properties respectively.
 -- =====================================================
 
 create or replace function platform.resolve_account_discount(
@@ -1926,19 +2067,22 @@ declare
     v_specific boolean;
 begin
 
-    -- Only paying tenants count: an active tenant with a subscription
-    -- in a billable status (same rule as platform.billable_subscriptions).
-    -- A tenant without a subscription, or with a trial / cancelled /
-    -- suspended / expired one, is not counted.
-    select count(distinct t.id)::integer
+    -- Count distinct billable properties across every tenant owned by
+    -- this customer account. A property counts once because 004 enforces
+    -- one subscription per property. Trial / cancelled / suspended /
+    -- expired subscriptions do not qualify for volume discounts.
+    select count(distinct p.id)::integer
     into v_count
-    from public.tenants t
+    from public.properties p
+    join public.tenants t
+      on t.id = p.tenant_id
     join public.subscriptions s
-        on s.tenant_id = t.id
+      on s.property_id = p.id
+     and s.tenant_id = p.tenant_id
     where t.customer_account_id = p_customer_account_id
-        and t.status::text = 'active'
-        and s.status in ('active', 'past_due');
-        
+      and t.status::text = 'active'
+      and s.status::text in ('active', 'past_due');
+
     select exists (
         select 1
         from public.customer_account_discount_tiers d
@@ -1971,7 +2115,7 @@ begin
     order by d.min_tenants desc, d.effective_from desc
     limit 1;
 
-    -- No tier matched: still report the tenant count.
+    -- No tier matched: still report the billable-property count.
     if not found then
         return query
         select
@@ -2096,6 +2240,8 @@ begin
         jsonb_build_object(
             'label', v_tier.label,
             'min_tenants', v_tier.min_tenants,
+            'min_properties', v_tier.min_tenants,
+            'property_count', v_tier.tenant_count,
             'account_specific', v_tier.account_specific,
             'tier_effective_from', v_tier.effective_from
         ),
@@ -2110,6 +2256,7 @@ begin
             'source', 'customer_account_tier',
             'tier_id', v_tier.tier_id,
             'tenant_count', v_tier.tenant_count,
+            'property_count', v_tier.tenant_count,
             'discount_percent', v_tier.discount_percent,
             'amount_applied', v_amount
         )
@@ -2218,18 +2365,6 @@ on public.subscriptions
 for each row
 execute function public.cancel_draft_invoices_after_cancellation();
 
-
-revoke all on function platform.invoice_distribute_discount(uuid, numeric)
-from public, anon, authenticated;
-
-revoke all on function platform.resolve_account_discount(uuid, timestamptz)
-from public, anon, authenticated;
-
-revoke all on function platform.apply_account_tier_discount(uuid)
-from public, anon, authenticated;
-
-revoke all on function public.cancel_draft_invoices_after_cancellation()
-from public, anon, authenticated;
 
 
 -- =====================================================
@@ -2390,7 +2525,7 @@ begin
 
         when 'create_product_plan' then
 
-            -- Plans belong to 002; role check inside the function.
+            -- Plans belong to 004; role check inside the function.
             return to_jsonb(public.subscription_plan_create(p_payload));
 
 
@@ -2403,6 +2538,42 @@ begin
 
             return to_jsonb(public.subscription_plan_update(p_payload));
 
+
+        -- =================================================
+        -- SUBSCRIPTION: GET / ADMIN UPDATE (PROPERTY SCOPE)
+        -- =================================================
+
+        when 'get_subscription' then
+            if nullif(p_payload->>'property_id', '') is null then raise exception 'property_id is required'; end if;
+            perform public.assert_property_access((p_payload->>'property_id')::uuid);
+            select to_jsonb(s) into v_result
+            from public.subscriptions s
+            where s.property_id = (p_payload->>'property_id')::uuid;
+            if v_result is null then raise exception 'subscription not found for property'; end if;
+            return v_result;
+
+        when 'create_subscription' then
+            if nullif(p_payload->>'property_id', '') is null then raise exception 'property_id is required'; end if;
+            if nullif(p_payload->>'plan_id', '') is null then raise exception 'plan_id is required'; end if;
+            v_row := public.subscription_create(
+                (p_payload->>'property_id')::uuid,
+                (p_payload->>'plan_id')::uuid,
+                coalesce(nullif(p_payload->>'status', ''), 'active')
+            );
+            return to_jsonb(v_row);
+
+        when 'update_subscription' then
+            if nullif(p_payload->>'property_id', '') is null then raise exception 'property_id is required'; end if;
+            perform public.assert_property_manager((p_payload->>'property_id')::uuid);
+            update public.subscriptions s
+            set status = case when p_payload ? 'status' then (p_payload->>'status')::public.subscription_status else s.status end,
+                current_period_start = case when p_payload ? 'current_period_start' then (p_payload->>'current_period_start')::timestamptz else s.current_period_start end,
+                current_period_end = case when p_payload ? 'current_period_end' then (p_payload->>'current_period_end')::timestamptz else s.current_period_end end
+            where s.property_id = (p_payload->>'property_id')::uuid
+            returning s.* into v_row;
+            if not found then raise exception 'subscription not found for property'; end if;
+            perform platform.log_audit('subscription.updated', 'subscription', v_row.id, p_payload - 'property_id');
+            return to_jsonb(v_row);
 
         -- =================================================
         -- SUBSCRIPTION: CHANGE PLAN
@@ -2687,7 +2858,7 @@ begin
 
 
         -- =================================================
-        -- ENTITLEMENTS: TENANT (READ ONLY)
+        -- ENTITLEMENTS: PROPERTY (READ ONLY)
         -- =================================================
         --
         -- Shape (Appsmith: {{ent.data.features.devices}}):
@@ -2707,19 +2878,20 @@ begin
         -- Otherwise is_entitled = false and features = {}.
         -- =================================================
 
-        when 'get_tenant_entitlements' then
+        when 'get_property_entitlements', 'get_tenant_entitlements' then
 
-            v_tid := platform.current_tenant_id();
-
-            if v_tid is null then
-                raise exception 'no active tenant';
+            if nullif(p_payload->>'property_id', '') is null then
+                raise exception 'property_id is required';
             end if;
+            perform public.assert_property_access((p_payload->>'property_id')::uuid);
+            v_tid := (select p.tenant_id from public.properties p where p.id = (p_payload->>'property_id')::uuid);
+            if v_tid is null then raise exception 'property not found'; end if;
 
             -- Best subscription: entitled statuses first.
             select s.id, s.plan_id, s.status, s.cancel_effective_at, s.current_period_end
             into v_row
             from public.subscriptions s
-            where s.tenant_id = v_tid
+            where s.property_id = (p_payload->>'property_id')::uuid
             order by
                 case s.status
                     when 'active' then 1
@@ -3292,12 +3464,16 @@ begin
                 raise exception 'code is required';
             end if;
 
+            if nullif(p_payload->>'property_id', '') is not null then
+                perform public.assert_property_access((p_payload->>'property_id')::uuid);
+            end if;
+
             v_plan_id := coalesce(
                 nullif(p_payload->>'plan_id', '')::uuid,
                 (
                     select s.plan_id
                     from public.subscriptions s
-                    where s.tenant_id = v_tid
+                    where s.property_id = (p_payload->>'property_id')::uuid
                 )
             );
 
@@ -3389,8 +3565,9 @@ begin
 
         when 'cancel_subscription' then
 
+            if nullif(p_payload->>'property_id', '') is null then raise exception 'property_id is required'; end if;
             v_row := public.subscription_cancel(
-                p_payload->>'reason'
+                (p_payload->>'property_id')::uuid, p_payload->>'reason'
             );
 
             return to_jsonb(v_row);
@@ -3398,7 +3575,8 @@ begin
 
         when 'undo_cancel_subscription' then
 
-            v_row := public.subscription_undo_cancel();
+            if nullif(p_payload->>'property_id', '') is null then raise exception 'property_id is required'; end if;
+            v_row := public.subscription_undo_cancel((p_payload->>'property_id')::uuid);
 
             return to_jsonb(v_row);
 
@@ -3884,7 +4062,7 @@ begin
             if public.is_platform_admin()
                and coalesce((p_payload->>'all')::boolean, false) then
 
-                select coalesce(jsonb_agg(to_jsonb(d) order by d.customer_account_id nulls first, d.min_tenants, d.effective_from), '[]'::jsonb)
+                select coalesce(jsonb_agg(to_jsonb(d) || jsonb_build_object('min_properties', d.min_tenants) order by d.customer_account_id nulls first, d.min_tenants, d.effective_from), '[]'::jsonb)
                 into v_result
                 from public.customer_account_discount_tiers d;
 
@@ -3910,6 +4088,7 @@ begin
                     d.id,
                     d.customer_account_id,
                     d.min_tenants,
+                    d.min_tenants as min_properties,
                     d.discount_percent,
                     d.label,
                     d.effective_from,
@@ -3944,7 +4123,10 @@ begin
             from public.tenants t
             where t.id = v_tid;
 
-            select to_jsonb(r)
+            select to_jsonb(r) || jsonb_build_object(
+                'property_count', r.tenant_count,
+                'min_properties', r.min_tenants
+            )
             into v_result
             from platform.resolve_account_discount(v_target, now()) r;
 
@@ -3980,7 +4162,7 @@ begin
                 )
                 values (
                     nullif(p_payload->>'customer_account_id', '')::uuid,
-                    (p_payload->>'min_tenants')::integer,
+                    coalesce(nullif(p_payload->>'min_properties', '')::integer, nullif(p_payload->>'min_tenants', '')::integer),
                     (p_payload->>'discount_percent')::numeric,
                     nullif(btrim(coalesce(p_payload->>'label', '')), ''),
                     coalesce(nullif(p_payload->>'effective_from', '')::timestamptz, now()),
@@ -3999,6 +4181,8 @@ begin
                         else d.customer_account_id
                     end,
                     min_tenants = case
+                        when p_payload ? 'min_properties'
+                            then (p_payload->>'min_properties')::integer
                         when p_payload ? 'min_tenants'
                             then (p_payload->>'min_tenants')::integer
                         else d.min_tenants
@@ -4044,7 +4228,7 @@ begin
                 p_payload
             );
 
-            select to_jsonb(d)
+            select to_jsonb(d) || jsonb_build_object('min_properties', d.min_tenants)
             into v_result
             from public.customer_account_discount_tiers d
             where d.id = v_target;
@@ -4123,6 +4307,7 @@ begin
                     ad.amount_applied,
                     ad.currency,
                     ad.tenant_count,
+                    ad.tenant_count as property_count,
                     ad.policy_snapshot,
                     ad.applied_at
                 from public.applied_discounts ad
@@ -4163,6 +4348,7 @@ as
 select
     s.id as subscription_id,
     s.tenant_id,
+    s.property_id,
     s.status,
     s.tier,
 
@@ -4213,11 +4399,10 @@ left join lateral (
 
 
 -- =====================================================
--- 25. DEFAULT SUBSCRIPTION PROVISIONING  (OWNED BY 002)
+-- 25. SUBSCRIPTION CREATION (OWNED BY 004)
 -- =====================================================
---
--- provision_default_subscription and its tenant trigger are part
--- of the subscription lifecycle in 002 (section 14C).
+-- A subscription is created only when the customer opts in/purchases it.
+-- Creating a property does not implicitly start a subscription.
 -- =====================================================
 
 
@@ -4225,7 +4410,7 @@ left join lateral (
 -- 26. TRIGGERS
 -- =====================================================
 
--- Plan and subscription triggers: 002 (section 14C and 16).
+-- Plan and subscription triggers are owned by 004.
 
 drop trigger if exists trg_ca_discount_tiers_updated_at
 on public.customer_account_discount_tiers;
@@ -5110,10 +5295,10 @@ comment on table public.discount_codes is
     'Discount code policy (Commerce 012).';
 
 comment on table public.customer_account_discount_tiers is
-    'Discount policy by number of tenants of a customer account (1 tenant = 0 %, 2 = x %, 3+ = y %). Null customer_account_id = global tiers. Tenant count is derived from 002.';
+    'Discount policy by billable properties across all tenants of a customer account. Legacy min_tenants field means minimum billable properties; new API responses also expose min_properties. Null customer_account_id = global tiers.';
 
 comment on table public.applied_discounts is
-    'Insert-only history of discounts that were actually applied to invoices (code or customer-account tier), with percentage, base amount, tenant count and policy as they were.';
+    'Insert-only history of discounts actually applied to invoices (code or customer-account tier), including the billable-property count and policy snapshot. Legacy tenant_count field stores the property count.';
 
 comment on table public.discount_redemptions is
     'Immutable commercial record of discounts applied to invoices/subscriptions.';
@@ -5131,10 +5316,10 @@ comment on function public.commerce_apply_discount_to_invoice(uuid, text) is
     'Validates and applies a discount code to a draft invoice, distributing it over the lines and recomputing VAT; writes the applied-discount snapshot.';
 
 comment on function platform.apply_account_tier_discount(uuid) is
-    'Applies the tenant-count tier discount of the invoice''s customer account to a draft invoice (idempotent) and writes the applied-discount snapshot.';
+    'Applies the billable-property tier discount of the invoice''s customer account to a draft invoice (idempotent) and writes the applied-discount snapshot.';
 
 comment on function platform.resolve_account_discount(uuid, timestamptz) is
-    'Resolves the tier that applies to a customer account: tenant count from 002 against customer_account_discount_tiers.';
+    'Resolves the account tier using billable property count across 004 properties/subscriptions. Legacy tenant_count/min_tenants output keys are retained for compatibility; property_count/min_properties aliases are also exposed by commerce_api.';
 
 comment on function platform.epsilon_enqueue_invoice(uuid, text) is
     'Validates, freezes (snapshot + lock) and queues an invoice for Epsilon. Idempotent. Backend only.';
@@ -5146,77 +5331,16 @@ comment on view public.v_subscription_overview is
 -- =====================================================
 -- 29. EXECUTE PRIVILEGES
 -- =====================================================
---
--- SECURITY DEFINER functions are explicitly granted only
--- to authenticated users. Authorization is enforced inside
--- the functions.
---
--- NOTE: the platform.epsilon_* functions (27A) are backend-only
--- and are intentionally NOT granted here; final execution
--- privileges are owned by 022 (service_role only).
--- =====================================================
-
-revoke all
-on function public.commerce_domain(text, jsonb)
-from public;
-
-grant execute
-on function public.commerce_domain(text, jsonb)
-to authenticated;
-
-
-revoke all
-on function public.commerce_compute_discount_amount(text, numeric, numeric)
-from public;
-
-grant execute
-on function public.commerce_compute_discount_amount(text, numeric, numeric)
-to authenticated;
-
-
-revoke all
-on function public.commerce_find_usable_discount_code(text, uuid)
-from public;
-
-grant execute
-on function public.commerce_find_usable_discount_code(text, uuid)
-to authenticated;
-
-
-revoke all
-on function public.commerce_apply_account_discount_to_invoice(uuid)
-from public;
-
-grant execute
-on function public.commerce_apply_account_discount_to_invoice(uuid)
-to authenticated;
-
-
-revoke all
-on function public.commerce_apply_discount_to_invoice(uuid, text)
-from public;
-
-grant execute
-on function public.commerce_apply_discount_to_invoice(uuid, text)
-to authenticated;
+-- Centralized exclusively in migrations 022 and 024.
 
 
 -- =====================================================
 -- 30. MIGRATION REGISTRATION
 -- =====================================================
 
-insert into platform.schema_migrations (
-    migration_name,
-    version,
-    rollback_available
-)
-values (
-    '012_commerce_engine',
-    'REV3',
-    false
-)
-on conflict (migration_name)
-do update
+insert into platform.schema_migrations (migration_name,version,rollback_available)
+values ('012_commerce_engine','REV2',false)
+on conflict (migration_name) do update
 set
     version = excluded.version,
     rollback_available = excluded.rollback_available;
@@ -5227,7 +5351,7 @@ set
 --
 -- COMMERCE ONLY
 --
--- Plans, subscription state, customer accounts -> 002
+-- Customer accounts and tenants -> 002; plans and property subscriptions -> 004
 -- CRM companies/contacts                       -> 003
 -- Device/BOM                                   -> 010
 -- Logistics                                    -> 011
