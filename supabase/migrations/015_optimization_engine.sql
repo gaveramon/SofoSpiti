@@ -110,7 +110,7 @@ create table if not exists public.optimization_recommendations (
 create table if not exists public.device_usage_scores (
     id uuid primary key default gen_random_uuid(),
 
-    tenant_id uuid not null references tenants(id) on delete cascade,
+    property_id uuid not null references properties(id) on delete cascade,
 
     device_id uuid not null,
 
@@ -122,7 +122,7 @@ create table if not exists public.device_usage_scores (
 
     calculated_at timestamptz default now(),
 
-    unique (tenant_id, device_id, category, score_period)
+    unique (property_id, device_id, category, score_period)
 );
 
 
@@ -157,17 +157,42 @@ create table if not exists public.energy_profiles (
 
 
 -- =====================================================
--- 6. RELATIONSHIPS & TENANT CONSISTENCY
+-- 6. PROPERTY CONSISTENCY
+-- DEVICE USAGE SCORES
 -- =====================================================
 
--- Device usage scores must reference a device belonging to the same tenant.
--- devices(id, tenant_id) is a composite key in 004.
-alter table public.device_usage_scores
-    add constraint fk_device_usage_scores_device_tenant
-    foreign key (device_id, tenant_id)
-    references public.devices(id, tenant_id)
-    on delete cascade;
+create or replace function
+    public.enforce_device_usage_score_property()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+    if not exists (
+        select 1
+        from public.device_assignments da
+        join public.rooms r
+          on r.id = da.room_id
+        where da.device_id = new.device_id
+          and r.property_id = new.property_id
+    ) then
+        raise exception
+            'Device % is not assigned to property %',
+            new.device_id,
+            new.property_id;
+    end if;
 
+    return new;
+end;
+$$;
+
+create trigger trg_device_usage_scores_property
+before insert or update of device_id, property_id
+on public.device_usage_scores
+for each row
+execute function
+    public.enforce_device_usage_score_property();
 
 -- =====================================================
 -- 6A. INSIGHT → RECOMMENDATION BACK-LINK
@@ -278,7 +303,7 @@ comment on column public.optimization_recommendations.suggested_changes is
 -- =====================================================
 
 create index if not exists idx_device_usage_scores_tenant_calculated
-on public.device_usage_scores (tenant_id, calculated_at desc);
+on public.device_usage_scores (property_id, calculated_at desc);
 
 
 create index if not exists idx_device_usage_scores_device
@@ -462,7 +487,8 @@ begin
         from (
             select s.id, s.tenant_id, s.device_id, s.score, s.category, s.score_period, s.calculated_at
             from public.device_usage_scores s
-            where s.tenant_id = v_tid
+            where s.property_id =
+                  (p_payload->>'property_id')::uuid
               and (p_payload->>'device_id' is null or s.device_id = (p_payload->>'device_id')::uuid)
         ) t;
 
@@ -498,7 +524,8 @@ begin
         join public.devices d on d.id = s.device_id
         join public.device_assignments da on da.device_id = d.id
         join public.rooms r on r.id = da.room_id
-        where s.tenant_id = v_tid
+        where s.property_id =
+              (p_payload->>'property_id')::uuid
           and r.property_id = (p_payload->>'property_id')::uuid;
         v_result := jsonb_build_object(
             'property_id', p_payload->>'property_id',
