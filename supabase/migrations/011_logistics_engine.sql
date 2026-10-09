@@ -197,7 +197,7 @@ create table if not exists public.fulfilment_orders (
 
     tenant_id uuid not null references public.tenants(id) on delete cascade,
 
-    property_id uuid not null references properties(id) on delete restrict,
+    property_id uuid not null,
 
     package_definition_id uuid references package_definitions(id) on delete restrict,
 
@@ -214,6 +214,11 @@ create table if not exists public.fulfilment_orders (
     created_at timestamptz default now(),
 
     updated_at timestamptz default now(),
+
+    constraint fk_fulfilment_orders_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete restrict,
 
     constraint chk_fulfilment_orders_package check (
         package_definition_id is not null
@@ -255,11 +260,11 @@ on public.fulfilment_orders (tenant_id);
 create index if not exists idx_fulfilment_orders_tenant_status
 on public.fulfilment_orders (tenant_id, status);
 
-create index if not exists idx_fulfilment_orders_tenant_created
-on public.fulfilment_orders (tenant_id, created_at desc);
-
 create index if not exists idx_fulfilment_orders_property
 on public.fulfilment_orders (property_id);
+
+create index if not exists idx_fulfilment_orders_tenant_created
+on public.fulfilment_orders (tenant_id, created_at desc);
 
 
 -- =====================================================
@@ -365,6 +370,21 @@ begin
     alter table public.fulfilment_orders
         add constraint fk_fulfilment_orders_tenant
         foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception
+    when duplicate_object then null;
+end $$;
+
+
+do $$
+begin
+    alter table public.fulfilment_orders
+        drop constraint if exists fulfilment_orders_property_id_fkey;
+
+    alter table public.fulfilment_orders
+        add constraint fk_fulfilment_orders_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete restrict;
 exception
     when duplicate_object then null;
 end $$;

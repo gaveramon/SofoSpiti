@@ -19,6 +19,8 @@ create table if not exists public.automation_runs (
 
     tenant_id uuid not null references public.tenants(id) on delete cascade,
 
+    property_id uuid,
+
     workflow_id uuid not null references operation_workflows(id) on delete restrict,
 
     trigger_type public.automation_trigger_type not null,
@@ -106,6 +108,10 @@ create index if not exists idx_automation_runs_workflow
     on public.automation_runs (workflow_id, created_at desc);
 
 
+create index if not exists idx_automation_runs_property
+    on public.automation_runs (property_id, created_at desc);
+
+
 create index if not exists idx_automation_runs_status
     on public.automation_runs (tenant_id, status, created_at desc)
     where status in ('pending', 'running');
@@ -138,6 +144,17 @@ begin
     alter table public.automation_runs
         add constraint fk_automation_runs_tenant
         foreign key (tenant_id) references public.tenants(id) on delete cascade;
+exception
+    when duplicate_object then null;
+end $$;
+
+
+do $$
+begin
+    alter table public.automation_runs
+        add constraint fk_automation_runs_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id) on delete set null;
 exception
     when duplicate_object then null;
 end $$;
@@ -290,7 +307,8 @@ for each row execute function public.enforce_automation_subscription_consistency
 create or replace function public.automation_start_run(
     p_workflow_id uuid,
     p_trigger_type public.automation_trigger_type,
-    p_trigger_payload jsonb default '{}'::jsonb
+    p_trigger_payload jsonb default '{}'::jsonb,
+    p_property_id uuid default null
 )
 returns uuid
 language plpgsql
@@ -301,10 +319,18 @@ declare
     v_tid uuid;
     v_run_id uuid;
     v_step record;
+    v_property_id uuid := p_property_id;
 begin
     v_tid := platform.current_tenant_id();
     if v_tid is null then
         raise exception 'no active tenant';
+    end if;
+
+    if v_property_id is not null and not exists (
+        select 1 from public.properties p
+        where p.id = v_property_id and p.tenant_id = v_tid
+    ) then
+        raise exception 'property not found or not owned by active tenant';
     end if;
 
     if not exists (
@@ -315,10 +341,10 @@ begin
     end if;
 
     insert into public.automation_runs (
-        tenant_id, workflow_id, trigger_type, trigger_payload, status
+        tenant_id, property_id, workflow_id, trigger_type, trigger_payload, status
     )
     values (
-        v_tid, p_workflow_id, p_trigger_type, coalesce(p_trigger_payload, '{}'::jsonb), 'pending'
+        v_tid, v_property_id, p_workflow_id, p_trigger_type, coalesce(p_trigger_payload, '{}'::jsonb), 'pending'
     )
     returning id into v_run_id;
 
@@ -403,7 +429,7 @@ begin
     end if;
 
     for v_trigger in
-        select wt.id, wt.workflow_id, wt.trigger_type
+        select wt.id, wt.workflow_id, wt.trigger_type, wt.property_id
         from public.workflow_triggers wt
         join public.automation_event_subscriptions aes on aes.workflow_trigger_id = wt.id
         where wt.tenant_id = v_tid
@@ -414,7 +440,8 @@ begin
         v_run_id := public.automation_start_run(
             v_trigger.workflow_id,
             v_trigger.trigger_type,
-            coalesce(p_payload, '{}'::jsonb)
+            coalesce(p_payload, '{}'::jsonb),
+            v_trigger.property_id
         );
         v_run_ids := array_append(v_run_ids, v_run_id);
     end loop;
@@ -458,7 +485,7 @@ begin
         select coalesce(jsonb_agg(to_jsonb(t) order by t.created_at desc), '[]'::jsonb)
         into v_result
         from (
-            select ar.id, ar.tenant_id, ar.workflow_id, ar.trigger_type, ar.status,
+            select ar.id, ar.tenant_id, ar.property_id, ar.workflow_id, ar.trigger_type, ar.status,
                    ar.correlation_id, ar.started_at, ar.completed_at, ar.created_at
             from public.automation_runs ar
             where ar.tenant_id = v_tid
@@ -475,7 +502,7 @@ begin
         end if;
         select to_jsonb(t) into v_result
         from (
-            select ar.id, ar.tenant_id, ar.workflow_id, ar.trigger_type, ar.trigger_payload,
+            select ar.id, ar.tenant_id, ar.property_id, ar.workflow_id, ar.trigger_type, ar.trigger_payload,
                    ar.status, ar.correlation_id, ar.started_at, ar.completed_at,
                    ar.error_message, ar.created_at
             from public.automation_runs ar
@@ -516,11 +543,12 @@ begin
         v_run_id := public.automation_start_run(
             (p_payload->>'workflow_id')::uuid,
             (p_payload->>'trigger_type')::public.automation_trigger_type,
-            coalesce(p_payload->'trigger_payload', '{}'::jsonb)
+            coalesce(p_payload->'trigger_payload', '{}'::jsonb),
+            (p_payload->>'property_id')::uuid
         );
         select to_jsonb(t) into v_result
         from (
-            select ar.id, ar.tenant_id, ar.workflow_id, ar.trigger_type, ar.status,
+            select ar.id, ar.tenant_id, ar.property_id, ar.workflow_id, ar.trigger_type, ar.status,
                    ar.correlation_id, ar.started_at, ar.completed_at, ar.created_at
             from public.automation_runs ar
             where ar.id = v_run_id and ar.tenant_id = v_tid
@@ -685,6 +713,7 @@ as
 select
     ar.id,
     ar.tenant_id,
+    ar.property_id,
     ar.workflow_id,
     ow.name as workflow_name,
     ar.trigger_type,

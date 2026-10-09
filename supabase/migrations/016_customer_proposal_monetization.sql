@@ -20,7 +20,7 @@ create table if not exists public.customer_proposals (
 
     tenant_id uuid not null references tenants(id) on delete cascade,
 
-    property_id uuid references properties(id) on delete set null,
+    property_id uuid,
 
     status proposal_status not null default 'draft',
 
@@ -34,7 +34,12 @@ create table if not exists public.customer_proposals (
 
     created_at timestamptz not null default now(),
 
-    updated_at timestamptz not null default now()
+    updated_at timestamptz not null default now(),
+
+    constraint fk_customer_proposals_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete set null (property_id)
 );
 
 
@@ -147,7 +152,7 @@ create table if not exists public.service_activation_state (
 
     tenant_id uuid not null references tenants(id) on delete cascade,
 
-    property_id uuid references properties(id) on delete set null,
+    property_id uuid,
 
     service_type service_type not null,
 
@@ -163,7 +168,12 @@ create table if not exists public.service_activation_state (
 
     constraint chk_service_activation_source check (
         source_proposal_id is not null or source_subscription_id is not null
-    )
+    ),
+
+    constraint fk_service_activation_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete set null (property_id)
 );
 
 
@@ -177,7 +187,7 @@ create table if not exists public.conversion_events (
 
     tenant_id uuid not null references tenants(id) on delete cascade,
 
-    property_id uuid references properties(id) on delete set null,
+    property_id uuid,
 
     proposal_id uuid references customer_proposals(id) on delete set null,
 
@@ -187,7 +197,12 @@ create table if not exists public.conversion_events (
 
     metadata jsonb not null default '{}'::jsonb,
 
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+
+    constraint fk_conversion_events_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete set null (property_id)
 );
 
 
@@ -201,13 +216,18 @@ create table if not exists public.conversion_scores (
 
     tenant_id uuid not null references tenants(id) on delete cascade,
 
-    property_id uuid references properties(id) on delete set null,
+    property_id uuid,
 
     score numeric(5,2),
 
     factors jsonb,
 
-    calculated_at timestamptz not null default now()
+    calculated_at timestamptz not null default now(),
+
+    constraint fk_conversion_scores_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete set null (property_id)
 );
 
 
@@ -222,6 +242,11 @@ on public.customer_proposals (tenant_id, created_at desc);
 
 create index if not exists idx_customer_proposals_tenant_status
 on public.customer_proposals (tenant_id, status);
+
+
+create index if not exists idx_customer_proposals_property
+on public.customer_proposals (property_id)
+where property_id is not null;
 
 
 comment on table public.customer_proposals is
@@ -297,6 +322,11 @@ create index if not exists idx_conversion_events_tenant_created
 on public.conversion_events (tenant_id, created_at desc);
 
 
+create index if not exists idx_conversion_events_property
+on public.conversion_events (property_id, created_at desc)
+where property_id is not null;
+
+
 create index if not exists idx_conversion_events_proposal
 on public.conversion_events (proposal_id, created_at desc)
 where proposal_id is not null;
@@ -308,6 +338,11 @@ on public.conversion_events (tenant_id, event_type, created_at desc);
 
 comment on table public.conversion_events is
     'Append-only commercial funnel events. Checkout/charge execution uses platform.payment_intents in 000.';
+
+
+create index if not exists idx_conversion_scores_property
+on public.conversion_scores (property_id, calculated_at desc)
+where property_id is not null;
 
 
 create index if not exists idx_conversion_scores_tenant_created

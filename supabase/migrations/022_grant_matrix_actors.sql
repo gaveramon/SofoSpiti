@@ -1331,6 +1331,19 @@ with seed (
 
     (
         'public',
+        'property_memberships',
+        'portal_user',
+        'Portal users require property-membership resolution and management only through approved API/RPC contracts; no direct table access.'
+    ),
+    (
+        'public',
+        'property_memberships',
+        'platform_admin',
+        'Platform administrators require controlled property-membership administration through approved API/RPC contracts; no direct table access.'
+    ),
+
+    (
+        'public',
         'rooms',
         'portal_user',
         'Portal users require tenant-scoped room access through approved API/RPC contracts.'

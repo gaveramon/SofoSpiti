@@ -301,13 +301,13 @@ begin
               not like '%is_healthcheck_user%'
     ) then
         raise exception
-            '025 healthcheck: a policy is not restricted to the healthcheck user';
+            '026 healthcheck: a policy is not restricted to the healthcheck user';
     end if;
 
     if has_table_privilege('anon', 'healthcheck.realtime_test', 'SELECT')
        or has_table_privilege('anon', 'healthcheck.realtime_test', 'INSERT') then
         raise exception
-            '025 healthcheck: anon must not have access to healthcheck.realtime_test';
+            '026 healthcheck: anon must not have access to healthcheck.realtime_test';
     end if;
 end
 $$;

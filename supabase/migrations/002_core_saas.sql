@@ -1,10 +1,10 @@
 -- ============================================================
--- REV23 GREENFIELD BASELINE
+-- REV1 GREENFIELD BASELINE
 -- 002_core_saas.sql
 --
 -- Consolidated Core SaaS SSOT
 --
--- REV23 (SSOT split 002 <-> 012):
+-- REV1 (SSOT split 002 <-> 012):
 --   002 owns the PLAN (subscription type) and the SUBSCRIPTION
 --   INSTANCE: which plan a tenant has, its status, its term and
 --   its lifecycle (trial expiry, end-of-month cancellation).
@@ -42,8 +42,9 @@
 --
 -- The customer-account owner is NOT a tenant membership role.
 --
--- Tenant membership remains responsible for access to an
--- individual tenant:
+-- Tenant membership remains responsible for tenant-level organizational
+-- access. Property-level portal authorization is introduced in the
+-- Property & Device Engine (004) and must not be duplicated here.
 --
 --   tenant_memberships.role
 --
@@ -56,6 +57,9 @@
 -- while still being the owner of the customer account containing
 -- all three tenants.
 --
+-- This distinction is intentional. Property ownership/access is a
+-- separate resource-level relationship and is not stored in 002.
+--
 -- This distinction is intentional:
 --
 --   CUSTOMER ACCOUNT
@@ -64,6 +68,8 @@
 --   TENANT MEMBERSHIP
 --       = access / role inside a tenant
 --
+--   PROPERTY MEMBERSHIP
+--       = access / role inside a property
 --
 -- Current tenant resolution authority:
 --

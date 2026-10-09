@@ -43,16 +43,17 @@
 --   - may use edge_require_backend() for defense-in-depth;
 --   - receive their final execution privileges exclusively in 022.
 --
--- 020 RESPONSIBILITY
+-- 019 RESPONSIBILITY
 -- =====================================================
 -- 1. Legacy public privilege hardening
--- 2. Tenant authority
--- 3. Role authority
--- 4. Platform admin authority
--- 5. Internal event helper
--- 6. Approved named RPC contracts
--- 7. Domain API contracts
--- 8. Migration registration
+-- 2. Tenant authority (legacy/account-scoped operations)
+-- 3. Property authority (primary portal/operational scope)
+-- 4. Role authority
+-- 5. Platform admin authority
+-- 6. Internal event helper
+-- 7. Approved named RPC contracts
+-- 8. Domain API contracts
+-- 9. Migration registration
 --
 -- 020 RESPONSIBILITY
 -- =====================================================
@@ -148,6 +149,8 @@
 --   log_event
 --   platform.is_platform_admin
 --   edge_require_tenant
+--   edge_require_property
+--   edge_require_property_manager
 --   edge_require_manager
 --   edge_require_admin
 --   edge_require_backend
@@ -307,6 +310,130 @@ as $$
 begin
     if not public.edge_is_platform_admin() then
         raise exception 'PLATFORM_ADMIN_REQUIRED';
+    end if;
+end;
+$$;
+
+
+-- =====================================================
+-- 4.1 PROPERTY AUTHORITY
+-- =====================================================
+--
+-- PROPERTY is the primary authorization boundary for all
+-- operational / portal data. Tenant membership is NOT a
+-- prerequisite for property access.
+--
+-- Authorization rule:
+--
+--   authenticated user
+--        ↓
+--   active property_memberships row
+--        ↓
+--   requested property
+--
+-- Platform administrators have explicit platform authority
+-- and may access a property without a membership row.
+-- The property must still exist.
+--
+-- No tenant context is resolved here.
+--
+-- FINAL EXECUTION PRIVILEGES ARE OWNED BY 022.
+-- These functions intentionally contain NO GRANT / REVOKE.
+-- =====================================================
+
+
+create or replace function public.edge_require_property(
+    p_property_id uuid
+)
+returns void
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+    v_user_id uuid := (select auth.uid());
+    v_exists boolean;
+begin
+    if v_user_id is null then
+        raise exception 'AUTHENTICATION_REQUIRED';
+    end if;
+
+    if p_property_id is null then
+        raise exception 'PROPERTY_ID_REQUIRED';
+    end if;
+
+    select exists (
+        select 1
+        from public.properties p
+        where p.id = p_property_id
+    )
+    into v_exists;
+
+    if not v_exists then
+        raise exception 'PROPERTY_NOT_FOUND';
+    end if;
+
+    if public.edge_is_platform_admin() then
+        return;
+    end if;
+
+    if not exists (
+        select 1
+        from public.property_memberships pm
+        where pm.property_id = p_property_id
+          and pm.user_id = v_user_id
+          and pm.is_active = true
+          and pm.revoked_at is null
+    ) then
+        raise exception 'PROPERTY_ACCESS_DENIED';
+    end if;
+end;
+$$;
+
+
+create or replace function public.edge_require_property_manager(
+    p_property_id uuid
+)
+returns void
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+    v_user_id uuid := (select auth.uid());
+begin
+    if v_user_id is null then
+        raise exception 'AUTHENTICATION_REQUIRED';
+    end if;
+
+    if p_property_id is null then
+        raise exception 'PROPERTY_ID_REQUIRED';
+    end if;
+
+    if not exists (
+        select 1
+        from public.properties p
+        where p.id = p_property_id
+    ) then
+        raise exception 'PROPERTY_NOT_FOUND';
+    end if;
+
+    if public.edge_is_platform_admin() then
+        return;
+    end if;
+
+    if not exists (
+        select 1
+        from public.property_memberships pm
+        where pm.property_id = p_property_id
+          and pm.user_id = v_user_id
+          and pm.is_active = true
+          and pm.revoked_at is null
+          and pm.role::text in ('owner', 'manager')
+    ) then
+        raise exception 'PROPERTY_MANAGER_REQUIRED';
     end if;
 end;
 $$;
@@ -628,15 +755,25 @@ begin
         when
             'list_runs',
             'get_run',
-            'list_run_steps',
-            'list_subscriptions'
+            'list_run_steps'
         then
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
+
+        when 'list_subscriptions' then
             perform public.edge_require_tenant();
 
         when
             'dispatch_event',
             'start_run',
-            'cancel_run',
+            'cancel_run'
+        then
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
+
+        when
             'upsert_subscription',
             'delete_subscription'
         then
@@ -675,7 +812,9 @@ begin
     case p_op
 
         when 'calculate_access_window' then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.booking_calculate_access_window(
                 (p_payload->>'booking_id')::uuid
@@ -685,7 +824,9 @@ begin
             'generate_booking_access',
             'regenerate_booking_access'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
             if p_op = 'generate_booking_access' then
                 return public.booking_generate_booking_access(
@@ -698,7 +839,9 @@ begin
             );
 
         when 'create_booking_access' then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.booking_create_booking_access(
                 p_payload
@@ -712,7 +855,9 @@ begin
             'list_access_policies',
             'list_access_rules'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.booking_domain(
                 p_op,
@@ -732,7 +877,9 @@ begin
             'update_access_rule',
             'delete_access_rule'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.booking_domain(
                 p_op,
@@ -1007,10 +1154,14 @@ begin
 
         when
             'list_properties',
+            'list_device_categories'
+        then
+            perform public.edge_require_tenant();
+
+        when
             'get_property',
             'list_rooms',
             'get_room',
-            'list_device_categories',
             'list_devices',
             'get_device',
             'get_device_config',
@@ -1018,10 +1169,16 @@ begin
             'get_device_current_state',
             'list_tenant_device_current_state'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
-            'create_property',
+            'create_property'
+        then
+            perform public.edge_require_manager();
+
+        when
             'update_property',
             'delete_property',
             'create_room',
@@ -1034,7 +1191,9 @@ begin
             'unassign_device',
             'upsert_device_config'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         else
             raise exception
@@ -1164,11 +1323,17 @@ begin
             'list_warehouses',
             'get_warehouse',
             'list_label_templates',
-            'list_shipping_rules',
+            'list_shipping_rules'
+        then
+            perform public.edge_require_tenant();
+
+        when
             'list_fulfilment_orders',
             'get_fulfilment_order'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'create_logistics_template',
@@ -1188,7 +1353,9 @@ begin
             'delete_fulfilment_order',
             'dispatch_fulfilment_order'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'create_carrier',
@@ -1236,18 +1403,28 @@ begin
             'list_lock_devices',
             'get_lock_device'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'list_credentials',
-            'get_credential',
+            'get_credential'
+        then
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
+
+        when
             'create_lock_device',
             'update_lock_device',
             'delete_lock_device',
             'issue_credential',
             'revoke_credential'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         else
             raise exception
@@ -1282,18 +1459,24 @@ begin
     case p_op
 
         when
-            'list_proposals',
-            'get_proposal',
-            'list_proposal_items',
             'list_packages',
             'get_package',
             'list_upsell_campaigns',
-            'get_upsell_campaign',
+            'get_upsell_campaign'
+        then
+            perform public.edge_require_tenant();
+
+        when
+            'list_proposals',
+            'get_proposal',
+            'list_proposal_items',
             'list_activation_state',
             'list_conversion_events',
             'list_conversion_scores'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'create_proposal',
@@ -1303,7 +1486,9 @@ begin
             'update_proposal_item',
             'delete_proposal_item'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'create_package',
@@ -1404,21 +1589,27 @@ begin
     case p_op
 
         when 'get_lifecycle' then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.onboarding_lifecycle_get(
                 (p_payload->>'property_id')::uuid
             );
 
         when 'list_lifecycle_transitions' then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.onboarding_lifecycle_list_transitions(
                 (p_payload->>'property_id')::uuid
             );
 
         when 'lifecycle_transition' then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.onboarding_lifecycle_apply_transition(
                 (p_payload->>'property_id')::uuid,
@@ -1438,7 +1629,9 @@ begin
             'list_checklist_items',
             'list_notes'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.onboarding_domain(
                 p_op,
@@ -1462,7 +1655,9 @@ begin
             'create_note',
             'delete_note'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
             return public.onboarding_domain(
                 p_op,
@@ -1502,7 +1697,6 @@ begin
             'list_workflows',
             'get_workflow',
             'list_workflow_steps',
-            'list_workflow_triggers',
             'list_support_tickets',
             'get_support_ticket',
             'create_support_ticket',
@@ -1510,6 +1704,11 @@ begin
             'create_support_message'
         then
             perform public.edge_require_tenant();
+
+        when 'list_workflow_triggers' then
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'update_support_ticket',
@@ -1522,12 +1721,18 @@ begin
             'delete_workflow',
             'create_workflow_step',
             'update_workflow_step',
-            'delete_workflow_step',
+            'delete_workflow_step'
+        then
+            perform public.edge_require_manager();
+
+        when
             'create_workflow_trigger',
             'update_workflow_trigger',
             'delete_workflow_trigger'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         else
             raise exception
@@ -1563,7 +1768,11 @@ begin
 
         when
             'list_rules',
-            'get_rule',
+            'get_rule'
+        then
+            perform public.edge_require_tenant();
+
+        when
             'list_insight_events',
             'get_insight_event',
             'list_recommendations',
@@ -1573,16 +1782,24 @@ begin
             'get_energy_profile',
             'calculate_property_score'
         then
-            perform public.edge_require_tenant();
+            perform public.edge_require_property(
+                (p_payload->>'property_id')::uuid
+            );
 
         when
             'create_rule',
             'update_rule',
-            'delete_rule',
+            'delete_rule'
+        then
+            perform public.edge_require_manager();
+
+        when
             'update_recommendation',
             'delete_recommendation'
         then
-            perform public.edge_require_manager();
+            perform public.edge_require_property_manager(
+                (p_payload->>'property_id')::uuid
+            );
 
         else
             raise exception
@@ -1877,6 +2094,8 @@ $$;
 -- NEVER automatically grant authenticated:
 --
 --   edge_require_tenant
+--   edge_require_property
+--   edge_require_property_manager
 --   edge_require_manager
 --   edge_require_admin
 --   edge_require_backend

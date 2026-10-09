@@ -112,7 +112,7 @@ create table if not exists public.device_usage_scores (
 
     tenant_id uuid not null references tenants(id) on delete cascade,
 
-    device_id uuid not null references devices(id) on delete cascade,
+    device_id uuid not null,
 
     score numeric(5,2),
 
@@ -159,6 +159,15 @@ create table if not exists public.energy_profiles (
 -- =====================================================
 -- 6. RELATIONSHIPS & TENANT CONSISTENCY
 -- =====================================================
+
+-- Device usage scores must reference a device belonging to the same tenant.
+-- devices(id, tenant_id) is a composite key in 004.
+alter table public.device_usage_scores
+    add constraint fk_device_usage_scores_device_tenant
+    foreign key (device_id, tenant_id)
+    references public.devices(id, tenant_id)
+    on delete cascade;
+
 
 -- =====================================================
 -- 6A. INSIGHT → RECOMMENDATION BACK-LINK

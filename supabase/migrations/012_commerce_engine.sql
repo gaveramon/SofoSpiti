@@ -6,13 +6,12 @@
 --
 -- SSOT SPLIT 002 <-> 012 (REV3)
 --
---   002 CORE SaaS owns (identity and state, never a price):
---     - customer accounts and tenants
---     - plan / subscription type            (product_plans)
---     - subscription instance               (subscriptions: plan,
---       status, term, trial expiry, end-of-month cancellation
---       state and its expiry job)
---     - subscription provisioning and plan changes
+--   004 Property & Device Engine owns:
+--   - subscription instance
+--   - property ↔ subscription relationship
+--   - subscription lifecycle state
+--   - subscription provisioning
+--   - subscription plan changes
 --
 --   012 COMMERCE owns (everything that has a price):
 --     - normal plan prices                  (plan_pricing)
@@ -1931,15 +1930,15 @@ begin
     -- in a billable status (same rule as platform.billable_subscriptions).
     -- A tenant without a subscription, or with a trial / cancelled /
     -- suspended / expired one, is not counted.
-    select count(*)::integer
+    select count(distinct t.id)::integer
     into v_count
     from public.tenants t
     join public.subscriptions s
-      on s.tenant_id = t.id
+        on s.tenant_id = t.id
     where t.customer_account_id = p_customer_account_id
-      and t.status::text = 'active'
-      and s.status in ('active', 'past_due');
-
+        and t.status::text = 'active'
+        and s.status in ('active', 'past_due');
+        
     select exists (
         select 1
         from public.customer_account_discount_tiers d

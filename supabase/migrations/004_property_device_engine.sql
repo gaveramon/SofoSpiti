@@ -1,5 +1,5 @@
 -- =====================================================
--- REV1 GREENFIELD BASELINE
+-- REV2 GREENFIELD BASELINE
 -- 004_PROPERTY_DEVICE_ENGINE.SQL
 -- =====================================================
 --
@@ -68,6 +68,83 @@ create table if not exists public.properties (
     -- the same property/tenant combination.
     unique (id, tenant_id)
 );
+
+
+-- =====================================================
+-- 1A. PROPERTY MEMBERSHIPS (RESOURCE ACCESS)
+--
+-- Property membership is the resource-level access relationship.
+-- It deliberately does not replace tenant_memberships in 002.
+--
+-- Access model:
+--
+--   platform.profiles
+--          |
+--          v
+--   property_memberships
+--          |
+--          v
+--       properties
+--          |
+--          v
+--        tenants
+--
+-- A customer-account owner is automatically made owner of every
+-- property created under a tenant belonging to that account.
+--
+-- Customer-account ownership itself remains authoritative in:
+--   customer_accounts.owner_user_id
+--
+-- Property access is authoritative in:
+--   property_memberships
+-- =====================================================
+
+create table if not exists public.property_memberships (
+    id uuid primary key default gen_random_uuid(),
+
+    property_id uuid not null,
+
+    user_id uuid not null
+        references platform.profiles(id)
+        on delete cascade,
+
+    role public.membership_role not null,
+
+    is_active boolean not null default true,
+
+    revoked_at timestamptz,
+
+    created_at timestamptz not null default now(),
+
+    updated_at timestamptz not null default now(),
+
+    unique (property_id, user_id),
+
+    -- The property and tenant pair must refer to the same property.
+    -- The tenant is derived from the property and is deliberately
+    -- not stored as a second independent authority here.
+    foreign key (property_id)
+        references public.properties(id)
+        on delete cascade
+);
+
+create unique index if not exists uq_property_memberships_active_owner
+on public.property_memberships (property_id)
+where role = 'owner' and is_active = true;
+
+create index if not exists idx_property_memberships_user_active
+on public.property_memberships (user_id, property_id)
+where is_active = true;
+
+create index if not exists idx_property_memberships_property_active
+on public.property_memberships (property_id, user_id)
+where is_active = true;
+
+comment on table public.property_memberships is
+    'Property-level resource access SSOT. A user sees and operates a property through an active membership. Tenant membership remains a separate organizational relationship in 002.';
+
+comment on column public.property_memberships.role is
+    'Property-level role. owner is automatically assigned to the customer_accounts.owner_user_id when a property is created.';
 
 
 -- =====================================================
@@ -190,6 +267,11 @@ create table if not exists public.devices (
 
     tenant_id uuid not null,
 
+    -- Explicit resource ownership. The device belongs to one property.
+    -- Tenant remains denormalized for existing domain dependencies and is
+    -- constrained against the property's tenant below.
+    property_id uuid not null,
+
     parent_device_id uuid
         references public.devices(id)
         on delete set null,
@@ -275,6 +357,12 @@ on public.rooms (property_id);
 create index if not exists idx_devices_tenant
 on public.devices (tenant_id);
 
+create index if not exists idx_devices_property
+on public.devices (property_id);
+
+create index if not exists idx_devices_property_created
+on public.devices (property_id, created_at desc);
+
 create index if not exists idx_devices_tenant_created
 on public.devices (tenant_id, created_at desc);
 
@@ -307,7 +395,10 @@ comment on table public.device_categories is
     'Hardware device taxonomy. code is the stable FK target for category_code columns. Seed: 004.';
 
 comment on table public.devices is
-    'SmartHellas device registry SSOT. Provider identity belongs to the Integration Engine. Runtime telemetry/state belongs outside 004.';
+    'SmartHellas device registry SSOT. Each device belongs to exactly one property. Provider identity belongs to the Integration Engine. Runtime telemetry/state belongs outside 004.';
+
+comment on column public.devices.property_id is
+    'Property resource owner of the device. This is immutable after device creation; tenant_id is retained for existing domain dependencies and constrained to the same property.';
 
 comment on table public.device_configurations is
     'Static provisioning configuration only. Do not store runtime telemetry, live state, provider identity, or provider webhook data.';
@@ -351,6 +442,20 @@ end $$;
 do $$
 begin
 
+    alter table public.devices
+        add constraint fk_devices_property_tenant
+        foreign key (property_id, tenant_id)
+        references public.properties(id, tenant_id)
+        on delete cascade;
+
+exception
+    when duplicate_object then null;
+end $$;
+
+
+do $$
+begin
+
     alter table platform.device_commands
         add constraint fk_device_commands_device
         foreign key (device_id)
@@ -365,6 +470,73 @@ end $$;
 comment on constraint fk_device_commands_device
 on platform.device_commands is
     'Domain device registry (004) is SSOT; restrict delete while commands may exist.';
+
+
+-- =====================================================
+-- 9A. PROPERTY MEMBERSHIP MAINTENANCE
+-- =====================================================
+
+drop trigger if exists trg_property_memberships_updated_at
+on public.property_memberships;
+
+create trigger trg_property_memberships_updated_at
+before update on public.property_memberships
+for each row
+execute function platform.set_updated_at();
+
+
+-- -----------------------------------------------------
+-- Automatically make the customer-account owner the
+-- owner of every newly created property.
+-- -----------------------------------------------------
+
+create or replace function public.bootstrap_property_owner()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_owner_user_id uuid;
+begin
+    select ca.owner_user_id
+      into v_owner_user_id
+      from public.tenants t
+      join public.customer_accounts ca
+        on ca.id = t.customer_account_id
+     where t.id = new.tenant_id;
+
+    if v_owner_user_id is null then
+        raise exception 'Property cannot be created without a customer-account owner';
+    end if;
+
+    insert into public.property_memberships (
+        property_id,
+        user_id,
+        role,
+        is_active,
+        revoked_at
+    )
+    values (
+        new.id,
+        v_owner_user_id,
+        'owner'::public.membership_role,
+        true,
+        null
+    );
+
+    return new;
+end;
+$$;
+
+
+drop trigger if exists trg_property_bootstrap_owner
+on public.properties;
+
+create trigger trg_property_bootstrap_owner
+after insert on public.properties
+for each row
+execute function public.bootstrap_property_owner();
 
 
 -- =====================================================
@@ -388,6 +560,13 @@ begin
        and new.tenant_id is distinct from old.tenant_id then
 
         raise exception 'tenant_id is immutable';
+
+    end if;
+
+    if tg_op = 'UPDATE'
+       and new.property_id is distinct from old.property_id then
+
+        raise exception 'property_id is immutable';
 
     end if;
 
@@ -425,6 +604,7 @@ as
 select
     d.id,
     d.tenant_id,
+    d.property_id,
     d.device_name,
     d.category_code,
     dc.name as category_name,
@@ -503,6 +683,19 @@ begin
           and p.tenant_id = v_tid
     ) then
         raise exception 'Room not found';
+    end if;
+
+
+    if not exists (
+        select 1
+        from public.devices d
+        join public.rooms r
+          on r.property_id = d.property_id
+        where d.id = p_device_id
+          and r.id = p_room_id
+          and d.tenant_id = v_tid
+    ) then
+        raise exception 'Device and room must belong to the same property';
     end if;
 
 
@@ -1186,6 +1379,7 @@ begin
                 select
                     d.id,
                     d.tenant_id,
+                    d.property_id,
                     d.parent_device_id,
                     d.device_name,
                     d.category_code,
@@ -1232,6 +1426,7 @@ begin
                 select
                     d.id,
                     d.tenant_id,
+                    d.property_id,
                     d.parent_device_id,
                     d.device_name,
                     d.category_code,
@@ -1242,21 +1437,8 @@ begin
                     d.created_at
                 from public.devices d
                 where d.tenant_id = v_tid
-                  and d.id in
-                  (
-                      select da.device_id
-                      from public.device_assignments da
-                      where da.room_id in
-                      (
-                          select r.id
-                          from public.rooms r
-                          join public.properties p
-                            on p.id = r.property_id
-                          where r.property_id =
-                              (p_payload->>'property_id')::uuid
-                            and p.tenant_id = v_tid
-                      )
-                  )
+                  and d.property_id =
+                      (p_payload->>'property_id')::uuid
             ) t;
 
 
@@ -1275,6 +1457,7 @@ begin
                 select
                     d.id,
                     d.tenant_id,
+                    d.property_id,
                     d.parent_device_id,
                     d.device_name,
                     d.category_code,
@@ -1310,6 +1493,9 @@ begin
 
             'tenant_id',
             d.tenant_id,
+
+            'property_id',
+            d.property_id,
 
             'parent_device_id',
             d.parent_device_id,
@@ -1400,6 +1586,16 @@ begin
         end if;
 
 
+        if not exists (
+            select 1
+            from public.properties p
+            where p.id = (p_payload->>'property_id')::uuid
+              and p.tenant_id = v_tid
+        ) then
+            raise exception 'Property not found';
+        end if;
+
+
         if p_payload ? 'parent_device_id'
            and p_payload->>'parent_device_id' is not null
         then
@@ -1410,8 +1606,9 @@ begin
                 where pd.id =
                     (p_payload->>'parent_device_id')::uuid
                   and pd.tenant_id = v_tid
+                  and pd.property_id = (p_payload->>'property_id')::uuid
             ) then
-                raise exception 'Parent device not found';
+                raise exception 'Parent device not found in property';
             end if;
 
         end if;
@@ -1420,6 +1617,7 @@ begin
         insert into public.devices
         (
             tenant_id,
+            property_id,
             device_name,
             category_code,
             protocol,
@@ -1431,6 +1629,7 @@ begin
         values
         (
             v_tid,
+            (p_payload->>'property_id')::uuid,
             p_payload->>'device_name',
             p_payload->>'category_code',
             (p_payload->>'protocol')::public.device_protocol,
@@ -1455,6 +1654,7 @@ begin
         returning
             id,
             tenant_id,
+            property_id,
             parent_device_id,
             device_name,
             category_code,
@@ -1496,12 +1696,15 @@ begin
 
             if not exists (
                 select 1
-                from public.devices pd
-                where pd.id =
-                    (p_payload->>'parent_device_id')::uuid
+                from public.devices d
+                join public.devices pd
+                  on pd.id = (p_payload->>'parent_device_id')::uuid
+                where d.id = (p_payload->>'id')::uuid
+                  and d.tenant_id = v_tid
                   and pd.tenant_id = v_tid
+                  and pd.property_id = d.property_id
             ) then
-                raise exception 'Parent device not found';
+                raise exception 'Parent device not found in same property';
             end if;
 
         end if;
@@ -1573,6 +1776,7 @@ begin
         returning
             d.id,
             d.tenant_id,
+            d.property_id,
             d.parent_device_id,
             d.device_name,
             d.category_code,

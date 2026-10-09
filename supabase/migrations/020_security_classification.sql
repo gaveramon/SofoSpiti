@@ -1005,6 +1005,19 @@ values
 
     (
         'public',
+        'property_memberships',
+        'business',
+        'rpc',
+        true,
+        false,
+        true,
+        true,
+        true,
+        'Property-level operational membership and authorization data. Portal access exclusively through approved property/account administration API/RPC contracts; direct authenticated table access is denied. Platform-admin access through explicit property administration RPC.'
+    ),
+
+    (
+        'public',
         'rooms',
         'business',
         'rpc',
