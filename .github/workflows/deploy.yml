@@ -41,4 +41,4 @@ jobs:
       - name: Run Supabase Migrations
         run: |
           # We gebruiken hier het gecodeerde wachtwoord uit de 'encode_pwd' stap
-          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres"
+          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable""
