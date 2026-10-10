@@ -38,11 +38,11 @@ jobs:
           sudo apt-get update && sudo apt-get install -y socat
           
           # We gebruiken 'nc' (Netcat) IN de container. Dit gebruikt GEEN poort-forwarding van de firewall.
-          socat TCP-LISTEN:54322,fork,reuseaddr EXEC:"ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 admin@${{ secrets.VPS_IP }} docker exec -i db-gbzn02wrcuunfjli9jsqmt9o nc 127.0.0.1 5432",nofork &
+          socat TCP-LISTEN:54322,fork,reuseaddr EXEC:"ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 admin@${{ secrets.VPS_IP }} docker exec -i db-gbzn02wrcuunfjli9jsqmt9o nc 10.0.2.4 5432",nofork &
           
           sleep 3
 
       - name: Run Supabase Migrations
         run: |
           # De CLI verbindt nu lokaal, en socat stuurt het als pure SSH-tekst naar de container
-          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
+          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@10.0.2.4:54322/postgres?sslmode=disable"
