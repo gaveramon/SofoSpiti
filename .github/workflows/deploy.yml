@@ -18,7 +18,7 @@ jobs:
         with:
           version: latest
 
-      # GECORRIGEERDE STAP: Maak het wachtwoord URL-veilig met quote_plus
+      # Maak het wachtwoord URL-veilig met quote_plus
       - name: Encode Database Password
         id: encode_pwd
         run: |
@@ -26,7 +26,7 @@ jobs:
           ${{ secrets.NEW_DB_PASSWORD }}
           EOF
           )
-          # Sla het gecodeerde wachtwoord op in de GitHub Actions omgevingsvariabelen
+          # Sla het gecodeerde wachtwoord op onder de key 'PASSWORD'
           echo "PASSWORD=$ENCODED_PASSWORD" >> $GITHUB_OUTPUT
 
       - name: Setup SSH Tunnel to VPS
@@ -40,5 +40,5 @@ jobs:
 
       - name: Run Supabase Migrations
         run: |
-          # We gebruiken hier het gecodeerde wachtwoord uit de 'encode_pwd' stap
-          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable""
+          # We gebruiken hier 'outputs.PASSWORD' en we hebben '?sslmode=disable' toegevoegd
+          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
