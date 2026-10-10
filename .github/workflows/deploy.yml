@@ -24,10 +24,11 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Open de tunnel met de nieuwe, wachtwoordloze sleutel
-          ssh -o StrictHostKeyChecking=no -f -N -L 54322:127.0.0.1:5432 admin@${{ secrets.VPS_IP }}
+          # We voegen -4 toe om IPv4 te forceren en tunnelen naar localhost (Docker-vriendelijk)
+          ssh -4 -o StrictHostKeyChecking=no -f -N -L 54322:localhost:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
-          # Voer de migraties uit over de werkende tunnel
-          supabase db push --db-url "postgresql://postgres:${{ secrets.NEW_DB_PASSWORD }}@127.0.0.1:54322/postgres"
+          # We voegen --debug toe om bij een eventuele fout de exacte PostgreSQL-foutcode te zien
+          supabase db push --debug --db-url "postgresql://postgres:${{ secrets.NEW_DB_PASSWORD }}@127.0.0.1:54322/postgres"
+
