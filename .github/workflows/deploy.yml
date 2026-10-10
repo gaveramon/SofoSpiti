@@ -23,12 +23,9 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Voeg VPS toe aan known_hosts om waarschuwingen te voorkomen
-          ssh-keyscan -H ${{ secrets.VPS_IP }} >> ~/.ssh/known_hosts
           
-          # Open een SSH-tunnel: stuurt lokale poort 54322 door naar poort 5432 op de VPS (binnen de Docker-omgeving)
-          # We gaan ervan uit dat je database in Coolify intern op poort 5432 draait
-          ssh -f -N -L 54322:127.0.0.1:5432 admin@${{ secrets.VPS_IP }}
+          # Open de tunnel met extra parameters om host-controle te omzeilen
+          ssh -o StrictHostKeyChecking=no -f -N -L 54322:127.0.0.1:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
