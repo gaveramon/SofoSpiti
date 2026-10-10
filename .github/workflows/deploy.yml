@@ -26,7 +26,6 @@ jobs:
           ${{ secrets.NEW_DB_PASSWORD }}
           EOF
           )
-          # Sla het gecodeerde wachtwoord op onder de key 'PASSWORD'
           echo "PASSWORD=$ENCODED_PASSWORD" >> $GITHUB_OUTPUT
 
       - name: Setup SSH Tunnel to VPS
@@ -35,11 +34,11 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # AANPASSING: We sturen poort 54322 door naar de INTERNE Docker-containernaam 'supabase-db'
-          # Als jouw container in Coolify anders heet (bijv. 'db'), vervang dan 'supabase-db' hieronder.
-          ssh -o StrictHostKeyChecking=no -f -N -L 54322:supabase-db:5432 admin@${{ secrets.VPS_IP }}
+          # GEBRUIK JOUW UNIEKE COOLIFY CONTAINERNAAM:
+          # We sturen de tunnel direct door naar jouw specifieke database-container
+          ssh -o StrictHostKeyChecking=no -f -N -L 54322:db-gbzn02wrcuunfjli9jsqmt9o:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
-          # We voegen ook --debug toe om de exacte PostgreSQL foutcode te zien mocht dit alsnog misgaan
-          supabase db push --debug --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
+          # De Supabase CLI voert nu de Greenfield-migratie uit via de perfect afgestelde tunnel
+          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
