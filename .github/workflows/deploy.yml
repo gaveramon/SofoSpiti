@@ -18,11 +18,11 @@ jobs:
         with:
           version: latest
 
-      # NIEUWE STAP: Codeer het wachtwoord met speciale tekens naar een veilige URL-string
+      # GECORRIGEERDE STAP: Maak het wachtwoord URL-veilig met quote_plus
       - name: Encode Database Password
         id: encode_pwd
         run: |
-          ENCODED_PASSWORD=$(python3 -c "import urllib.parse; print(urllib.parse.quote_making_safe('', safe=''))" << 'EOF'
+          ENCODED_PASSWORD=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote_plus(sys.stdin.read().strip()))" << 'EOF'
           ${{ secrets.NEW_DB_PASSWORD }}
           EOF
           )
