@@ -3,7 +3,7 @@ name: Greenfield Supabase Migration
 on:
   push:
     branches:
-      - main # Of handmatig via workflow_dispatch
+      - main
 
 jobs:
   deploy:
@@ -24,13 +24,10 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Test direct de SSH-verbinding in debug-modus
-          ssh -vvv -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 admin@${{ secrets.VPS_IP }} "echo 'SSH connectie is gelukt!'"
-          
-          # Als de test hierboven slaagt, start de tunnel op de achtergrond
+          # Open de tunnel met de nieuwe, wachtwoordloze sleutel
           ssh -o StrictHostKeyChecking=no -f -N -L 54322:127.0.0.1:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
-          # Voer de migraties uit via de geopende tunnel
+          # Voer de migraties uit over de werkende tunnel
           supabase db push --db-url "postgresql://postgres:${{ secrets.NEW_DB_PASSWORD }}@127.0.0.1:54322/postgres"
