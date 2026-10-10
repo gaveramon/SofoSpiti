@@ -1,0 +1,36 @@
+name: Greenfield Supabase Migration
+
+on:
+  push:
+    branches:
+      - main # Of handmatig via workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Setup SSH Tunnel to VPS
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Voeg VPS toe aan known_hosts om waarschuwingen te voorkomen
+          ssh-keyscan -H ${{ secrets.VPS_IP }} >> ~/.ssh/known_hosts
+          
+          # Open een SSH-tunnel: stuurt lokale poort 54322 door naar poort 5432 op de VPS (binnen de Docker-omgeving)
+          # We gaan ervan uit dat je database in Coolify intern op poort 5432 draait
+          ssh -f -N -L 54322:127.0.0.1:5432 root@${{ secrets.VPS_IP }}
+
+      - name: Run Supabase Migrations
+        run: |
+          # Voer de migraties uit via de geopende tunnel
+          supabase db push --db-url "postgresql://postgres:${{ secrets.NEW_DB_PASSWORD }}@127.0.0.1:54322/postgres"
