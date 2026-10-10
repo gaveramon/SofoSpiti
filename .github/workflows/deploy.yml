@@ -18,17 +18,27 @@ jobs:
         with:
           version: latest
 
+      # NIEUWE STAP: Codeer het wachtwoord met speciale tekens naar een veilige URL-string
+      - name: Encode Database Password
+        id: encode_pwd
+        run: |
+          ENCODED_PASSWORD=$(python3 -c "import urllib.parse; print(urllib.parse.quote_making_safe('', safe=''))" << 'EOF'
+          ${{ secrets.NEW_DB_PASSWORD }}
+          EOF
+          )
+          # Sla het gecodeerde wachtwoord op in de GitHub Actions omgevingsvariabelen
+          echo "PASSWORD=$ENCODED_PASSWORD" >> $GITHUB_OUTPUT
+
       - name: Setup SSH Tunnel to VPS
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # We voegen -4 toe om IPv4 te forceren en tunnelen naar localhost (Docker-vriendelijk)
+          # Open de tunnel over IPv4 naar localhost
           ssh -4 -o StrictHostKeyChecking=no -f -N -L 54322:localhost:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
-          # We voegen --debug toe om bij een eventuele fout de exacte PostgreSQL-foutcode te zien
-          supabase db push --debug --db-url "postgresql://postgres:${{ secrets.NEW_DB_PASSWORD }}@127.0.0.1:54322/postgres"
-
+          # We gebruiken hier het gecodeerde wachtwoord uit de 'encode_pwd' stap
+          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres"
