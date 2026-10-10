@@ -24,7 +24,10 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Open de tunnel met extra parameters om host-controle te omzeilen
+          # Test direct de SSH-verbinding in debug-modus
+          ssh -vvv -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 admin@${{ secrets.VPS_IP }} "echo 'SSH connectie is gelukt!'"
+          
+          # Als de test hierboven slaagt, start de tunnel op de achtergrond
           ssh -o StrictHostKeyChecking=no -f -N -L 54322:127.0.0.1:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
