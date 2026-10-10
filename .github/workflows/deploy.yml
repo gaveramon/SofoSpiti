@@ -35,10 +35,11 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Open de tunnel over IPv4 naar localhost
-          ssh -4 -o StrictHostKeyChecking=no -f -N -L 54322:localhost:5432 admin@${{ secrets.VPS_IP }}
+          # AANPASSING: We sturen poort 54322 door naar de INTERNE Docker-containernaam 'supabase-db'
+          # Als jouw container in Coolify anders heet (bijv. 'db'), vervang dan 'supabase-db' hieronder.
+          ssh -o StrictHostKeyChecking=no -f -N -L 54322:supabase-db:5432 admin@${{ secrets.VPS_IP }}
 
       - name: Run Supabase Migrations
         run: |
-          # We gebruiken hier 'outputs.PASSWORD' en we hebben '?sslmode=disable' toegevoegd
-          supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
+          # We voegen ook --debug toe om de exacte PostgreSQL foutcode te zien mocht dit alsnog misgaan
+          supabase db push --debug --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
