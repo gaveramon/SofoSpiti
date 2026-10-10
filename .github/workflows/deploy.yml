@@ -34,11 +34,15 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # GEBRUIK JOUW UNIEKE COOLIFY CONTAINERNAAM:
-          # We sturen de tunnel direct door naar jouw specifieke database-container
-          ssh -o StrictHostKeyChecking=no -f -N -L 54322:db-gbzn02wrcuunfjli9jsqmt9o:5432 admin@${{ secrets.VPS_IP }}
+          # Installeer socat alléén op de GitHub runner (niet op je VPS)
+          sudo apt-get update && sudo apt-get install -y socat
+          
+          # We gebruiken 'nc' (Netcat) IN de container. Dit gebruikt GEEN poort-forwarding van de firewall.
+          socat TCP-LISTEN:54322,fork,reuseaddr EXEC:"ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 admin@${{ secrets.VPS_IP }} docker exec -i db-gbzn02wrcuunfjli9jsqmt9o nc 127.0.0.1 5432",nofork &
+          
+          sleep 3
 
       - name: Run Supabase Migrations
         run: |
-          # De Supabase CLI voert nu de Greenfield-migratie uit via de perfect afgestelde tunnel
+          # De CLI verbindt nu lokaal, en socat stuurt het als pure SSH-tekst naar de container
           supabase db push --db-url "postgresql://postgres:${{ steps.encode_pwd.outputs.PASSWORD }}@127.0.0.1:54322/postgres?sslmode=disable"
